@@ -23,6 +23,7 @@ from quack.gemm_tvm_ffi_utils import (
     get_majors,
     get_dtypes,
     perm3d,
+    perm3d_single,
     make_scheduler_args,
     make_varlen_args,
     make_fake_scheduler_args,
@@ -62,6 +63,8 @@ def _compile_gemm(
     rounding_mode,
     sr_seed_mode,
     has_trace_ptr,
+    reduce_scatter,
+    num_ranks,
 ):
     sm_to_cls = {
         9: GemmDefaultSm90,
@@ -133,6 +136,8 @@ def _compile_gemm(
         varlen_args,
         has_trace_ptr=has_trace_ptr,
         use_tma_gather=use_tma_gather,
+        reduce_scatter=reduce_scatter,
+        num_ranks=num_ranks,
     )
 
 
@@ -164,6 +169,11 @@ def gemm(
     sr_seed: int | Tensor = 0,
     use_tma_gather: bool = False,
     trace_ptr=None,  # Optional Int64 from TraceSession.ptr
+    reduce_scatter: Optional[str] = None,
+    mD_mc=None,
+    d_peer_tensors=None,
+    barrier_flag=None,
+    barrier_flag_mc=None,
 ) -> None:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
@@ -199,6 +209,9 @@ def gemm(
         )
 
     A_p, B_p, D_p, C_p = perm3d(A, B, D, C, varlen_m=varlen_m, varlen_k=varlen_k)
+    if mD_mc is not None:
+        mD_mc = perm3d_single(mD_mc)
+        d_peer_tensors = [perm3d_single(t) for t in d_peer_tensors]
     a_major, b_major, d_major, c_major = get_majors(A_p, B_p, D_p, C_p)
     a_dtype, b_dtype, d_dtype, c_dtype = get_dtypes(A, B, D, C)
 
@@ -209,6 +222,8 @@ def gemm(
     sr_seed_mode = (
         2 if isinstance(sr_seed, Tensor) else (1 if rounding_mode == RoundingMode.RS else 0)
     )
+    import torch.distributed as dist
+    num_ranks = dist.get_world_size() if reduce_scatter is not None else 1
     compiled_fn = _compile_gemm(
         a_dtype,
         b_dtype,
@@ -238,6 +253,8 @@ def gemm(
         rounding_mode,
         sr_seed_mode,
         trace_ptr is not None,
+        reduce_scatter,
+        num_ranks,
     )
 
     from quack.cache_utils import COMPILE_ONLY
@@ -273,8 +290,14 @@ def gemm(
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
 
     if device_capacity[0] in [10, 11]:
-        compiled_fn(
-            A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None, trace_ptr
-        )
+        if reduce_scatter is not None:
+            compiled_fn(
+                A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None,
+                mD_mc, d_peer_tensors, barrier_flag, barrier_flag_mc, trace_ptr,
+            )
+        else:
+            compiled_fn(
+                A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None, trace_ptr
+            )
     else:
         compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, trace_ptr)

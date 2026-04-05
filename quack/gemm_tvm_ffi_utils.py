@@ -187,6 +187,8 @@ def compile_gemm_kernel(
     mSFB=None,
     has_trace_ptr=False,
     use_tma_gather=False,
+    reduce_scatter=None,
+    num_ranks=1,
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
     if device_capacity[0] in [9, 12]:
@@ -196,6 +198,7 @@ def compile_gemm_kernel(
             GemmCls,
             use_clc_persistence=is_dynamic_persistent,
             use_tma_gather=use_tma_gather,
+            reduce_scatter=reduce_scatter,
         )
     gemm_obj = GemmCls(
         Float32,
@@ -211,6 +214,16 @@ def compile_gemm_kernel(
     # Trace pointer: Optional[Int64]. Compile with Int64(0) when tracing is
     # requested, None otherwise. TVM-FFI caches each variant separately.
     trace_ptr = Int64(0) if has_trace_ptr else None
+    rs_kwargs = {}
+    if reduce_scatter is not None and device_capacity[0] in (10, 11):
+        flag_size = cute.sym_int()
+        fake_flag = fake_tensor(Int32, (flag_size,), leading_dim=0, divisibility=1)
+        rs_kwargs = dict(
+            mD_mc=mD,
+            d_peer_tensors=[mD] * num_ranks,
+            barrier_flag=fake_flag,
+            barrier_flag_mc=fake_flag,
+        )
     return cute.compile(
         gemm_obj,
         mA,
@@ -222,6 +235,7 @@ def compile_gemm_kernel(
         varlen_args,
         stream,
         *sf_args,
-        trace_ptr,
+        **rs_kwargs,
+        trace_ptr=trace_ptr,
         options="--enable-tvm-ffi",
     )

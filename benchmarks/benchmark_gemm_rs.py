@@ -6,7 +6,7 @@ from typing import Tuple, Type, Optional
 import numpy as np
 import torch
 import torch.distributed as dist
-from cuda.core.experimental import Device
+from cuda.core import Device
 from cuda.pathfinder import load_nvidia_dynamic_lib
 from triton.testing import do_bench
 
@@ -176,7 +176,7 @@ def run(args):
         A = torch.randn(total_k, m, dtype=torch.bfloat16, device=device).T
         B = torch.randn(total_k, n, dtype=torch.bfloat16, device=device).T
         D = torch.empty(l, m, n, dtype=torch.bfloat16, device=device)
-    elif: reduce_scatter:
+    elif reduce_scatter:
         assert not varlen_m and not varlen_k and not gather_A, \
             "reduce_scatter does not support varlen_m, varlen_k, or gather_A"
         A = torch.randn(l, m, k, dtype=torch.bfloat16, device=device) / (k**0.5)
@@ -192,8 +192,10 @@ def run(args):
         barrier_flag_torch = nvshmem.core.tensor((num_tiles + num_sms,), dtype=torch.int32)
         barrier_flag_torch.fill_(0)
         barrier_flag_torch_mc = nvshmem.core.get_multicast_tensor(nvshmem.core.Teams.TEAM_NODE, barrier_flag_torch)
-        barrier_flag = from_dlpack(barrier_flag_torch).mark_layout_dynamic()
-        barrier_flag_mc = from_dlpack(barrier_flag_torch_mc).mark_layout_dynamic()
+        barrier_flag = barrier_flag_torch
+        barrier_flag_mc = barrier_flag_torch_mc
+        torch.cuda.synchronize()
+        dist.barrier()
     else:
         A = torch.randn(l, m, k, dtype=torch.bfloat16, device=device) / (k**0.5)
         B = torch.randn(l, n, k, dtype=torch.bfloat16, device=device) / (k**0.5)
@@ -213,6 +215,11 @@ def run(args):
             cu_seqlens_k=cu_seqlens_k,
             A_idx=A_idx,
             use_tma_gather=args.use_tma_gather,
+            reduce_scatter=reduce_scatter,
+            mD_mc=D_torch_mc,
+            d_peer_tensors=D_peer_torch_tensors,
+            barrier_flag=barrier_flag,
+            barrier_flag_mc=barrier_flag_mc,
         )
         if tile_count_semaphore is not None and varlen_m:
             tile_count_semaphore.zero_()
@@ -226,15 +233,31 @@ def run(args):
                  else A[cu_seqlens_m[i]:cu_seqlens_m[i+1]]) @ B[i].T
                 for i in range(l)
             ])
+            torch.testing.assert_close(D, ref.to(torch.bfloat16), atol=tolerance, rtol=1e-3)
         elif varlen_k:
             ref = torch.stack([
                 A[:, cu_seqlens_k[i]:cu_seqlens_k[i+1]] @
                 B[:, cu_seqlens_k[i]:cu_seqlens_k[i+1]].T
                 for i in range(l)
             ])
+            torch.testing.assert_close(D, ref.to(torch.bfloat16), atol=tolerance, rtol=1e-3)
+        elif reduce_scatter:
+            # Each rank contributed a partial GEMM; the RS summed them.
+            # Reference: all_reduce of each rank's local A @ B^T.
+            # This rank owns rows [start, end) of the M dimension.
+            ref_local = torch.bmm(A.to(torch.float32), B.to(torch.float32).mT)
+            dist.all_reduce(ref_local, op=dist.ReduceOp.SUM)
+            m_per_rank = m // dist.get_world_size()
+            start = dist.get_rank() * m_per_rank
+            end = start + m_per_rank
+            torch.testing.assert_close(
+                D[:, start:end, :].to(torch.float32),
+                ref_local[:, start:end, :].to(torch.bfloat16).to(torch.float32),
+                atol=tolerance, rtol=1e-3,
+            )
         else:
             ref = torch.bmm(A, B.mT)
-        torch.testing.assert_close(D, ref.to(torch.bfloat16), atol=tolerance, rtol=1e-3)
+            torch.testing.assert_close(D, ref.to(torch.bfloat16), atol=tolerance, rtol=1e-3)
         print("Ref check PASSED")
 
     # ── Benchmark ─────────────────────────────────────────────────────────────

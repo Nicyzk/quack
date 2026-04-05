@@ -7,8 +7,11 @@ from functools import partial
 
 import cuda.bindings.driver as cuda
 
+import torch
+
 import cutlass
 import cutlass.cute as cute
+import cutlass.utils as utils
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
@@ -160,6 +163,7 @@ class GemmSm100(GemmSm90):
         gather_A: bool = False,
         use_tma_gather: bool = False,
         use_clc_persistence: bool = True,
+        reduce_scatter: Optional[str] = None,
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -195,10 +199,14 @@ class GemmSm100(GemmSm90):
         self.use_clc_persistence = use_clc_persistence
         self.gather_A = gather_A
         self.use_tma_gather = use_tma_gather
+        self.reduce_scatter = reduce_scatter
         if gather_A:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
         if use_tma_gather:
             assert gather_A, "TMA gather requires gather_A=True"
+        if reduce_scatter is not None:
+            assert reduce_scatter == "two_shot", f"Unsupported reduce_scatter mode: {reduce_scatter}"
+            assert not use_clc_persistence, "reduce_scatter requires use_clc_persistence=False"
 
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -214,6 +222,9 @@ class GemmSm100(GemmSm90):
         self.scheduler_warp_id = self.epi_load_warp_id + 1
         # So that we have 12 warps in case of gather_A
         self.empty_warp_ids = () if not self.gather_A else (self.scheduler_warp_id + 1,)
+        
+        rs_start = self.scheduler_warp_id + len(self.empty_warp_ids) + 1
+        self.reduce_scatter_warp_ids = () if not self.reduce_scatter else (tuple(range(rs_start, rs_start + 4)))
         self.num_epi_warps = len(self.epilog_warp_id)
         self.epilogue_barrier = pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierGemm.Epilogue),
@@ -233,11 +244,17 @@ class GemmSm100(GemmSm90):
                     self.scheduler_warp_id,
                     *self.epilog_warp_id,
                     *self.empty_warp_ids,
+                    *self.reduce_scatter_warp_ids,
                 )
             )
         )
         # Multiple of 4 warps to increase/decrease number of registers
         assert self.threads_per_cta % 128 == 0
+
+        if reduce_scatter:
+            self.reduce_scatter_sync_bar_id = int(NamedBarrierGemm.TmemPtr) + 1
+            self.num_ranks = torch.distributed.get_world_size()
+            self.rank_id = torch.distributed.get_rank()
 
     def _setup_attributes(self, epilogue_args: EpilogueArguments, varlen_args: VarlenArguments):
         """Set up configurations that are dependent on GEMM inputs
@@ -455,6 +472,10 @@ class GemmSm100(GemmSm90):
         stream: cuda.CUstream,
         mSFA: Optional[cute.Tensor] = None,
         mSFB: Optional[cute.Tensor] = None,
+        mD_mc: Optional[cute.Tensor] = None,
+        d_peer_tensors: Optional[list] = None,
+        barrier_flag: Optional[cute.Tensor] = None,
+        barrier_flag_mc: Optional[cute.Tensor] = None,
         trace_ptr: Optional[cutlass.Int64] = None,
     ):
         """Execute the GEMM operation in steps:
@@ -723,7 +744,6 @@ class GemmSm100(GemmSm90):
             ]
 
         self.shared_storage = SharedStorage
-
         # Launch the kernel synchronously
         self.kernel(
             self.tiled_mma,
@@ -754,6 +774,10 @@ class GemmSm100(GemmSm90):
             self.epi_tile,
             tile_sched_params,
             TileSchedulerCls,
+            mD_mc,
+            d_peer_tensors,
+            barrier_flag,
+            barrier_flag_mc,
             trace_ptr,
         ).launch(
             grid=grid,
@@ -796,12 +820,16 @@ class GemmSm100(GemmSm90):
         epi_tile: cute.Tile,
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
+        mD_mc: Optional[cute.Tensor] = None,
+        d_peer_tensors: Optional[list] = None,
+        barrier_flag: Optional[cute.Tensor] = None,
+        barrier_flag_mc: Optional[cute.Tensor] = None,
         trace_ptr: Optional[cutlass.Int64] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
         """
-
+        
         from quack.trace import TraceContext
 
         tctx = TraceContext.create(trace_ptr)
@@ -835,7 +863,7 @@ class GemmSm100(GemmSm90):
 
         # Setup cta/thread coordinates
         # Coords inside cluster
-        bidx, _, _ = cute.arch.block_idx()
+        bidx, bidy, bidz = cute.arch.block_idx()
         mma_tile_coord_v = bidx % cute.size(tiled_mma.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
@@ -1549,6 +1577,23 @@ class GemmSm100(GemmSm90):
                     acc_pipeline.consumer_release(acc_consumer_state)
                 acc_consumer_state.advance()
 
+                # Signal reduce scatter warps that this tile's output is in memory
+                if const_expr(self.reduce_scatter == "two_shot"):
+                    tile_id = Int32(
+                        tile_scheduler._current_work_idx
+                        * (self.cluster_shape_mnk[0] * self.cluster_shape_mnk[1])
+                        + cute.arch.block_idx_in_cluster()
+                    )
+                    if warp_idx == self.epilog_warp_id[0]:
+                        cute.arch.cp_async_bulk_wait_group(0, read=False)
+                        with cute.arch.elect_one():
+                            flag = barrier_flag_mc.iterator + tile_id
+                            utils.distributed.multimem_red_add1(
+                                lock_ptr=flag,
+                                scope="gpu",
+                                order="release",
+                            )
+
                 # Advance to next tile
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
@@ -1561,6 +1606,197 @@ class GemmSm100(GemmSm90):
             tmem.relinquish_alloc_permit()
             tmem_alloc_barrier.arrive_and_wait()
             tmem.free(acc_tmem_ptr)
+
+        # ///////////////////////////////////////////////////////////////////////////////
+        # Reduce Scatter warps
+        # ///////////////////////////////////////////////////////////////////////////////
+        if const_expr(self.reduce_scatter == "two_shot"):
+            if warp_idx >= self.reduce_scatter_warp_ids[0]:
+                rank_id = self.rank_id
+                num_ranks = Int32(self.num_ranks)
+                lane_id = cute.arch.lane_idx()
+
+                tile_scheduler = TileSchedulerCls()
+                work_tile = tile_scheduler.initial_work_tile_info()
+
+                # we want 128bit ld/st for better performance
+                atom_val = 128 // mD_mc.element_type.width
+                atom_thr_n = self.mma_tiler[1] // atom_val
+                atom_thr_m = len(self.reduce_scatter_warp_ids) * cute.arch.WARP_SIZE // atom_thr_n
+                thr_layout = cute.make_layout((atom_thr_m, atom_thr_n), stride=(atom_thr_n, 1))
+                val_layout = cute.make_layout((1, atom_val), stride=(atom_val, 1))
+
+                copy_atom_load = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), mD_mc.element_type)
+                tiled_copy_fake = cute.make_tiled_copy_tv(copy_atom_load, thr_layout, val_layout)
+                thr_copy_fake = tiled_copy_fake.get_slice(tidx - self.reduce_scatter_warp_ids[0] * 32)
+
+                # predicate tensor
+                idD = cute.make_identity_tensor(mD_mc.shape)
+
+                # partition and slice at tile level
+                gD_mc = cute.local_tile(
+                    mD_mc, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+                )
+                cD = cute.local_tile(
+                    idD, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+                )
+
+                m_tiles_in_total = gD_mc.shape[2]
+                n_tiles_in_total = gD_mc.shape[3]
+                m_tiles_per_rank = m_tiles_in_total // self.num_ranks
+
+                while work_tile.is_valid_tile:
+                    cur_tile_coord = work_tile.tile_idx
+                    if bidx == 2 and bidy == 0 and bidz == 0 and warp_idx == self.reduce_scatter_warp_ids[0]:
+                        with cute.arch.elect_one():
+                           cute.printf("cur_tile_coord={},{},{}", cur_tile_coord[0], cur_tile_coord[1], cur_tile_coord[3]) 
+                    mma_tile_coord_mnl = (
+                        ((cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)) % m_tiles_per_rank)
+                        + self.rank_id * m_tiles_per_rank,
+                        cur_tile_coord[1],
+                        cur_tile_coord[3],  # tile_idx = (pid_m, pid_n, None, batch_idx)
+                    )
+
+                    chunk_id = (cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)) // m_tiles_per_rank
+                    tile_id = mma_tile_coord_mnl[0] + mma_tile_coord_mnl[1] * m_tiles_in_total
+                    tile_id = tile_id * cute.size(tiled_mma.thr_id.shape)
+
+                    if not is_leader_cta:
+                        tile_id = tile_id + 1
+
+                    # Wait for all ranks to signal this tile's output is ready
+                    flag = barrier_flag.iterator + tile_id
+
+                    tctx.b("epi_rs_barrier")
+                    if warp_idx == self.reduce_scatter_warp_ids[0]:
+                        if lane_id == 0:
+                            res = 0
+                            while res < self.num_ranks:
+                                res = cute.arch.load(flag.llvm_ptr, cutlass.Int32, sem="relaxed", scope="gpu")
+                    tctx.e("epi_rs_barrier")
+                    cute.arch.barrier(
+                        barrier_id=self.reduce_scatter_sync_bar_id,
+                        number_of_threads=32 * len(self.reduce_scatter_warp_ids),
+                    )
+                    if warp_idx == self.reduce_scatter_warp_ids[0]:
+                        if lane_id == 0:
+                            res = cute.arch.atomic_add(
+                                flag.llvm_ptr,
+                                Int32(1),
+                                sem="relaxed",
+                                scope="sys",
+                            )
+                            res = cute.arch.load(flag.llvm_ptr, cutlass.Int32, sem="relaxed", scope="sys")
+                            if res == self.num_ranks * 2:
+                                cute.arch.store(flag.llvm_ptr, Int32(0), sem="relaxed", scope="sys")
+
+                    tCgD_mc = thr_mma.partition_C(gD_mc)
+                    tCpD = thr_mma.partition_C(cD)
+
+                    tCgD_mc_slice = tCgD_mc[((None, None), 0, 0, *mma_tile_coord_mnl)]
+                    tCpD_slice = tCpD[((None, None), 0, 0, *mma_tile_coord_mnl)]
+
+                    cta_mma_tile_m = self.mma_tiler[0] // cute.size(tiled_mma.thr_id.shape)
+                    m_local_rank = int(cta_mma_tile_m / self.num_ranks)
+                    tCgD_mc_slice_partitioned = cute.zipped_divide(tCgD_mc_slice, (m_local_rank, self.mma_tiler[1]))
+                    tCpD_slice_partitioned = cute.zipped_divide(tCpD_slice, (m_local_rank, self.mma_tiler[1]))
+
+                    tCgD_mc_local_rank = cute.slice_(tCgD_mc_slice_partitioned, ((None, None), (chunk_id, 0)))
+                    tCpD_local_rank = cute.slice_(tCpD_slice_partitioned, ((None, None), (chunk_id, 0)))
+                    frgD_mc = thr_copy_fake.partition_S(tCgD_mc_local_rank)
+                    frpD = thr_copy_fake.partition_S(tCpD_local_rank)
+
+                    m_idx = gD_mc.shape[0] * mma_tile_coord_mnl[0]
+                    m_per_rank = mD_mc.shape[0] // self.num_ranks
+                    dst_rank_this_tile = m_idx // m_per_rank
+
+                    peer = d_peer_tensors[rank_id]
+                    gD_peer = cute.local_tile(
+                        peer, cute.slice_(self.mma_tiler, (None, None, 0)), (None, None, None)
+                    )
+                    tCgD_peer = thr_mma.partition_C(gD_peer)
+                    tCgD_peer_slice = tCgD_peer[((None, None), 0, 0, *mma_tile_coord_mnl)]
+                    tCgD_peer_slice_partitioned = cute.zipped_divide(tCgD_peer_slice, (m_local_rank, self.mma_tiler[1]))
+                    tCgD_peer_local_rank = cute.slice_(tCgD_peer_slice_partitioned, ((None, None), (chunk_id, 0)))
+                    frgD_peer = thr_copy_fake.partition_S(tCgD_peer_local_rank)
+
+                    atom, loop_m, loop_n = frgD_mc.shape
+                    tmp_results = cute.make_rmem_tensor((4, loop_m, loop_n), cutlass.Int32)
+                    local_chunk_lower_bound = (rank_id * m_per_rank, mD_mc.shape[1], mD_mc.shape[2])
+                    local_chunk_upper_bound = ((rank_id + 1) * m_per_rank, mD_mc.shape[1], mD_mc.shape[2])
+
+                    tctx.b("rs")
+                    for i in cutlass.range_constexpr(loop_m):
+                        for j in cutlass.range_constexpr(loop_n):
+                            if cute.elem_less(frpD[0, i, j], local_chunk_upper_bound) and not cute.elem_less(frpD[0, i, j], local_chunk_lower_bound):
+                                mc_ptr = frgD_mc[None, i, j].iterator
+                                if cutlass.const_expr(self.d_dtype == cutlass.Float16):
+                                    x, y, z, w = utils.distributed.multimem_ld_reduce_8xf16(mc_ptr)
+                                elif cutlass.const_expr(self.d_dtype == cutlass.Float32):
+                                    x, y, z, w = utils.distributed.multimem_ld_reduce_4xf32(mc_ptr)
+                                elif cutlass.const_expr(self.d_dtype == cutlass.BFloat16):
+                                    x, y, z, w = utils.distributed.multimem_ld_reduce_8xbf16(mc_ptr)
+                                tmp_results[0, i, j] = x
+                                tmp_results[1, i, j] = y
+                                tmp_results[2, i, j] = z
+                                tmp_results[3, i, j] = w
+
+                    from cutlass._mlir.dialects import llvm
+                    from cutlass.cutlass_dsl import T
+                    for i in cutlass.range_constexpr(loop_m):
+                        for j in cutlass.range_constexpr(loop_n):
+                            if cute.elem_less(frpD[0, i, j], local_chunk_upper_bound) and not cute.elem_less(frpD[0, i, j], local_chunk_lower_bound):
+                                ptr_int = frgD_peer[None, i, j].iterator.toint().ir_value()
+                                x = tmp_results[0, i, j].ir_value()
+                                y = tmp_results[1, i, j].ir_value()
+                                z = tmp_results[2, i, j].ir_value()
+                                w = tmp_results[3, i, j].ir_value()
+                                llvm.inline_asm(
+                                    T.i32(),
+                                    [ptr_int, x, y, z, w],
+                                    "st.global.sys.relaxed.v4.f32 [$1], {$2, $3, $4, $5};",
+                                    "=r,l,r,r,r,r",
+                                    has_side_effects=True,
+                                    asm_dialect=0,
+                                )
+                    tctx.e("rs")
+
+                    # Advance to next tile
+                    tile_scheduler.advance_to_next_work()
+                    work_tile = tile_scheduler.get_current_work()
+
+                cute.arch.barrier(
+                    barrier_id=self.reduce_scatter_sync_bar_id,
+                    number_of_threads=32 * len(self.reduce_scatter_warp_ids),
+                )
+                # End-of-kernel system barrier: release per-SM flag, wait for all ranks
+                if warp_idx == self.reduce_scatter_warp_ids[0]:
+                    with cute.arch.elect_one():
+                        last_tile_id_linear = cute.size(
+                            tile_scheduler.params.problem_shape_ncluster_mnl
+                        ) * (self.cluster_shape_mnk[0] * self.cluster_shape_mnk[1])
+                        sm_id_linear = (
+                            cute.arch.block_idx()[0]
+                            + cute.arch.block_idx()[1] * cute.arch.grid_dim()[0]
+                            + cute.arch.block_idx()[2]
+                            * cute.arch.grid_dim()[0]
+                            * cute.arch.grid_dim()[1]
+                        )
+                        utils.distributed.multimem_red_add1(
+                            lock_ptr=barrier_flag_mc.iterator
+                            + last_tile_id_linear
+                            + sm_id_linear,
+                            scope="sys",
+                            order="release",
+                        )
+                        utils.distributed.spin_lock_atom_cas_relaxed_wait(
+                            lock_ptr=barrier_flag.iterator
+                            + last_tile_id_linear
+                            + sm_id_linear,
+                            expected_val=self.num_ranks,
+                            reset_val=0,
+                            scope="sys",
+                        )
 
         tctx.flush()
 
