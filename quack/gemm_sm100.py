@@ -668,6 +668,7 @@ class GemmSm100(GemmSm90):
         epilogue_params = self.epi_to_underlying_arguments(epilogue_args)
         varlen_params = VarlenManager.to_underlying_arguments(varlen_args)
 
+        """
         TileSchedulerCls = self.get_scheduler_class(varlen_m=varlen_m)
         tile_sched_args = self.get_scheduler_arguments(
             mA, mB, mD, scheduler_args, varlen_args, epilogue_args
@@ -676,6 +677,9 @@ class GemmSm100(GemmSm90):
         grid = TileSchedulerCls.get_grid_shape(
             tile_sched_params, scheduler_args.max_active_clusters
         )
+        """
+        TileSchedulerCls = None
+        tile_sched_params, grid = self._compute_grid(mD, self.cta_tile_shape_mnk, self.cluster_shape_mnk[:2], scheduler_args.max_active_clusters)
 
         self.buffer_align_bytes = 1024
 
@@ -969,9 +973,11 @@ class GemmSm100(GemmSm90):
             len_k_static=Int32(mA_mkl.shape[1]),
         )
 
+        """
         TileSchedulerCls = partial(
             TileSchedulerCls.create, tile_sched_params, sched_data, sched_pipeline
         )
+        """
 
         epi_load_barrier = None
         if const_expr(has_C):
@@ -1014,7 +1020,13 @@ class GemmSm100(GemmSm90):
                     )
 
             # Persistent tile scheduling loop
+            """
             tile_scheduler = TileSchedulerCls()
+            """
+            tile_scheduler = utils.StaticPersistentTileScheduler.create(
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            )
+
             work_tile = tile_scheduler.initial_work_tile_info()
             ab_producer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, self.ab_stage
@@ -1025,12 +1037,12 @@ class GemmSm100(GemmSm90):
             do_epi_load_barrier_arrive = Boolean(True)
             while work_tile.is_valid_tile:
                 tile_coord_mnkl = work_tile.tile_idx
-                batch_idx = tile_coord_mnkl[3]
+                batch_idx = tile_coord_mnkl[2]
                 # Local_tile partition global tensors
                 mma_tile_coord_mnl = (
                     tile_coord_mnkl[0] // cute.size(tiled_mma.thr_id.shape),
                     tile_coord_mnkl[1],
-                    tile_coord_mnkl[3],
+                    tile_coord_mnkl[2],
                 )
                 gA_mk = None
                 if const_expr(not self.gather_A):
@@ -1249,7 +1261,13 @@ class GemmSm100(GemmSm90):
                         cute.make_identity_tensor(tile_M if varlen_m else tile_K)
                     )
                 # Persistent tile scheduling loop
+                """
                 tile_scheduler = TileSchedulerCls(is_scheduler_warp=is_scheduler_warp)
+                """
+                tile_scheduler = utils.StaticPersistentTileScheduler.create(
+                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                )
+
                 work_tile = tile_scheduler.initial_work_tile_info()
                 a_prefetch_producer_state = None
                 if const_expr(self.gather_A):
@@ -1259,7 +1277,8 @@ class GemmSm100(GemmSm90):
                 while work_tile.is_valid_tile:
                     if const_expr(self.gather_A):
                         tile_coord_mnkl = work_tile.tile_idx
-                        batch_idx = tile_coord_mnkl[3]
+                        # batch_idx = tile_coord_mnkl[3]
+                        batch_idx = tile_coord_mnkl[2]
                         mAIdx_mk = varlen_manager.offset_batch_AIdx(batch_idx)
                         if const_expr(varlen_m):
                             # (tile_M,)
@@ -1310,11 +1329,12 @@ class GemmSm100(GemmSm90):
                                 a_prefetch_pipeline.producer_commit(a_prefetch_producer_state)
                                 a_prefetch_producer_state.advance()
                     # Advance to next tile
-                    tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
+                    # tile_scheduler.advance_to_next_work(is_scheduler_warp=is_scheduler_warp)
+                    tile_scheduler.advance_to_next_work()
                     work_tile = tile_scheduler.get_current_work()
                     # End of persistent scheduler loop
-                if is_scheduler_warp:
-                    tile_scheduler.producer_tail()
+                # if is_scheduler_warp:
+                #     tile_scheduler.producer_tail()
 
         # Specialized TMA epi load warp
         if warp_idx == self.epi_load_warp_id:
@@ -1326,12 +1346,18 @@ class GemmSm100(GemmSm90):
                 )
                 do_epi_load_barrier_wait = Boolean(True)
                 # Persistent tile scheduling loop
+                """
                 tile_scheduler = TileSchedulerCls()
+                """
+                tile_scheduler = utils.StaticPersistentTileScheduler.create(
+                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                )
+
                 work_tile = tile_scheduler.initial_work_tile_info()
                 while work_tile.is_valid_tile:
                     # Get tile coord from tile scheduler
                     tile_coord_mnkl = work_tile.tile_idx
-                    batch_idx = tile_coord_mnkl[3]
+                    batch_idx = tile_coord_mnkl[2]
                     copy_C_fn, _, bGS_gC = self.epilog_gmem_copy_and_partition(
                         tma_atom_c,
                         varlen_manager.offset_batch_epi(mC_mnl, batch_idx),
@@ -1418,7 +1444,13 @@ class GemmSm100(GemmSm90):
                 tiled_copy_s2t_sfb, tCsSFB_compact_s2t, tCtSFB_compact_s2t = None, None, None
 
             # Persistent tile scheduling loop
+            """
             tile_scheduler = TileSchedulerCls()
+            """
+            tile_scheduler = utils.StaticPersistentTileScheduler.create(
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            )
+
             work_tile = tile_scheduler.initial_work_tile_info()
             ab_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.ab_stage
@@ -1429,7 +1461,7 @@ class GemmSm100(GemmSm90):
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 tile_coord_mnkl = work_tile.tile_idx
-                batch_idx = tile_coord_mnkl[3]
+                batch_idx = tile_coord_mnkl[2]
                 k_len = varlen_manager.len_k(batch_idx)
                 k_tile_cnt = cute.ceil_div(k_len, self.mma_tiler[2])
                 # Set tensor memory buffer for current tile
@@ -1501,7 +1533,13 @@ class GemmSm100(GemmSm90):
                 )
 
             # Persistent tile scheduling loop
+            """
             tile_scheduler = TileSchedulerCls()
+            """
+            tile_scheduler = utils.StaticPersistentTileScheduler.create(
+                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            )
+
             work_tile = tile_scheduler.initial_work_tile_info()
             acc_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
@@ -1513,7 +1551,7 @@ class GemmSm100(GemmSm90):
             while work_tile.is_valid_tile:
                 # Get tile coord from tile scheduler
                 tile_coord_mnkl = work_tile.tile_idx
-                batch_idx = tile_coord_mnkl[3]
+                batch_idx = tile_coord_mnkl[2]
                 # Set tensor memory buffer for current tile
                 # (T2R, T2R_M, T2R_N, EPI_M, EPI_M)
                 tTR_tAcc = tTR_tAcc_base[None, None, None, None, None, acc_consumer_state.index]
@@ -1544,6 +1582,7 @@ class GemmSm100(GemmSm90):
                 )
 
                 tctx.b("epilogue")
+                """
                 epi_read_state, _ = self.epilogue(
                     epilogue_params,
                     epi_smem_tensors,
@@ -1570,6 +1609,7 @@ class GemmSm100(GemmSm90):
                     epi_tidx,
                     is_tma_warp,
                 )
+                """
                 tctx.e("epilogue")
 
                 # Async arrive accumulator buffer empty
@@ -1580,7 +1620,7 @@ class GemmSm100(GemmSm90):
                 # Signal reduce scatter warps that this tile's output is in memory
                 if const_expr(self.reduce_scatter == "two_shot"):
                     tile_id = Int32(
-                        tile_scheduler._current_work_idx
+                        tile_scheduler._current_work_linear_idx
                         * (self.cluster_shape_mnk[0] * self.cluster_shape_mnk[1])
                         + cute.arch.block_idx_in_cluster()
                     )
@@ -1616,7 +1656,13 @@ class GemmSm100(GemmSm90):
                 num_ranks = Int32(self.num_ranks)
                 lane_id = cute.arch.lane_idx()
 
+                """
                 tile_scheduler = TileSchedulerCls()
+                """
+                tile_scheduler = utils.StaticPersistentTileScheduler.create(
+                    tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+                )
+
                 work_tile = tile_scheduler.initial_work_tile_info()
 
                 # we want 128bit ld/st for better performance
@@ -1649,12 +1695,12 @@ class GemmSm100(GemmSm90):
                     cur_tile_coord = work_tile.tile_idx
                     if bidx == 2 and bidy == 0 and bidz == 0 and warp_idx == self.reduce_scatter_warp_ids[0]:
                         with cute.arch.elect_one():
-                           cute.printf("cur_tile_coord={},{},{}", cur_tile_coord[0], cur_tile_coord[1], cur_tile_coord[3]) 
+                           cute.printf("cur_tile_coord={},{},{}", cur_tile_coord[0], cur_tile_coord[1], cur_tile_coord[2]) 
                     mma_tile_coord_mnl = (
                         ((cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)) % m_tiles_per_rank)
                         + self.rank_id * m_tiles_per_rank,
                         cur_tile_coord[1],
-                        cur_tile_coord[3],  # tile_idx = (pid_m, pid_n, None, batch_idx)
+                        cur_tile_coord[2],  # tile_idx = (pid_m, pid_n, None, batch_idx)
                     )
 
                     chunk_id = (cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)) // m_tiles_per_rank
@@ -1773,7 +1819,7 @@ class GemmSm100(GemmSm90):
                 if warp_idx == self.reduce_scatter_warp_ids[0]:
                     with cute.arch.elect_one():
                         last_tile_id_linear = cute.size(
-                            tile_scheduler.params.problem_shape_ncluster_mnl
+                            tile_scheduler.params.problem_layout_ncluster_mnl
                         ) * (self.cluster_shape_mnk[0] * self.cluster_shape_mnk[1])
                         sm_id_linear = (
                             cute.arch.block_idx()[0]
@@ -2411,6 +2457,43 @@ class GemmSm100(GemmSm90):
         # Add remaining unused smem to epilogue
         epi_stage += (remaining_bytes - ab_bytes_per_stage * ab_stage) // (epi_bytes_per_stage)
         return num_acc_stage, ab_stage, epi_stage, epi_c_stage
+
+    @staticmethod
+    def _compute_grid(
+        c: cute.Tensor,
+        cta_tile_shape_mnk: Tuple[int, int, int],
+        cluster_shape_mn: Tuple[int, int],
+        max_active_clusters: cutlass.Constexpr,
+    ) -> Tuple[utils.PersistentTileSchedulerParams, Tuple[int, int, int]]:
+        """Use persistent tile scheduler to compute the grid size for the output tensor C.
+
+        :param c: The output tensor C
+        :type c: cute.Tensor
+        :param cta_tile_shape_mnk: The shape (M, N, K) of the CTA tile.
+        :type cta_tile_shape_mnk: tuple[int, int, int]
+        :param cluster_shape_mn: Shape of each cluster in M, N dimensions.
+        :type cluster_shape_mn: tuple[int, int]
+        :param max_active_clusters: Maximum number of active clusters.
+        :type max_active_clusters: cutlass.Constexpr
+
+        :return: A tuple containing:
+            - tile_sched_params: Parameters for the persistent tile scheduler.
+            - grid: Grid shape for kernel launch.
+        :rtype: Tuple[utils.PersistentTileSchedulerParams, tuple[int, int, int]]
+        """
+        c_shape = cute.slice_(cta_tile_shape_mnk, (None, None, 0))
+        gc = cute.zipped_divide(c, tiler=c_shape)
+        num_ctas_mnl = gc[(0, (None, None, None))].shape
+        cluster_shape_mnl = (*cluster_shape_mn, 1)
+
+        tile_sched_params = utils.PersistentTileSchedulerParams(
+            num_ctas_mnl, cluster_shape_mnl
+        )
+        grid = utils.StaticPersistentTileScheduler.get_grid_shape(
+            tile_sched_params, max_active_clusters
+        )
+
+        return tile_sched_params, grid
 
     @staticmethod
     def _compute_num_tmem_alloc_cols(

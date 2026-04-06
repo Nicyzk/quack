@@ -255,6 +255,7 @@ def run(args):
                 ref_local[:, start:end, :].to(torch.bfloat16).to(torch.float32),
                 atol=tolerance, rtol=1e-3,
             )
+            print("passed rs ref check")
         else:
             ref = torch.bmm(A, B.mT)
             torch.testing.assert_close(D, ref.to(torch.bfloat16), atol=tolerance, rtol=1e-3)
