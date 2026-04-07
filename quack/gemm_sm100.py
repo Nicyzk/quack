@@ -1561,10 +1561,8 @@ class GemmSm100(GemmSm90):
                 acc_pipeline.consumer_wait(acc_consumer_state)
 
                 copy_D = None
-                bSG_sD = None
-                bSG_gD = None
                 if const_expr(has_D):
-                    copy_D, bSG_sD, bSG_gD = self.epilog_gmem_copy_and_partition(
+                    copy_D, _, _ = self.epilog_gmem_copy_and_partition(
                         tma_atom_d,
                         varlen_manager.offset_batch_epi(mD_mnl, batch_idx),
                         self.cta_tile_shape_mnk[:2],
@@ -1572,7 +1570,6 @@ class GemmSm100(GemmSm90):
                         sD,
                         tile_coord_mnkl,
                     )
-                    bSG_gD = cute.group_modes(bSG_gD, 1, cute.rank(bSG_gD))
                 copy_C = None  # We're using a separate warp to load C
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
@@ -1586,8 +1583,7 @@ class GemmSm100(GemmSm90):
                     clear_acc=varlen_k and k_len == 0,
                 )
 
-                tctx.b("epilogue")
-                """
+                tctx.b("epilogue") 
                 epi_read_state, _ = self.epilogue(
                     epilogue_params,
                     epi_smem_tensors,
@@ -1614,44 +1610,6 @@ class GemmSm100(GemmSm90):
                     epi_tidx,
                     is_tma_warp,
                 )
-                """
-                ### temporary epilogue start
-                #
-                # Store accumulator to global memory in subtiles
-                #
-                subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
-                num_prev_subtiles = tile_scheduler.num_tiles_executed * subtile_cnt
-                for subtile_idx in cutlass.range(subtile_cnt):
-                    #
-                    # Load accumulator from tensor memory buffer to register
-                    #
-                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
-                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
-
-                    #
-                    # Store acc to tRS_rD (fp32), then cvt_copy to sD (d_dtype)
-                    #
-                    tRS_rD.store(tiled_copy_r2s.retile(tTR_rAcc).load())
-                    c_buffer = (num_prev_subtiles + subtile_idx) % self.epi_stage
-                    copy_utils.cvt_copy(
-                        tiled_copy_r2s,
-                        tRS_rD,
-                        tRS_sD[(None, None, None, c_buffer)],
-                    )
-                    # Fence and barrier to make sure shared memory store is visible to TMA store
-                    cute.arch.fence_proxy("async.shared", space="cta")
-                    self.epilogue_barrier.arrive_and_wait()
-
-                    #
-                    # TMA store D to global memory
-                    #
-                    if warp_idx == self.epilog_warp_id[0]:
-                        copy_D(src_idx=c_buffer, dst_idx=subtile_idx)
-                        epi_store_pipeline.producer_commit()
-                        epi_store_pipeline.producer_acquire()
-                    self.epilogue_barrier.arrive_and_wait()
-
-                ### temporary epilogue end
                 tctx.e("epilogue")
 
                 # Async arrive accumulator buffer empty
