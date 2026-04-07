@@ -1229,7 +1229,7 @@ class GemmSm90:
         epi_tile_layout = cute.make_ordered_layout(epi_tile_shape, order=(1, 0))
         epi_tile_num = cute.size(epi_tile_shape)
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
-
+        """
         epi_tensors = self.epi_begin(
             params,
             epi_smem_tensors,
@@ -1241,7 +1241,7 @@ class GemmSm90:
             epilogue_barrier,
             tidx,
         )
-
+        """
         if const_expr(copy_C is not None):
             for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
                 gmem_coord_C = epi_tile_layout.get_hier_coord(epi_idx)
@@ -1256,7 +1256,9 @@ class GemmSm90:
             gmem_coord = epi_tile_layout.get_hier_coord(epi_idx)
             # Copy from acc to D registers
             load_acc_subtile(tRS_rD, epi_idx)
+            """
             epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, gmem_coord)
+            """
             if const_expr(has_C):
                 epi_pipeline.consumer_wait(epi_read_state)
                 cute.copy(tiled_copy_s2r, tSR_sC[None, None, None, epi_read_state.index], tSR_rC)
@@ -1273,7 +1275,9 @@ class GemmSm90:
                     copy_C(src_idx=gmem_coord_C, producer_state=epi_producer_state)
                     epi_pipeline.producer_commit(epi_producer_state)
                 epi_producer_state.advance()
+            """
             tRS_rPostAct = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
+            """
             # Convert and store postact if this epilogue produces one
             if const_expr(postact_ctx is not None):
                 tRS_rPostAct_out = self.epi_convert_postact(
@@ -1330,7 +1334,7 @@ class GemmSm90:
                 if const_expr(postact_ctx is not None):
                     copy_postact(src_idx=epi_buffer, dst_idx=gmem_coord)
                 epi_store_pipeline.producer_commit()
-
+        """
         self.epi_end(
             params,
             epi_tensors,
@@ -1341,6 +1345,7 @@ class GemmSm90:
             varlen_manager,
             tidx,
         )
+        """
 
         return epi_read_state, epi_producer_state
 

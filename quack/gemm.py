@@ -65,6 +65,7 @@ def _compile_gemm(
     has_trace_ptr,
     reduce_scatter,
     num_ranks,
+    rank_id,
 ):
     sm_to_cls = {
         9: GemmDefaultSm90,
@@ -224,6 +225,7 @@ def gemm(
     )
     import torch.distributed as dist
     num_ranks = dist.get_world_size() if reduce_scatter is not None else 1
+    rank_id = dist.get_rank() if reduce_scatter is not None else 0 
     compiled_fn = _compile_gemm(
         a_dtype,
         b_dtype,
@@ -255,6 +257,7 @@ def gemm(
         trace_ptr is not None,
         reduce_scatter,
         num_ranks,
+        rank_id, # each rank gets its own kernel; without this, all ranks try to load first-compiled kernel and may get incorrect rank_id
     )
 
     from quack.cache_utils import COMPILE_ONLY

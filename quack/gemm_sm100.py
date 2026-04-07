@@ -25,6 +25,8 @@ from cutlass.cute.nvgpu.warp import (
 )
 from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
+from cutlass._mlir.dialects import llvm
+from cutlass.cutlass_dsl import T
 
 from quack.pipeline import PipelineTmaUmma, PipelineTmaCpAsyncUmma
 from quack.tile_scheduler import TileSchedulerOptions
@@ -1559,8 +1561,10 @@ class GemmSm100(GemmSm90):
                 acc_pipeline.consumer_wait(acc_consumer_state)
 
                 copy_D = None
+                bSG_sD = None
+                bSG_gD = None
                 if const_expr(has_D):
-                    copy_D, _, _ = self.epilog_gmem_copy_and_partition(
+                    copy_D, bSG_sD, bSG_gD = self.epilog_gmem_copy_and_partition(
                         tma_atom_d,
                         varlen_manager.offset_batch_epi(mD_mnl, batch_idx),
                         self.cta_tile_shape_mnk[:2],
@@ -1568,6 +1572,7 @@ class GemmSm100(GemmSm90):
                         sD,
                         tile_coord_mnkl,
                     )
+                    bSG_gD = cute.group_modes(bSG_gD, 1, cute.rank(bSG_gD))
                 copy_C = None  # We're using a separate warp to load C
 
                 tTR_tAcc = cute.group_modes(tTR_tAcc, 3, cute.rank(tTR_tAcc))
@@ -1610,6 +1615,43 @@ class GemmSm100(GemmSm90):
                     is_tma_warp,
                 )
                 """
+                ### temporary epilogue start
+                #
+                # Store accumulator to global memory in subtiles
+                #
+                subtile_cnt = cute.size(tTR_tAcc.shape, mode=[3])
+                num_prev_subtiles = tile_scheduler.num_tiles_executed * subtile_cnt
+                for subtile_idx in cutlass.range(subtile_cnt):
+                    #
+                    # Load accumulator from tensor memory buffer to register
+                    #
+                    tTR_tAcc_mn = tTR_tAcc[(None, None, None, subtile_idx)]
+                    cute.copy(tiled_copy_t2r, tTR_tAcc_mn, tTR_rAcc)
+
+                    #
+                    # Store acc to tRS_rD (fp32), then cvt_copy to sD (d_dtype)
+                    #
+                    tRS_rD.store(tiled_copy_r2s.retile(tTR_rAcc).load())
+                    c_buffer = (num_prev_subtiles + subtile_idx) % self.epi_stage
+                    copy_utils.cvt_copy(
+                        tiled_copy_r2s,
+                        tRS_rD,
+                        tRS_sD[(None, None, None, c_buffer)],
+                    )
+                    # Fence and barrier to make sure shared memory store is visible to TMA store
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    self.epilogue_barrier.arrive_and_wait()
+
+                    #
+                    # TMA store D to global memory
+                    #
+                    if warp_idx == self.epilog_warp_id[0]:
+                        copy_D(src_idx=c_buffer, dst_idx=subtile_idx)
+                        epi_store_pipeline.producer_commit()
+                        epi_store_pipeline.producer_acquire()
+                    self.epilogue_barrier.arrive_and_wait()
+
+                ### temporary epilogue end
                 tctx.e("epilogue")
 
                 # Async arrive accumulator buffer empty
@@ -1624,6 +1666,7 @@ class GemmSm100(GemmSm90):
                         * (self.cluster_shape_mnk[0] * self.cluster_shape_mnk[1])
                         + cute.arch.block_idx_in_cluster()
                     )
+
                     if warp_idx == self.epilog_warp_id[0]:
                         cute.arch.cp_async_bulk_wait_group(0, read=False)
                         with cute.arch.elect_one():
@@ -1693,9 +1736,6 @@ class GemmSm100(GemmSm90):
 
                 while work_tile.is_valid_tile:
                     cur_tile_coord = work_tile.tile_idx
-                    if bidx == 2 and bidy == 0 and bidz == 0 and warp_idx == self.reduce_scatter_warp_ids[0]:
-                        with cute.arch.elect_one():
-                           cute.printf("cur_tile_coord={},{},{}", cur_tile_coord[0], cur_tile_coord[1], cur_tile_coord[2]) 
                     mma_tile_coord_mnl = (
                         ((cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)) % m_tiles_per_rank)
                         + self.rank_id * m_tiles_per_rank,
@@ -1706,7 +1746,11 @@ class GemmSm100(GemmSm90):
                     chunk_id = (cur_tile_coord[0] // cute.size(tiled_mma.thr_id.shape)) // m_tiles_per_rank
                     tile_id = mma_tile_coord_mnl[0] + mma_tile_coord_mnl[1] * m_tiles_in_total
                     tile_id = tile_id * cute.size(tiled_mma.thr_id.shape)
-
+                    """                    
+                    if bidx == 0 and bidy == 0 and bidz == 0 and warp_idx == self.reduce_scatter_warp_ids[0]:
+                        with cute.arch.elect_one():
+                            cute.printf("self.rank_id={}, cur_tile_coord={},{},{}, mma_tile_coord_mnl={},{},{}", self.rank_id, cur_tile_coord[0], cur_tile_coord[1], cur_tile_coord[2], mma_tile_coord_mnl[0], mma_tile_coord_mnl[1], mma_tile_coord_mnl[2])
+                    """
                     if not is_leader_cta:
                         tile_id = tile_id + 1
 
@@ -1787,8 +1831,6 @@ class GemmSm100(GemmSm90):
                                 tmp_results[2, i, j] = z
                                 tmp_results[3, i, j] = w
 
-                    from cutlass._mlir.dialects import llvm
-                    from cutlass.cutlass_dsl import T
                     for i in cutlass.range_constexpr(loop_m):
                         for j in cutlass.range_constexpr(loop_n):
                             if cute.elem_less(frpD[0, i, j], local_chunk_upper_bound) and not cute.elem_less(frpD[0, i, j], local_chunk_lower_bound):
@@ -1835,6 +1877,10 @@ class GemmSm100(GemmSm90):
                             scope="sys",
                             order="release",
                         )
+
+                        if bidx == 0 and bidy == 0 and bidz == 0:
+                            cute.printf("self.rank_id={}, spinning", self.rank_id)
+                        
                         utils.distributed.spin_lock_atom_cas_relaxed_wait(
                             lock_ptr=barrier_flag.iterator
                             + last_tile_id_linear

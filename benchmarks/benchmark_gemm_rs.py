@@ -8,7 +8,39 @@ import torch
 import torch.distributed as dist
 from cuda.core import Device
 from cuda.pathfinder import load_nvidia_dynamic_lib
-from triton.testing import do_bench
+from triton.testing import do_bench, runtime as triton_runtime, _summarize_statistics
+
+
+def do_bench_all(fn, n_warmup=25, n_rep=20, grad_to_none=None, quantiles=None, return_mode="mean"):
+    """issue: do_bench computes n_repeat which may vary between ranks, causing deadlock. do_bench_dist runs a fixed number of iterations across ranks,"""
+    assert return_mode in ["min", "max", "mean", "median", "all"]
+    
+    di = triton_runtime.driver.active.get_device_interface()
+    
+    fn()
+    di.synchronize()
+    
+    cache = triton_runtime.driver.active.get_empty_cache_for_benchmark()
+    
+    start_event = [di.Event(enable_timing=True) for i in range(n_rep)]
+    end_event = [di.Event(enable_timing=True) for i in range(n_rep)]
+    
+    # Warm-up
+    for _ in range(n_warmup):
+        fn()
+    # Benchmark
+    for i in range(n_rep):
+        if grad_to_none is not None:
+            for x in grad_to_none:
+                x.grad = None
+        triton_runtime.driver.active.clear_cache(cache)
+        start_event[i].record()
+        fn()
+        end_event[i].record()
+    # Record clocks
+    di.synchronize()
+    times = [s.elapsed_time(e) for s, e in zip(start_event, end_event)]
+    return _summarize_statistics(times, quantiles, return_mode)
 
 import cutlass
 import cutlass.torch as cutlass_torch
@@ -179,8 +211,12 @@ def run(args):
     elif reduce_scatter:
         assert not varlen_m and not varlen_k and not gather_A, \
             "reduce_scatter does not support varlen_m, varlen_k, or gather_A"
-        A = torch.randn(l, m, k, dtype=torch.bfloat16, device=device) / (k**0.5)
-        B = torch.randn(l, n, k, dtype=torch.bfloat16, device=device) / (k**0.5)
+        # Deterministic: rank r fills A with (r+1), B with 1.0
+        # => A@B.T on rank r = (r+1)*k  =>  RS sum = k*sum(1..world_size)
+        _rank = dist.get_rank()
+        _world = dist.get_world_size()
+        A = torch.full((l, m, k), float(_rank + 1), dtype=torch.bfloat16, device=device)
+        B = torch.ones(l, n, k, dtype=torch.bfloat16, device=device)
         D_cpu = torch.zeros(l, m, n, dtype=torch.bfloat16)
         mD, mD_mc, D, D_torch_mc, D_peer_torch_tensors, D_peer_tensors = create_mc_tensor(
             D_cpu, cutlass.BFloat16, leading_dim=2
@@ -250,9 +286,14 @@ def run(args):
             m_per_rank = m // dist.get_world_size()
             start = dist.get_rank() * m_per_rank
             end = start + m_per_rank
+
+            actual_slice = D[:, start:end, :].to(torch.float32)
+            ref_slice    = ref_local[:, start:end, :].to(torch.bfloat16).to(torch.float32)
+            print(f"[rank {_rank}] D[0,0,:4]   = {actual_slice[0, 0, :4].tolist()}")
+            print(f"[rank {_rank}] ref[0,0,:4] = {ref_slice[0, 0, :4].tolist()}")
             torch.testing.assert_close(
-                D[:, start:end, :].to(torch.float32),
-                ref_local[:, start:end, :].to(torch.bfloat16).to(torch.float32),
+                actual_slice,
+                ref_slice,
                 atol=tolerance, rtol=1e-3,
             )
             print("passed rs ref check")
@@ -274,22 +315,32 @@ def run(args):
         timing_cublas = do_bench(fn_cublas, warmup=warmup, rep=repeats)
         tflops_cublas = flops / (timing_cublas * 1e9)
         print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
-
+     
     time.sleep(0.5)
-    timing = do_bench(fn, warmup=warmup, rep=repeats)
+    timing = do_bench_all(fn, n_warmup=warmup, n_rep=repeats)
     time.sleep(0.5)
-    timing = do_bench(fn, warmup=warmup, rep=repeats)
+    timing = do_bench_all(fn, n_warmup=warmup, n_rep=repeats)
     tflops = flops / (timing * 1e9)
     gbps = total_bytes / (timing * 1e6)
     print(f"Cute-DSL Average time: {timing:.3f} ms, TFLOPS: {tflops:.1f}, GB/s: {gbps:.0f}")
-    fn()
-
+    
+    """ this code works!
+    time.sleep(0.5)
+    for i in range(100):
+        # print(f"iteration={i}")
+        fn()
+    # time.sleep(0.5)
+    for i in range(100):
+        # print(f"iteration={i}")
+        fn()
+    """
+    """
     if not (varlen_m or varlen_k) and not gather_A:
         time.sleep(0.5)
         timing_cublas = do_bench(fn_cublas, warmup=warmup, rep=repeats)
         tflops_cublas = flops / (timing_cublas * 1e9)
         print(f"CuBLAS Average time: {timing_cublas:.3f} ms, TFLOPS: {tflops_cublas:.1f}")
-
+    """
     if reduce_scatter:
         nvshmem.core.free_tensor(D_torch_mc)
         nvshmem.core.free_tensor(D)
