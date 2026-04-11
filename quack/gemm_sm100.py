@@ -25,7 +25,9 @@ from cutlass.cute.nvgpu.warp import (
 )
 from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
+from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
+from cutlass.cute.tensor import TensorSSA
 from cutlass.cutlass_dsl import T
 
 from quack.pipeline import PipelineTmaUmma, PipelineTmaCpAsyncUmma
@@ -479,6 +481,7 @@ class GemmSm100(GemmSm90):
         barrier_flag: Optional[cute.Tensor] = None,
         barrier_flag_mc: Optional[cute.Tensor] = None,
         trace_ptr: Optional[cutlass.Int64] = None,
+        epi_rs_args: Optional[tuple] = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -668,6 +671,7 @@ class GemmSm100(GemmSm90):
             )
 
         epilogue_params = self.epi_to_underlying_arguments(epilogue_args)
+        epi_rs_params = self.epi_rs_to_underlying_arguments(epi_rs_args) if self.reduce_scatter is not None else None
         varlen_params = VarlenManager.to_underlying_arguments(varlen_args)
 
         """
@@ -767,6 +771,7 @@ class GemmSm100(GemmSm90):
             tma_atom_c,
             tma_tensor_c,
             epilogue_params,
+            epi_rs_params,
             varlen_params,
             self.cluster_layout_vmnk,
             self.cluster_layout_sfb_vmnk,
@@ -813,6 +818,7 @@ class GemmSm100(GemmSm90):
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: Optional[cute.Tensor],
         epilogue_params,
+        epi_rs_params,
         varlen_params: VarlenManager.Params,
         cluster_layout_vmnk: cute.Layout,
         cluster_layout_sfb_vmnk: Optional[cute.Layout],
@@ -1774,8 +1780,12 @@ class GemmSm100(GemmSm90):
                     local_chunk_upper_bound = ((rank_id + 1) * m_per_rank, mD_mc.shape[1], mD_mc.shape[2])
 
                     tctx.b("rs")
+                    epi_tile_rs = cutlass.const_expr((atom_thr_m, self.mma_tiler[1]))
+                    tidx_rs = tidx - cutlass.const_expr(self.reduce_scatter_warp_ids[0] * cute.arch.WARP_SIZE)
+                    epi_rs_state = self.epi_rs_begin(epi_rs_params, epi_tile_rs, thr_copy_fake, tCpD_local_rank, tidx_rs)
                     for i in cutlass.range_constexpr(loop_m):
                         for j in cutlass.range_constexpr(loop_n):
+                            loop_state = self.epi_rs_begin_loop(epi_rs_state, (i, j))
                             if cute.elem_less(frpD[0, i, j], local_chunk_upper_bound) and not cute.elem_less(frpD[0, i, j], local_chunk_lower_bound):
                                 mc_ptr = frgD_mc[None, i, j].iterator
                                 if cutlass.const_expr(self.d_dtype == cutlass.Float16):
@@ -1788,6 +1798,9 @@ class GemmSm100(GemmSm90):
                                 tmp_results[1, i, j] = y
                                 tmp_results[2, i, j] = z
                                 tmp_results[3, i, j] = w
+                                dst_vec_type = ir.VectorType.get([atom_val], mD_mc.element_type.mlir_type)
+                                tRS_rD = TensorSSA(llvm.bitcast(dst_vec_type, tmp_results[None, i, j].load()), (atom_val,), mD_mc.element_type).to(Float32)
+                                self.epi_rs_visit_subtile_slice(loop_state, epi_rs_params, tRS_rD, frpD[None, i, j])
 
                     for i in cutlass.range_constexpr(loop_m):
                         for j in cutlass.range_constexpr(loop_n):
@@ -1805,6 +1818,7 @@ class GemmSm100(GemmSm90):
                                     has_side_effects=True,
                                     asm_dialect=0,
                                 )
+                    self.epi_rs_end(epi_rs_state, epi_rs_params, frpD, mma_tile_coord_mnl, tidx_rs)
                     tctx.e("rs")
 
                     # Advance to next tile
