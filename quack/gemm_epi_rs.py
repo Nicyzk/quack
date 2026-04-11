@@ -8,6 +8,7 @@ from cutlass import Int32, Float32, const_expr
 
 from quack.cute_dsl_utils import mlir_namedtuple
 from quack.sm90_utils import partition_for_epilogue
+from quack import layout_utils
 
 class GemmLseRsMixin():
     """LSE (log-sum-exp) computation in the RS warp block.
@@ -107,20 +108,25 @@ class GemmLseRsMixin():
         atom_thr_n = const_expr(self.mma_tiler[1] // (128 // self.d_dtype.width))
         n_tile_idx = mma_tile_coord_mnl[1]
         batch_idx = mma_tile_coord_mnl[2]
-        loop_m = const_expr(tDr_max.shape[1])
-        loop_n = const_expr(tDr_max.shape[2])
-        for i in cutlass.range_constexpr(loop_m):
-            for j in cutlass.range_constexpr(loop_n):
-                tDr_max_loop = cute.group_modes(tDr_max, 1, cute.rank(tDr_max))[(None, None), (i, j)]
-                tDr_sum_loop = cute.group_modes(tDr_sum, 1, cute.rank(tDr_sum))[(None, None), (i, j)]
-                tDr_max_flt = cute.filter_zeros(tDr_max_loop)
-                tDr_sum_flt = cute.filter_zeros(tDr_sum_loop)
-                # Final warp-reduce sum across atom_thr_n n-threads; max already reduced per visit.
-                tDr_sum_flt[0] = cute.arch.warp_reduction_sum(tDr_sum_flt[0], threads_in_group=atom_thr_n)
-                row_idx, _, _ = frpD[0, i, j]
+
+        # Final warp-reduce sum across atom_thr_n n-threads (once per unique m-row).
+        # Max was already warp-reduced inside epi_rs_visit_subtile_slice.
+        tDr_sum_flt = cute.filter_zeros(tDr_sum)
+        for r in cutlass.range_constexpr(cute.size(tDr_sum_flt)):
+            tDr_sum_flt[r] = cute.arch.warp_reduction_sum(tDr_sum_flt[r], threads_in_group=atom_thr_n)
+
+        # Per-row views: collapse every mode that has stride 0 in tDr_max's layout
+        # (i.e. the N modes broadcast by the stride=(1,0) source layout). frpD shares
+        # the same partition structure, so the remaining modes line up element-for-element.
+        tDr_max_m = layout_utils.convert_layout_zero_stride(tDr_max, tDr_max.layout)[None, 0]
+        tDr_sum_m = layout_utils.convert_layout_zero_stride(tDr_sum, tDr_max.layout)[None, 0]
+        frpD_m = layout_utils.convert_layout_zero_stride(frpD, tDr_max.layout)[None, 0]
+
+        # One writer per m-row: thread 0 in each n-group.
+        if tidx_rs % atom_thr_n == 0:
+            for m in cutlass.range_constexpr(cute.size(frpD_m, mode=[0])):
+                row_idx, _, _ = frpD_m[m]
                 if cute.elem_less((row_idx, n_tile_idx), epi_rs_params.mLSE.shape[:2]):
-                    # One writer per m-row: thread 0 in each n-group.
-                    if tidx_rs % atom_thr_n == 0:
-                        row_max = 0.0 if tDr_max_flt[0] == -Float32.inf else tDr_max_flt[0]
-                        lse_val = mult * row_max + cute.math.log(tDr_sum_flt[0], fastmath=True)
-                        epi_rs_params.mLSE[row_idx, n_tile_idx, batch_idx] = lse_val
+                    row_max = 0.0 if tDr_max_m[m] == -Float32.inf else tDr_max_m[m]
+                    lse_val = mult * row_max + cute.math.log(tDr_sum_m[m], fastmath=True)
+                    epi_rs_params.mLSE[row_idx, n_tile_idx, batch_idx] = lse_val
