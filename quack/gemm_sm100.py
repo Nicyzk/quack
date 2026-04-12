@@ -1799,8 +1799,11 @@ class GemmSm100(GemmSm90):
                                 tmp_results[2, i, j] = z
                                 tmp_results[3, i, j] = w
                                 dst_vec_type = ir.VectorType.get([atom_val], mD_mc.element_type.mlir_type)
-                                tRS_rD = TensorSSA(llvm.bitcast(dst_vec_type, tmp_results[None, i, j].load()), (atom_val,), mD_mc.element_type).to(Float32)
-                                self.epi_rs_visit_subtile_slice(loop_state, epi_rs_params, tRS_rD, frpD[None, i, j])
+                                tRS_rD_ssa = TensorSSA(llvm.bitcast(dst_vec_type, tmp_results[None, i, j].load()), (atom_val,), mD_mc.element_type).to(Float32)
+                                tRS_rD = cute.make_rmem_tensor((atom_val,), Float32)
+                                for v in cutlass.range_constexpr(atom_val):
+                                    tRS_rD[v] = tRS_rD_ssa[v]
+                                self.epi_rs_visit_subtile_slice(loop_state, epi_rs_params, tRS_rD)
 
                     for i in cutlass.range_constexpr(loop_m):
                         for j in cutlass.range_constexpr(loop_n):
@@ -1818,7 +1821,7 @@ class GemmSm100(GemmSm90):
                                     has_side_effects=True,
                                     asm_dialect=0,
                                 )
-                    self.epi_rs_end(epi_rs_state, epi_rs_params, frpD, mma_tile_coord_mnl, tidx_rs)
+                    self.epi_rs_end(epi_rs_state, epi_rs_params, mma_tile_coord_mnl, tidx_rs)
                     tctx.e("rs")
 
                     # Advance to next tile
@@ -1849,10 +1852,10 @@ class GemmSm100(GemmSm90):
                             scope="sys",
                             order="release",
                         )
-
+                        """
                         if bidx == 0 and bidy == 0 and bidz == 0:
                             cute.printf("self.rank_id={}, spinning", self.rank_id)
-                        
+                        """
                         utils.distributed.spin_lock_atom_cas_relaxed_wait(
                             lock_ptr=barrier_flag.iterator
                             + last_tile_id_linear

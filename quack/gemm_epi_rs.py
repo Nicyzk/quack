@@ -59,20 +59,27 @@ class GemmLseRsMixin():
         tDr_sum = cute.make_rmem_tensor(tDrLSE_layout, Float32)
         cute.filter_zeros(tDr_max).fill(-Float32.inf)
         cute.filter_zeros(tDr_sum).fill(0.0)
-        return tDr_max, tDr_sum
+        # Partition the global coordinate tensor with the same partition_for_epilogue
+        # so tRS_cD has matching 5-mode structure as tDr_max. tCpD_local_rank already
+        # carries global coordinates (from make_identity_tensor(mD_mc.shape)).
+        tRS_cD = partition_for_epilogue(
+            tCpD_local_rank, epi_tile=epi_tile_rs, tiled_copy=tiled_copy,
+            tidx=tidx_rs, reference_src=True,
+        )
+        return tDr_max, tDr_sum, tRS_cD
 
     @cute.jit
     def epi_rs_begin_loop(self, epi_rs_state, epi_coord):
-        tDr_max, tDr_sum = epi_rs_state
-        # Shape from partition_for_epilogue: (CPY, CPY_M, CPY_N, EPI_M, EPI_N)
-        # Group (EPI_M, EPI_N) into mode 3, index with epi_coord
+        tDr_max, tDr_sum, tRS_cD = epi_rs_state
+        # Shape: (CPY, CPY_M, CPY_N, EPI_M, EPI_N) from partition_for_epilogue
         tDr_max_loop = cute.group_modes(tDr_max, 3, cute.rank(tDr_max))[(None, None), None, None, epi_coord]
         tDr_sum_loop = cute.group_modes(tDr_sum, 3, cute.rank(tDr_sum))[(None, None), None, None, epi_coord]
-        return tDr_max_loop, tDr_sum_loop
+        tRS_cD_loop = cute.group_modes(tRS_cD, 3, cute.rank(tRS_cD))[(None, None), None, None, epi_coord]
+        return tDr_max_loop, tDr_sum_loop, tRS_cD_loop
 
     @cute.jit
-    def epi_rs_visit_subtile_slice(self, loop_state, epi_rs_params, tRS_rD, frpD):
-        tDr_max_loop, tDr_sum_loop = loop_state
+    def epi_rs_visit_subtile_slice(self, loop_state, epi_rs_params, tRS_rD):
+        tDr_max_loop, tDr_sum_loop, tRS_cD_loop = loop_state
         do_bound_check = const_expr(epi_rs_params.D_limit_n is not None)
         mult = epi_rs_params.multiplier if const_expr(epi_rs_params.multiplier is not None) else 1.0
         atom_thr_n = const_expr(self.mma_tiler[1] // (128 // self.d_dtype.width))
@@ -84,9 +91,9 @@ class GemmLseRsMixin():
         tDr_prev_max = cute.make_rmem_tensor_like(tDr_max_flt, Float32)
         tDr_prev_max.store(tDr_max_flt.load())
 
-        # Per-element max update; tDr_max_loop[k] maps k to the right m-row via stride=(1,0)
+        # Per-element max update
         for k in cutlass.range(cute.size(tDr_max_loop), unroll_full=True):
-            m_k, n_k, l_k = frpD[k]
+            m_k, n_k, l_k = tRS_cD_loop[k]
             if not do_bound_check or n_k < epi_rs_params.D_limit_n:
                 tDr_max_loop[k] = cute.arch.fmax(tDr_max_loop[k], tRS_rD[k])
 
@@ -98,14 +105,14 @@ class GemmLseRsMixin():
             tDr_sum_flt[r] *= cute.math.exp2(math.log2(math.e) * mult * (prev_max - cur_max), fastmath=True)
 
         # Per-element sum update
-        for k in cutlass.range(cute.size(tDr_max_loop), unroll_full=True):
-            m_k, n_k, l_k = frpD[k]
+        for k in cutlass.range(cute.size(tDr_sum_loop), unroll_full=True):
+            m_k, n_k, l_k = tRS_cD_loop[k]
             if not do_bound_check or n_k < epi_rs_params.D_limit_n:
                 tDr_sum_loop[k] += cute.math.exp2(math.log2(math.e) * mult * (tRS_rD[k] - tDr_max_loop[k]), fastmath=True)
 
     @cute.jit
-    def epi_rs_end(self, epi_rs_state, epi_rs_params, frpD, mma_tile_coord_mnl, tidx_rs):
-        tDr_max, tDr_sum = epi_rs_state
+    def epi_rs_end(self, epi_rs_state, epi_rs_params, mma_tile_coord_mnl, tidx_rs):
+        tDr_max, tDr_sum, tRS_cD = epi_rs_state
         mult = epi_rs_params.multiplier if const_expr(epi_rs_params.multiplier is not None) else 1.0
         atom_thr_n = const_expr(self.mma_tiler[1] // (128 // self.d_dtype.width))
         n_tile_idx = mma_tile_coord_mnl[1]
@@ -122,7 +129,7 @@ class GemmLseRsMixin():
         # the same partition structure, so the remaining modes line up element-for-element.
         tDr_max_m = layout_utils.convert_layout_zero_stride(tDr_max, tDr_max.layout)[None, 0]
         tDr_sum_m = layout_utils.convert_layout_zero_stride(tDr_sum, tDr_max.layout)[None, 0]
-        frpD_m = layout_utils.convert_layout_zero_stride(frpD, tDr_max.layout)[None, 0]
+        frpD_m = layout_utils.convert_layout_zero_stride(tRS_cD, tDr_max.layout)[None, 0]
 
         # One writer per m-row: thread 0 in each n-group.
         if tidx_rs % atom_thr_n == 0:
