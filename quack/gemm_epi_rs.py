@@ -45,13 +45,13 @@ class GemmLseRsMixin():
         return self.EpiRSParams(args.mLSE, args.mTarget, args.mTargetLogit, args.D_limit_n, args.multiplier)
 
     @cute.jit
-    def epi_rs_begin(self, epi_rs_params, epi_tile_rs, thr_copy_fake, tCpD_local_rank, tidx_rs):
+    def epi_rs_begin(self, epi_rs_params, epi_tile_rs, tiled_copy, tCpD_local_rank, tidx_rs):
         # m-only layout: stride=(1,0) makes m unique, n broadcast.
         tile_layout = cute.make_layout(tCpD_local_rank.shape, stride=(1, 0))
         tDrLSE_layout = partition_for_epilogue(
             cute.make_rmem_tensor(tile_layout, Float32),
             epi_tile=epi_tile_rs,
-            tiled_copy=thr_copy_fake,
+            tiled_copy=tiled_copy,
             tidx=tidx_rs,
             reference_src=True,
         ).layout
@@ -64,8 +64,10 @@ class GemmLseRsMixin():
     @cute.jit
     def epi_rs_begin_loop(self, epi_rs_state, epi_coord):
         tDr_max, tDr_sum = epi_rs_state
-        tDr_max_loop = cute.group_modes(tDr_max, 1, cute.rank(tDr_max))[(None, None), epi_coord]
-        tDr_sum_loop = cute.group_modes(tDr_sum, 1, cute.rank(tDr_sum))[(None, None), epi_coord]
+        # Shape from partition_for_epilogue: (CPY, CPY_M, CPY_N, EPI_M, EPI_N)
+        # Group (EPI_M, EPI_N) into mode 3, index with epi_coord
+        tDr_max_loop = cute.group_modes(tDr_max, 3, cute.rank(tDr_max))[(None, None), None, None, epi_coord]
+        tDr_sum_loop = cute.group_modes(tDr_sum, 3, cute.rank(tDr_sum))[(None, None), None, None, epi_coord]
         return tDr_max_loop, tDr_sum_loop
 
     @cute.jit
@@ -83,20 +85,20 @@ class GemmLseRsMixin():
         tDr_prev_max.store(tDr_max_flt.load())
 
         # Per-element max update; tDr_max_loop[k] maps k to the right m-row via stride=(1,0)
-        for k in cutlass.range_constexpr(cute.size(tDr_max_loop)):
+        for k in cutlass.range(cute.size(tDr_max_loop), unroll_full=True):
             m_k, n_k, l_k = frpD[k]
             if not do_bound_check or n_k < epi_rs_params.D_limit_n:
                 tDr_max_loop[k] = cute.arch.fmax(tDr_max_loop[k], tRS_rD[k])
 
         # Warp-reduce max and rescale sum — one pass per unique m-row
-        for r in cutlass.range_constexpr(cute.size(tDr_max_flt)):
+        for r in cutlass.range(cute.size(tDr_max_flt), unroll_full=True):
             prev_max = tDr_prev_max[r] if tDr_prev_max[r] > -Float32.inf else 0.0
             tDr_max_flt[r] = cute.arch.warp_reduction_max(tDr_max_flt[r], threads_in_group=atom_thr_n)
             cur_max = tDr_max_flt[r] if tDr_max_flt[r] > -Float32.inf else 0.0
             tDr_sum_flt[r] *= cute.math.exp2(math.log2(math.e) * mult * (prev_max - cur_max), fastmath=True)
 
         # Per-element sum update
-        for k in cutlass.range_constexpr(cute.size(tDr_max_loop)):
+        for k in cutlass.range(cute.size(tDr_max_loop), unroll_full=True):
             m_k, n_k, l_k = frpD[k]
             if not do_bound_check or n_k < epi_rs_params.D_limit_n:
                 tDr_sum_loop[k] += cute.math.exp2(math.log2(math.e) * mult * (tRS_rD[k] - tDr_max_loop[k]), fastmath=True)
@@ -112,7 +114,7 @@ class GemmLseRsMixin():
         # Final warp-reduce sum across atom_thr_n n-threads (once per unique m-row).
         # Max was already warp-reduced inside epi_rs_visit_subtile_slice.
         tDr_sum_flt = cute.filter_zeros(tDr_sum)
-        for r in cutlass.range_constexpr(cute.size(tDr_sum_flt)):
+        for r in cutlass.range(cute.size(tDr_sum_flt), unroll_full=True):
             tDr_sum_flt[r] = cute.arch.warp_reduction_sum(tDr_sum_flt[r], threads_in_group=atom_thr_n)
 
         # Per-row views: collapse every mode that has stride 0 in tDr_max's layout
@@ -124,7 +126,7 @@ class GemmLseRsMixin():
 
         # One writer per m-row: thread 0 in each n-group.
         if tidx_rs % atom_thr_n == 0:
-            for m in cutlass.range_constexpr(cute.size(frpD_m, mode=[0])):
+            for m in cutlass.range(cute.size(frpD_m, mode=[0]), unroll_full=True):
                 row_idx, _, _ = frpD_m[m]
                 if cute.elem_less((row_idx, n_tile_idx), epi_rs_params.mLSE.shape[:2]):
                     row_max = 0.0 if tDr_max_m[m] == -Float32.inf else tDr_max_m[m]

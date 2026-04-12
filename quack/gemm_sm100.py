@@ -1782,7 +1782,7 @@ class GemmSm100(GemmSm90):
                     tctx.b("rs")
                     epi_tile_rs = cutlass.const_expr((atom_thr_m, self.mma_tiler[1]))
                     tidx_rs = tidx - cutlass.const_expr(self.reduce_scatter_warp_ids[0] * cute.arch.WARP_SIZE)
-                    epi_rs_state = self.epi_rs_begin(epi_rs_params, epi_tile_rs, thr_copy_fake, tCpD_local_rank, tidx_rs)
+                    epi_rs_state = self.epi_rs_begin(epi_rs_params, epi_tile_rs, tiled_copy_fake, tCpD_local_rank, tidx_rs)
                     for i in cutlass.range_constexpr(loop_m):
                         for j in cutlass.range_constexpr(loop_n):
                             loop_state = self.epi_rs_begin_loop(epi_rs_state, (i, j))
