@@ -23,6 +23,7 @@ from cutlass.cute.nvgpu.warp import (
 )
 from cutlass import Int32, Float32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
+import cutlass.utils.distributed as cute_distributed
 
 from quack.pipeline import PipelineTmaUmma, PipelineTmaCpAsyncUmma
 from quack.tile_scheduler import TileSchedulerOptions
@@ -523,6 +524,8 @@ class GemmSm100(GemmTmaBase):
         stream: cuda.CUstream,
         mSFA: Optional[cute.Tensor] = None,
         mSFB: Optional[cute.Tensor] = None,
+        load_a_flag: Optional[cutlass.Int64] = None,
+        d_stored_flags: Optional[cutlass.Int64] = None,
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes before smem/grid/tma computation
@@ -837,6 +840,8 @@ class GemmSm100(GemmTmaBase):
             self.epi_tile,
             tile_sched_params,
             TileSchedulerCls,
+            load_a_flag,
+            d_stored_flags,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -879,6 +884,8 @@ class GemmSm100(GemmTmaBase):
         epi_tile: cute.Tile,
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
+        load_a_flag: Optional[cutlass.Int64] = None,
+        d_stored_flags: Optional[cutlass.Int64] = None,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -1046,6 +1053,17 @@ class GemmSm100(GemmTmaBase):
                 cute.arch.griddepcontrol_wait()
             if const_expr(self.gather_A):
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
+            # Gated A-load: load warp spins until the producer signals this shard's flag.
+            # Non-consuming (ld < expected, no reset) so it's broadcast-safe across CTAs.
+            if const_expr(load_a_flag is not None):
+                if cute.arch.lane_idx() == 0:
+                    flag_ptr = cute.make_ptr(
+                        Int32, load_a_flag, cute.AddressSpace.gmem, assumed_align=4
+                    )
+                    cute_distributed.spin_lock_ld_lt_relaxed_wait(
+                        flag_ptr, expected_val=Int32(1), scope="gpu"
+                    )
+                cute.arch.sync_warp()
             # Compute multicast mask for A/B buffer full
             block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
             block_in_cluster_coord_sfb_vmnk = None
@@ -1675,6 +1693,24 @@ class GemmSm100(GemmTmaBase):
                 # acc_pipeline.consumer_release was already called in self.epi_load_acc_subtile
                 acc_consumer_state.advance()
                 iket.range_pop()
+
+                # Signal this output tile is stored: drain its TMA stores, then multicast
+                # release/sys +1 into d_stored_flags[m, n] (each rank's slot reaches world_size).
+                if const_expr(d_stored_flags is not None):
+                    if is_tma_warp:
+                        cute.arch.cp_async_bulk_wait_group(0)
+                        with cute.arch.elect_one():
+                            n_tiles = cute.ceil_div(
+                                cute.size(mD_mnl, mode=[1]), self.cta_tile_shape_mnk[1]
+                            )
+                            idx = tile_coord_mnkl[0] * n_tiles + tile_coord_mnkl[1]
+                            cptr = cute.make_ptr(
+                                Int32,
+                                d_stored_flags + cutlass.Int64(idx * 4),
+                                cute.AddressSpace.gmem,
+                                assumed_align=4,
+                            )
+                            cute_distributed.multimem_red_release_sys_add1(cptr)
 
                 # Advance to next tile
                 tile_scheduler.advance_to_next_work()

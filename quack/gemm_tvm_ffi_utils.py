@@ -185,6 +185,8 @@ def compile_gemm_kernel(
     post_init=None,
     mSFA=None,
     mSFB=None,
+    has_load_a_flag=False,
+    has_d_stored_flags=False,
     use_tma_gather=False,
     concat_layout=None,
     num_warps=None,
@@ -214,6 +216,15 @@ def compile_gemm_kernel(
         post_init(gemm_obj)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     sf_args = () if device_capacity[0] in (8, 9, 12) else (mSFA, mSFB)
+    # Load-A flag pointer (Optional[Int64]): SM100 only, compile with Int64(0) when
+    # requested, None otherwise. TVM-FFI caches each variant separately.
+    load_a_args = (
+        (Int64(0) if has_load_a_flag else None,) if device_capacity[0] in (10, 11) else ()
+    )
+    # D-stored flags pointer (Optional[Int64]): SM100 only, mirrors load_a_flag caching.
+    d_stored_args = (
+        (Int64(0) if has_d_stored_flags else None,) if device_capacity[0] in (10, 11) else ()
+    )
     return cute.compile(
         gemm_obj,
         mA,
@@ -225,5 +236,7 @@ def compile_gemm_kernel(
         varlen_args,
         stream,
         *sf_args,
+        *load_a_args,
+        *d_stored_args,
         options="--enable-tvm-ffi",
     )

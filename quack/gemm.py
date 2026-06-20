@@ -64,6 +64,8 @@ def _compile_gemm(
     rounding_mode,
     sr_seed_mode,
     num_warps,
+    has_load_a_flag=False,
+    has_d_stored_flags=False,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -134,6 +136,8 @@ def _compile_gemm(
         epi_args,
         scheduler_args,
         varlen_args,
+        has_load_a_flag=has_load_a_flag,
+        has_d_stored_flags=has_d_stored_flags,
         use_tma_gather=use_tma_gather,
         concat_layout=concat_layout or None,
         num_warps=num_warps,
@@ -171,6 +175,8 @@ def gemm(
     use_tma_gather: bool = False,
     concat_layout: dict | None = None,
     num_warps: Optional[int] = None,
+    load_a_flag: Optional[Tensor] = None,  # (1,) int32; A-load waits until it is 1
+    d_stored_flags: Optional[Tensor] = None,  # (tiles_m, tiles_n) int32 MULTICAST; +1 per output tile stored (release/sys)
 ) -> None:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
@@ -195,6 +201,12 @@ def gemm(
     )
     if use_tma_gather:
         assert device_capacity[0] in [10, 11], "TMA gather currently requires SM100/SM110"
+    if load_a_flag is not None:
+        assert device_capacity[0] in [10, 11], "load_a_flag requires SM100/SM110"
+        assert not gather_A, "load_a_flag is not supported with gather_A"
+    if d_stored_flags is not None:
+        assert device_capacity[0] in [10, 11], "d_stored_flags requires SM100/SM110"
+        assert not (varlen_m or varlen_k), "d_stored_flags assumes a static 2D tile grid"
     if rounding_mode == RoundingMode.RS:
         assert device_capacity[0] == 10, "Stochastic rounding (RoundingMode.RS) requires SM100"
     if is_dynamic_persistent and device_capacity[0] <= 9:
@@ -249,6 +261,8 @@ def gemm(
         rounding_mode,
         sr_seed_mode,
         num_warps,
+        load_a_flag is not None,
+        d_stored_flags is not None,
     )
 
     from quack.cache import is_compile_only
@@ -287,6 +301,11 @@ def gemm(
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
 
     if device_capacity[0] in [10, 11]:
-        compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None)
+        load_a_ptr = load_a_flag.data_ptr() if load_a_flag is not None else None
+        d_stored_ptr = d_stored_flags.data_ptr() if d_stored_flags is not None else None
+        compiled_fn(
+            A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args, None, None,
+            load_a_ptr, d_stored_ptr,
+        )
     else:
         compiled_fn(A_p, B_p, D_p, C_p, epi_args, scheduler_args, varlen_args)
