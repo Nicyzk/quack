@@ -5,7 +5,7 @@ from functools import partial
 
 
 import cutlass.cute as cute
-from cutlass import Int32, Float32
+from cutlass import Int32, Int64, Float32
 from cutlass.cute.runtime import make_ptr
 
 from quack.compile_utils import make_fake_tensor as fake_tensor
