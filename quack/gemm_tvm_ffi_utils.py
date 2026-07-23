@@ -299,10 +299,19 @@ def make_fake_epi_reduce_args(d_dtype, num_ranks):
     d_fake = lambda: fake_tensor(
         d_dtype, (cute.sym_int(), cute.sym_int(), cute.sym_int()), leading_dim=1, divisibility=dvec
     )
+    # (cta_M * cta_N, ntile_m, ntile_n, L) d_dtype partial stripes, stripe-contiguous.
+    ws_fake = lambda: fake_tensor(
+        d_dtype,
+        (cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()),
+        leading_dim=0,
+        divisibility=dvec,
+    )
     flags = lambda: fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=4)
     return EpiReduceArguments(
         mD_mc=d_fake(),
         mD_peers=tuple(d_fake() for _ in range(num_ranks)),
+        workspace=ws_fake(),
+        workspace_mc=ws_fake(),
         tile_flags=flags(),
         tile_flags_mc=flags(),
         sync_barrier=flags(),

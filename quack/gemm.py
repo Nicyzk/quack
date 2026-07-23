@@ -474,6 +474,8 @@ def gemm(
         if epi_reduce_args is None:
             raise ValueError("epi_reduce_mode requires epi_reduce_args")
         epi_reduce = (epi_reduce_mode, dist.get_world_size(), dist.get_rank())
+        if epi_reduce_mode == "all_reduce" and D.shape[-1] % (16 // D.element_size()) != 0:
+            raise ValueError("all_reduce needs N % (16B / d_dtype) == 0 (16B multimem_st)")
     elif epi_reduce_args is not None:
         raise ValueError("epi_reduce_args requires epi_reduce_mode")
     key = (

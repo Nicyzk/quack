@@ -7,24 +7,23 @@ epilogue_split_rank / split_rank_partial_commit, the cross-rank siblings of the
 split-K pair.
 
 Dataflow: both warp groups run epilogue_split_rank. The producer's finalize action
-is split_rank_partial_commit — register-direct d_dtype D partials into symmetric D,
-then the tile signal. The reducer's is epilogue() between two bound functions:
-multimem ld_reduce in, EVT/C_load/aux TileStores unchanged in the middle,
-register-direct store out (this rank's slab for reduce_scatter, multimem_st
-broadcast for all_reduce). Pipelines: epi_pipeline stages C for the reducer;
+is split_rank_partial_commit — d_dtype fragment stripes into the symmetric
+workspace (_frag_stripe_op, split-K's addressing), then the tile signal. The
+reducer walks producer tiles intersecting its slab and runs epilogue() between two
+bound functions: stripe multimem ld_reduce in (same addressing, mc view),
+EVT/C_load/aux TileStores unchanged in the middle, real-address store out
+(reduce_scatter: this rank's D slab; all_reduce: 16B multimem_st chunks through
+the mc partition). Pipelines: epi_pipeline stages C for the reducer;
 epi_reduce_store_pipeline backs the reducer's aux stores."""
 
-from typing import NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 from cutlass import Int32, const_expr
-from cutlass.cutlass_dsl import T
-from cutlass._mlir.dialects import llvm
 
 from quack.cute_dsl_utils import mlir_namedtuple
-from quack.dist_utils import multimem_ld_reduce_128b
 from quack.fast_math import FastDivmod
 
 
@@ -33,18 +32,22 @@ from quack.fast_math import FastDivmod
 
 @mlir_namedtuple
 class EpiReduceArguments(NamedTuple):
-    """Comm-side tensors for epi_reduce_mode. tile_flags/counters are sized to one
-    problem shape (the tile->slot mapping); sync_barrier is per resident epi-reduce
-    CTA slot, with num_sms allocation remaining a safe upper bound."""
+    """Comm-side tensors for epi_reduce_mode. workspace/tile_flags/counters share one
+    problem shape's cluster-rounded (E, ntile_m, ntile_n, L) tile domain; sync_barrier
+    is per resident epi-reduce CTA slot, with num_sms allocation remaining a safe
+    upper bound."""
 
     mD_mc: Optional[cute.Tensor] = None  # multicast view of symmetric D
     mD_peers: Optional[tuple] = None  # per-rank views of symmetric D
-    # producer -> consumer, ceil(M/cta_M) * ceil(N/cta_N) * L entries
+    # d_dtype partial stripes, (cta_M * cta_N, ntile_m, ntile_n, L) symmetric
+    workspace: Optional[cute.Tensor] = None
+    workspace_mc: Optional[cute.Tensor] = None
+    # producer -> consumer, one flag per workspace tile slot
     tile_flags: Optional[cute.Tensor] = None
     tile_flags_mc: Optional[cute.Tensor] = None
     sync_barrier: Optional[cute.Tensor] = None  # exit barrier, one slot per resident CTA
     sync_barrier_mc: Optional[cute.Tensor] = None
-    # consumer-private epoch bases, slab_tiles_m * ceil(N/cta_N) * L entries
+    # consumer-private epoch bases, indexed like tile_flags
     consumer_counters: Optional[cute.Tensor] = None
 
 
@@ -117,104 +120,107 @@ def epi_reduce_exit_slot(params: EpiReduceSchedulerParams) -> Int32:
     return slot_layout((cta_m, cta_n, cluster_id))
 
 
-# ---- multimem reduce + store ----
-# Tile-agnostic (no GEMM state; a standalone RS kernel could bind them), under a
-# three-part contract: the fragment views are of a symmetric-heap tensor (mc view
-# for ld_reduce/broadcast, peer view for the slab store); the partition's value
-# atom is one contiguous 128b vector (n-major, N % (16B/elem) == 0); subtiles
-# slice fragment rows evenly (chunk = loop_m / num_subtiles).
+# ---- stripe reduce / commit ----
+# The reducer's two data-movement callbacks, both in the PRODUCER's r2s fragment
+# geometry (the stripe contract).
 
 
 @cute.jit
-def multimem_reduce_subtile(
-    frgD_mc: cute.Tensor,
-    frgD_crd: cute.Tensor,
-    row_limit: Int32,
+def stripe_reduce_subtile(
+    stripe_op: Callable,
+    ws_mc_ptr: cute.Pointer,
+    num_threads: cutlass.Constexpr[int],
+    tidx: Int32,
+    tRS_cD: cute.Tensor,
+    row_lo: Int32,
+    row_hi: Int32,
     col_limit: Int32,
     subtile_layout: cute.Layout,
     tRS_rD: cute.Tensor,
     epi_coord: cute.Coord,
-    no_release: cutlass.Constexpr[bool] = False,
 ) -> None:
-    """Reduce this subtile's D partials across all ranks into tRS_rD via multimem
-    ld_reduce; passed to epilogue() as load_acc_subtile by the reducer warps.
-    Rows/cols past row/col_limit (partial slab tile / N tail) are zeroed: keeps
-    visit reductions exact. N % (16B/elem) keeps vectors from straddling the edge."""
-    _atom, chunk, loop_n = tRS_rD.shape
+    """Reduce this subtile's workspace stripes across all ranks into tRS_rD;
+    passed to epilogue() as load_acc_subtile by the reducer warps. stripe_op is
+    the bound _frag_stripe_op — the identical addressing the producers stored
+    with, read through the workspace's mc view. Lanes outside [row_lo, row_hi)
+    (foreign slab rows / M tail) or past col_limit are zeroed: keeps visit
+    reductions exact, and foreign rows belong to their owning rank."""
+    frag_elems = cute.size(tRS_rD)
     epi_idx = subtile_layout(epi_coord)
-    ld_reduce = multimem_ld_reduce_128b(frgD_mc.element_type)
-    tmp_results = cute.make_rmem_tensor((4, chunk, loop_n), cutlass.Int32)
-    for ii in cutlass.range_constexpr(chunk):
-        i = epi_idx * chunk + ii
-        for j in cutlass.range_constexpr(loop_n):
-            crd = frgD_crd[((0, 0), i, j)]
-            if crd[0] < row_limit and crd[1] < col_limit:
-                mc_ptr = frgD_mc[None, i, j].iterator
-                x, y, z, w = ld_reduce(mc_ptr)
-                tmp_results[0, ii, j] = x
-                tmp_results[1, ii, j] = y
-                tmp_results[2, ii, j] = z
-                tmp_results[3, ii, j] = w
-            else:
-                tmp_results[0, ii, j] = Int32(0)
-                tmp_results[1, ii, j] = Int32(0)
-                tmp_results[2, ii, j] = Int32(0)
-                tmp_results[3, ii, j] = Int32(0)
-    tmp_rD = cute.recast_tensor(tmp_results, frgD_mc.element_type)
-    tRS_rD.store(tmp_rD.load().to(tRS_rD.element_type))
+    tmp = cute.make_rmem_tensor(tRS_rD.layout.shape, ws_mc_ptr.dtype)
+    stripe_op(
+        "multimem_ld_reduce", ws_mc_ptr + epi_idx * num_threads * frag_elems,
+        tidx, num_threads, tmp,
+    )
+    tRS_rD.store(tmp.load().to(tRS_rD.element_type))
+    tRS_cD_cur = tRS_cD[None, None, None, epi_coord[0], epi_coord[1]]
+    for i in cutlass.range_constexpr(frag_elems):
+        crd = tRS_cD_cur[i]
+        if crd[0] < row_lo or crd[0] >= row_hi or crd[1] >= col_limit:
+            tRS_rD[i] = 0.0
 
 
 @cute.jit
-def commit_reduced_subtile(
-    frgD_mc: cute.Tensor,
-    frgD_peer: cute.Tensor,
-    frgD_crd: cute.Tensor,
-    row_limit: Int32,
+def commit_frag_subtile(
+    tRS_gD: cute.Tensor,
+    tRS_gD_mc: Optional[cute.Tensor],
+    tRS_cD: cute.Tensor,
+    row_lo: Int32,
+    row_hi: Int32,
     col_limit: Int32,
-    subtile_layout: cute.Layout,
+    full_tile: cutlass.Boolean,
     all_reduce: cutlass.Constexpr[bool],
     tRS_rD: cute.Tensor,
     epi_coord: cute.Coord,
 ) -> None:
-    """Store the reduced, post-EVT subtile — reduce_scatter: st.global to this rank's
-    D slab; all_reduce: multimem_st broadcast to every rank. Passed to epilogue() as
-    commit_D by the reducer warps. Owns d_dtype conversion and edge predication: skip
-    rows past the slab (a foreign-row store races the owner's reduce) and cols past N
-    (n-major D: an OOB column wraps into the next row)."""
-    _atom, chunk, loop_n = tRS_rD.shape
-    epi_idx = subtile_layout(epi_coord)
-    if const_expr(tRS_rD.element_type != frgD_mc.element_type):
-        tmp_out = cute.make_rmem_tensor(tRS_rD.layout.shape, frgD_mc.element_type)
-        tmp_out.store(tRS_rD.load().to(frgD_mc.element_type))
+    """Store the reduced, post-EVT subtile at real (m, n) — reduce_scatter: plain
+    generic stores to this rank's D slab (single-writer-local now that partials
+    live in the workspace); all_reduce: 16B multimem_st through the mc partition
+    to every rank. Passed to epilogue() as commit_D by the reducer warps. Owns
+    d_dtype conversion and slab/edge predication.
+
+    The AR chunks lean on the tmem-load atom handing each thread contiguous
+    n-runs: coalesce fragment and gmem partition (order-preserving), certify 16B
+    with max_common_vector, then one multimem_st per chunk. Chunks never straddle
+    rows (cta_n % vec == 0) and never straddle N (host asserts N % vec == 0 for
+    AR), so the first element's coords predicate the whole chunk."""
+    tRS_gD_cur = tRS_gD[None, None, None, epi_coord[0], epi_coord[1]]
+    if const_expr(tRS_rD.element_type != tRS_gD.element_type):
+        tmp_out = cute.make_rmem_tensor(tRS_rD.layout.shape, tRS_gD.element_type)
+        tmp_out.store(tRS_rD.load().to(tRS_gD.element_type))
     else:
         tmp_out = tRS_rD
-    out_i32 = cute.recast_tensor(tmp_out, cutlass.Int32)
-    for ii in cutlass.range_constexpr(chunk):
-        i = epi_idx * chunk + ii
-        for j in cutlass.range_constexpr(loop_n):
-            crd = frgD_crd[((0, 0), i, j)]
-            if crd[0] < row_limit and crd[1] < col_limit:
-                if const_expr(all_reduce):
-                    utils.distributed.multimem_st_4xb32(
-                        frgD_mc[None, i, j].iterator,
-                        out_i32[0, ii, j].ir_value(),
-                        out_i32[1, ii, j].ir_value(),
-                        out_i32[2, ii, j].ir_value(),
-                        out_i32[3, ii, j].ir_value(),
-                    )
-                else:
-                    ptr_int = frgD_peer[None, i, j].iterator.toint().ir_value()
-                    x, y, z, w = (
-                        out_i32[0, ii, j].ir_value(),
-                        out_i32[1, ii, j].ir_value(),
-                        out_i32[2, ii, j].ir_value(),
-                        out_i32[3, ii, j].ir_value(),
-                    )
-                    llvm.inline_asm(
-                        T.i32(),
-                        [ptr_int, x, y, z, w],
-                        "st.global.sys.relaxed.v4.f32 [$1], {$2, $3, $4, $5};",
-                        "=r,l,r,r,r,r",
-                        has_side_effects=True,
-                        asm_dialect=0,
-                    )
+    tRS_cD_cur = tRS_cD[None, None, None, epi_coord[0], epi_coord[1]]
+    if const_expr(not all_reduce):
+        if full_tile:
+            cute.autovec_copy(tmp_out, tRS_gD_cur)
+        else:
+            for i in cutlass.range_constexpr(cute.size(tmp_out)):
+                crd = tRS_cD_cur[i]
+                if crd[0] >= row_lo and crd[0] < row_hi and crd[1] < col_limit:
+                    tRS_gD_cur[i] = tmp_out[i]
+    else:
+        gD_mc_cur = tRS_gD_mc[None, None, None, epi_coord[0], epi_coord[1]]
+        gD_mc_f = cute.coalesce(gD_mc_cur)
+        vec = const_expr(
+            min(
+                cute.max_common_vector(gD_mc_f, cute.coalesce(tmp_out)),
+                128 // tRS_gD.element_type.width,
+            )
+        )
+        assert vec == 128 // tRS_gD.element_type.width, (
+            "all_reduce commit needs 16B fragment n-runs (tmem-load atom too narrow)"
+        )
+        gD_mc_v = cute.zipped_divide(gD_mc_f, vec)
+        for v in cutlass.range_constexpr(cute.size(tmp_out) // vec):
+            crd = tRS_cD_cur[v * vec]
+            if crd[0] >= row_lo and crd[0] < row_hi and crd[1] < col_limit:
+                chunk = cute.make_tensor(tmp_out.iterator + v * vec, cute.make_layout(vec))
+                v32 = cute.recast_tensor(chunk, cutlass.Int32)
+                utils.distributed.multimem_st_4xb32(
+                    gD_mc_v[None, v].iterator,
+                    v32[0].ir_value(),
+                    v32[1].ir_value(),
+                    v32[2].ir_value(),
+                    v32[3].ir_value(),
+                )

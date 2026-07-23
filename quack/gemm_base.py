@@ -18,6 +18,8 @@ import quack.layout_utils as layout_utils
 import quack.utils as utils
 from cutlass.utils.distributed import multimem_red_add1
 
+from quack.dist_utils import multimem_ld_reduce_128b
+
 from quack.cute_dsl_utils import ParamsBase
 from quack.epi_ops import EpiSmemBytes, TileLoad, TileStore, VecReduce
 from quack.epi_reduce import EpiReduceArguments
@@ -80,11 +82,9 @@ class GemmBase:
     split_k = 1
     split_k_mode = SplitKMode.SERIAL
     # Fused epilogue reduction across TP ranks: None | "reduce_scatter" | "all_reduce".
-    # Staging tiles (read by quack.epi_utils.setup_epi_tensor):
-    #   D partials -> epi_tile (epilogue warps, unchanged)
-    #   C / EpiOp aux -> epi_reduce_tile (reducer warps)
+    # Everything stages per epi_tile — the reducer warps run the standard epilogue
+    # geometry (the stripe contract reuses the producer's r2s fragment order).
     epi_reduce_mode = None
-    epi_reduce_tile = None
     # mB arrives (l, k, n) and is transposed to (n, k, l) at trace time when set
     # (see rotate_batch_last); compile_gemm_kernel sets these per compiled
     # variant. All three are trace-time relabels replacing per-call host
@@ -541,34 +541,29 @@ class GemmBase:
         load_acc_subtile: Callable,
         tRS_rD: cute.Tensor,
         epi_tile: cute.Tile,
-        tRS_gD: cute.Tensor,
-        tRS_cD: cute.Tensor,
-        limit_m: Int32,
-        limit_n: Int32,
-        full_tile: cutlass.Boolean,
+        ws_ptr: cute.Pointer,
         epi_read_state: Optional[cutlass.pipeline.PipelineState],
         epi_producer_state: Optional[cutlass.pipeline.PipelineState],
         epilogue_barrier: cutlass.pipeline.NamedBarrier,
         tile_flags_mc: cute.Tensor,
         tile_id: Int32,
-        in_bounds: cutlass.Boolean,
+        tidx: Int32,
         is_tma_warp: cutlass.Boolean,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         """Split-rank sibling of split_k_partial_commit: commit this rank's D partial,
-        run no epi ops (EVT/C/aux belong to the reducer warps). Unlike split-K's
-        layout-free f32 stripes, the partial is stored in d_dtype at real (m, n)
-        addresses — the cross-rank multimem contract — as plain register-direct
-        stores: generic-proxy stores need no TMA drain, so ordering is just the
-        epi-group barrier below plus the signal's release. tRS_gD/tRS_cD are the
-        r2s-fragment-order gmem partition of this tile and its (m, n) coords, with
-        the epi-subtile modes trailing; full interior tiles take the vectorized
-        copy, edge tiles the predicated scalar loop.
+        run no epi ops (EVT/C/aux belong to the reducer warps). Same flat workspace
+        stripes as split-K, but in d_dtype (the cross-rank wire format) in this rank's
+        SYMMETRIC workspace — the reducer folds them with the multimem_ld_reduce
+        stripe op at the identical addressing. Generic-proxy stores need no TMA
+        drain, so ordering is just the epi-group barrier below plus the signal's
+        release.
 
         The tile signal is the sibling of split-K's sem release: +1 on every
         rank's copy of flag[tile_id] (multimem red.release), after the barrier
         orders all epi threads' stores. Flags are monotonic — never reset —
-        and consumers epoch-track via consumer_counters; in_bounds skips
-        fully-OOB CTA halves, whose coord would alias the next column's flag.
+        and consumers epoch-track via consumer_counters. The workspace/flag
+        domain is the cluster-rounded tile grid, so a fully-OOB CTA half owns a
+        (dead) slot and commits junk safely — no in-bounds predication anywhere.
 
         Runs where epi_fn would (once per tile, on the local finalizing entity —
         under local split-K the load_acc_subtile it receives is the
@@ -584,34 +579,32 @@ class GemmBase:
         epi_tile_layout = cute.make_ordered_layout(
             epi_tile_shape, order=(0, 1) if const_expr(self.epi_m_major) else (1, 0)
         )
+        num_epi_threads = self.num_epi_warps * cute.arch.WARP_SIZE
+        frag_elems = cute.size(tRS_rD)
+        assert (
+            frag_elems * num_epi_threads * cute.size(epi_tile_shape)
+            == self.cta_tile_shape_mnk[0] * self.cta_tile_shape_mnk[1]
+        ), "split-rank workspace stripe does not tile cta_tile_m * cta_tile_n"
         for epi_idx in cutlass.range_constexpr(cute.size(epi_tile_shape)):
             epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
             load_acc_subtile(tRS_rD, epi_coord)
             tRS_rD_out = cute.make_rmem_tensor(tRS_rD.layout.shape, self.d_dtype)
             tRS_rD_out.store(tRS_rD.load().to(self.d_dtype))
-            tRS_gD_cur = tRS_gD[None, None, None, epi_coord[0], epi_coord[1]]
-            if full_tile:
-                cute.autovec_copy(tRS_rD_out, tRS_gD_cur)
-            else:
-                tRS_cD_cur = tRS_cD[None, None, None, epi_coord[0], epi_coord[1]]
-                for i in cutlass.range_constexpr(cute.size(tRS_rD_out)):
-                    crd = tRS_cD_cur[i]
-                    if crd[0] < limit_m and crd[1] < limit_n:
-                        tRS_gD_cur[i] = tRS_rD_out[i]
+            frag_base = ws_ptr + epi_idx * num_epi_threads * frag_elems
+            self._frag_stripe_op("store", frag_base, tidx, num_epi_threads, tRS_rD_out)
         # All epi threads' stores ordered before the elected signal thread's release.
         epilogue_barrier.arrive_and_wait()
         if is_tma_warp:
-            if in_bounds:
-                with cute.arch.elect_one():
-                    multimem_red_add1(
-                        lock_ptr=tile_flags_mc.iterator + tile_id, scope="gpu", order="release"
-                    )
+            with cute.arch.elect_one():
+                multimem_red_add1(
+                    lock_ptr=tile_flags_mc.iterator + tile_id, scope="gpu", order="release"
+                )
         return epi_read_state, epi_producer_state
 
     @cute.jit
     def _frag_stripe_op(
         self,
-        op: cutlass.Constexpr[Literal["store", "red_add", "load_add"]],
+        op: cutlass.Constexpr[Literal["store", "red_add", "load_add", "multimem_ld_reduce"]],
         frag_base: cute.Pointer,
         tidx: Int32,
         num_threads: cutlass.Constexpr,
@@ -619,15 +612,18 @@ class GemmBase:
     ) -> None:
         """One accumulator fragment vs the tile's flat workspace stripe.
 
-        The stripe is (vector, thread, 4)-interleaved: at a fixed vector index,
-        adjacent threads access adjacent 16-byte chunks — vectorized v4 when the
-        fragment allows, scalar (thread-strided) otherwise. The three ops share
-        this addressing exactly, which is what makes the write and read sides
-        provably consistent:
+        The stripe is (vector, thread, 16B)-interleaved: at a fixed vector index,
+        adjacent threads access adjacent 16-byte chunks — vectorized when the
+        fragment allows, scalar (thread-strided) otherwise. The stripe dtype is the
+        fragment's dtype (f32 for split-K, d_dtype for split-rank partials). The four
+        ops share this addressing exactly, which is what makes the write and read
+        sides provably consistent:
 
         - "store":    plain store of the fragment (split 0's in-order init)
         - "red_add":  one-way L2 red.add, no read-back (later splits' commits)
         - "load_add": read the stripe and add it INTO the fragment (finalizer fold)
+        - "multimem_ld_reduce": read the stripe through a multicast pointer, reducing
+          across ranks into the fragment (split-rank fold; frag_base must be mc)
         """
         frag_elems = cute.size(tRS_rD)
         if const_expr(op == "load_add"):
@@ -635,20 +631,32 @@ class GemmBase:
             frag = tRS_rWs
         else:
             frag = tRS_rD
-        if const_expr(frag_elems % 4 == 0 and self.acc_dtype == cutlass.Float32):
+        vec = 128 // frag.element_type.width  # one 16B chunk
+        if const_expr(frag_elems % vec == 0):
             gWs = cute.make_tensor(frag_base, cute.make_layout(num_threads * frag_elems))
             thr_copy, tCgWs = copy_utils.vectorized_thread_partition(
-                gWs, tidx, num_threads, 4, is_source=const_expr(op == "load_add")
+                gWs,
+                tidx,
+                num_threads,
+                vec,
+                is_source=const_expr(op == "load_add" or op == "multimem_ld_reduce"),
             )
-            for v in cutlass.range_constexpr(frag_elems // 4):
-                chunk = cute.make_tensor(frag.iterator + 4 * v, cute.make_layout(4))
+            for v in cutlass.range_constexpr(frag_elems // vec):
+                chunk = cute.make_tensor(frag.iterator + vec * v, cute.make_layout(vec))
                 if const_expr(op == "store"):
                     cute.copy(thr_copy, chunk, tCgWs[None, v])
                 elif const_expr(op == "red_add"):
                     cute.arch.atomic_add(tCgWs[None, v].iterator, chunk.load())
+                elif const_expr(op == "multimem_ld_reduce"):
+                    x, y, z, w = multimem_ld_reduce_128b(frag.element_type)(
+                        tCgWs[None, v].iterator
+                    )
+                    chunk_i32 = cute.recast_tensor(chunk, cutlass.Int32)
+                    chunk_i32[0], chunk_i32[1], chunk_i32[2], chunk_i32[3] = x, y, z, w
                 else:
                     cute.copy(thr_copy, tCgWs[None, v], chunk)
         else:
+            assert op != "multimem_ld_reduce", "multimem stripe op needs 16B-divisible fragments"
             frag_layout = cute.make_layout((num_threads, frag_elems), stride=(1, num_threads))
             tRS_gWs = cute.make_tensor(frag_base, frag_layout)
             for v in cutlass.range_constexpr(frag_elems):
@@ -796,11 +804,9 @@ class GemmBase:
         # Which warp group calls (static, per call site): the producer commits this
         # rank's partial; the reducer is the finalizer running epi_fn.
         is_producer: cutlass.Constexpr[bool] = True,
-        # epi_reduce_mode materials, unused when mode is None: the r2s copy (producer
-        # commit addressing) and the comm bundle — one collective allocation, one
-        # argument (flags, counters, mc/peer views; the kernel's own mD is a TMA
-        # coordinate tensor, so the store target is the bundle's peer view).
-        tiled_copy_r2s: Optional[cute.TiledCopy] = None,
+        # epi_reduce_mode comm bundle, unused when mode is None: one collective
+        # allocation, one argument (symmetric workspace, flags, counters, mc/peer
+        # views of D).
         epi_reduce_args: Optional[EpiReduceArguments] = None,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         """Split-rank protocol wrapper — the cross-rank sibling of epilogue_split_k.
@@ -821,92 +827,55 @@ class GemmBase:
         its own coordinates (producer: global CTA tiles; reducer: slab tiles) —
         is_producer folds each call site to its branch. ``epi_fn`` is the
         finalizer's once-per-tile action, exactly as in epilogue_split_k: the
-        reducer binds the full epilogue (multimem load_acc, commit_D) into it;
-        the producer's finalize action is the rank's partial commit instead, and
-        nesting through epilogue_split_k makes local split-K compose (the
+        reducer binds the full epilogue (stripe multimem load_acc, commit_D) into
+        it; the producer's finalize action is the rank's partial commit instead,
+        and nesting through epilogue_split_k makes local split-K compose (the
         committed partial is the rank's completed local sum). Like its sibling
         builds ws_ptr/split_k_sem, this wrapper owns the flag protocol on both
-        sides: the M-major CTA-tile flag indexing, the producer's commit
-        addressing (fragment-order gmem partition of this tile of symmetric D),
-        and the reducer's spin + epoch counters. Without epi_reduce_mode this is
-        a pure passthrough (world of 1 is a trivial rank split)."""
-        cta_m, cta_n = self.cta_tile_shape_mnk[0], self.cta_tile_shape_mnk[1]
+        sides: the workspace-domain tile_id shared by flags and stripe slots, and
+        the reducer's spin + epoch counters. Both sides address the workspace with
+        the split-K stripe machinery (_frag_stripe_op) — the reducer's fold reads
+        the stripes through the multicast view. Without epi_reduce_mode this is a
+        pure passthrough (world of 1 is a trivial rank split)."""
         if const_expr(self.epi_reduce_mode is not None and is_producer):
-            assert tiled_copy_r2s is not None and epi_reduce_args is not None, (
-                "producer needs tiled_copy_r2s and epi_reduce_args"
-            )
-            # This rank's symmetric-D view (real pointers; the kernel's mD is a TMA
-            # coordinate tensor and cannot back generic stores).
-            mD_local = epi_reduce_args.mD_peers[self.rank_id]
-            # Flag contract: M-major CTA-tile linear id, derived identically by the
-            # reducer branch below. A fully-OOB CTA half (partial MMA tile) has no
-            # rows to announce — in_bounds keeps its coord from aliasing the next
-            # column's flag.
-            cta_tiles_m = cute.ceil_div(mD_local.shape[0], cta_m)
-            cta_tiles_n = cute.ceil_div(mD_local.shape[1], cta_n)
+            assert epi_reduce_args is not None, "producer needs epi_reduce_args"
+            # Flat d_dtype stripes in this rank's symmetric workspace, at split-K's
+            # cluster-rounded (E, tile_m, tile_n, L) slot. Flags share that domain:
+            # every CTA half (fully-OOB ones included) owns a slot, and the tile_id
+            # below is derived identically by the reducer branch.
+            ws = epi_reduce_args.workspace
+            ntile_m, ntile_n = ws.shape[1], ws.shape[2]
             tile_id = Int32(
-                tile_coord_mnkl[0]
-                + cta_tiles_m * (tile_coord_mnkl[1] + cta_tiles_n * tile_coord_mnkl[3])
+                tile_coord_mnkl[0] + ntile_m * (tile_coord_mnkl[1] + ntile_n * tile_coord_mnkl[3])
             )
-            in_bounds = tile_coord_mnkl[0] * cta_m < mD_local.shape[0]
-            # Fragment-order gmem partition of this tile of symmetric D (and its
-            # (m, n) coords), epi-subtile modes trailing — the direct store targets.
-            mD_l = mD_local[None, None, tile_coord_mnkl[3]]
-            tile_mn = (tile_coord_mnkl[0], tile_coord_mnkl[1])
-            gD = cute.local_tile(mD_l, self.cta_tile_shape_mnk[:2], tile_mn)
-            cD = cute.local_tile(
-                cute.make_identity_tensor(mD_l.shape), self.cta_tile_shape_mnk[:2], tile_mn
+            ws_ptr = utils.elem_pointer(
+                ws, (0, tile_coord_mnkl[0], tile_coord_mnkl[1], tile_coord_mnkl[3])
             )
-            thr_copy_r2s = tiled_copy_r2s.get_slice(tidx)
-            tRS_gD = thr_copy_r2s.partition_D(cute.flat_divide(gD, epi_tile))
-            tRS_cD = thr_copy_r2s.partition_D(cute.flat_divide(cD, epi_tile))
-            full_tile = (tile_coord_mnkl[0] + 1) * cta_m <= mD_l.shape[0] and (
-                tile_coord_mnkl[1] + 1
-            ) * cta_n <= mD_l.shape[1]
-
             # The rank's partial commit replaces the epilogue closure as the finalize
             # action; load_acc_subtile stays the one argument left unbound.
             epi_fn = partial(
                 self.split_rank_partial_commit,
                 tRS_rD=tRS_rD,
                 epi_tile=epi_tile,
-                tRS_gD=tRS_gD,
-                tRS_cD=tRS_cD,
-                limit_m=mD_l.shape[0],
-                limit_n=mD_l.shape[1],
-                full_tile=full_tile,
+                ws_ptr=ws_ptr,
                 epi_read_state=epi_read_state,
                 epi_producer_state=epi_producer_state,
                 epilogue_barrier=epilogue_barrier,
                 tile_flags_mc=epi_reduce_args.tile_flags_mc,
                 tile_id=tile_id,
-                in_bounds=in_bounds,
+                tidx=tidx,
                 is_tma_warp=is_tma_warp,
             )
         if const_expr(self.epi_reduce_mode is not None and not is_producer):
             assert epi_reduce_args is not None, "reducer needs epi_reduce_args"
-            # Finalizer wait — the sibling of split-K's sem.wait_eq(S-1). Producer
-            # tiles (and their flags) are anchored at global row 0; consumer tiles
-            # at the slab start, which need not be a multiple of cta_m. Same shape,
-            # out of phase: this tile's valid rows span 1-2 producer tiles (exactly
-            # 1 when M % (TP*cta_m) == 0).
-            mD_mc = epi_reduce_args.mD_mc
-            slab_m = mD_mc.shape[0] // self.num_ranks
-            slab_row0 = self.rank_id * slab_m
-            cta_tiles_m_total = cute.ceil_div(mD_mc.shape[0], cta_m)
-            n_tiles_total = cute.ceil_div(mD_mc.shape[1], cta_n)
-            slab_tiles_m = cute.ceil_div(slab_m, cta_m)
-            m_tile, n_tile = tile_coord_mnkl[0], tile_coord_mnkl[1]
-            batch = tile_coord_mnkl[3]
-            row0 = m_tile * cta_m
-            rows_here = Int32(cta_m)
-            if slab_m - row0 < cta_m:
-                rows_here = slab_m - row0
-            g_row0 = slab_row0 + row0
-            prod_m0 = g_row0 // cta_m
-            prod_m1 = (g_row0 + rows_here - 1) // cta_m
-            slab_linear = m_tile + slab_tiles_m * (n_tile + n_tiles_total * batch)
-            flag_base = cta_tiles_m_total * (n_tile + n_tiles_total * batch)
+            # Finalizer wait — the sibling of split-K's sem.wait_eq(S-1). The reducer
+            # walks producer tiles (its tile_coord_mnkl is the GLOBAL tile coord), so
+            # one flag covers the tile.
+            ws = epi_reduce_args.workspace
+            ntile_m, ntile_n = ws.shape[1], ws.shape[2]
+            tile_id = Int32(
+                tile_coord_mnkl[0] + ntile_m * (tile_coord_mnkl[1] + ntile_n * tile_coord_mnkl[3])
+            )
 
             # Passed as args: DSL control flow can't close over outer variables.
             def spin_flag(flag, base, num_ranks):
@@ -915,20 +884,16 @@ class GemmBase:
                 while res - base < num_ranks:
                     res = cute.arch.load(flag.llvm_ptr, cutlass.Int32, sem="relaxed", scope="gpu")
 
-            # One counter per consumer tile: each producer signal is +1, so every
-            # flag grows by exactly num_ranks per launch and both checks share one
-            # baseline. Never reset flags: PDL overlaps launches, so the next
-            # launch's +1 can land before a store-0 reset (erased signal = hang),
-            # and a twice-visited flag would over-drain under per-visit
-            # subtraction. Counters are single-writer; int32 wrap harmless
-            # (differences only).
+            # One counter per tile, indexed like the flags: each producer signal is +1,
+            # so every flag grows by exactly num_ranks per launch and both checks share
+            # one baseline. Never reset flags: PDL overlaps launches, so the next
+            # launch's +1 can land before a store-0 reset (erased signal = hang), and a
+            # twice-visited flag would over-drain under per-visit subtraction. Counters
+            # are single-writer; int32 wrap harmless (differences only).
             if tidx == 0:
-                counter = epi_reduce_args.consumer_counters.iterator + slab_linear
+                counter = epi_reduce_args.consumer_counters.iterator + tile_id
                 base = cute.arch.load(counter.llvm_ptr, cutlass.Int32, sem="relaxed", scope="gpu")
-                flags = epi_reduce_args.tile_flags
-                spin_flag(flags.iterator + prod_m0 + flag_base, base, self.num_ranks)
-                if prod_m1 != prod_m0:
-                    spin_flag(flags.iterator + prod_m1 + flag_base, base, self.num_ranks)
+                spin_flag(epi_reduce_args.tile_flags.iterator + tile_id, base, self.num_ranks)
                 cute.arch.atomic_add(
                     counter.llvm_ptr, Int32(self.num_ranks), sem="relaxed", scope="gpu"
                 )
@@ -1315,14 +1280,8 @@ class GemmTmaBase(GemmBase):
             )
         tma_atom_c, tma_tensor_c = None, None
         if const_expr(mC is not None):
-            # Under epi_reduce_mode, C is consumed by the reducer warps per epi_reduce_tile.
-            epi_c_tile = (
-                self.epi_reduce_tile
-                if const_expr(self.epi_reduce_mode is not None)
-                else self.epi_tile
-            )
             tma_atom_c, tma_tensor_c = self._make_tma_epi_atoms_and_tensors(
-                mC, self.epi_c_smem_layout_staged, epi_c_tile, op_type="load"
+                mC, self.epi_c_smem_layout_staged, self.epi_tile, op_type="load"
             )
         return (
             tma_atom_d,

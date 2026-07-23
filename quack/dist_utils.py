@@ -115,6 +115,17 @@ def create_multicast_tensor(torch_tensor_cpu, dtype, leading_dim, is_dynamic_lay
     return tensor, tensor_mc, torch_gpu, torch_gpu_mc, peer_torch, cute_peers
 
 
+def make_symmetric_tensor(shape, torch_dtype):
+    """Fresh symmetric tensor + multicast view (torch handles; no init — callers
+    gate reads on their own flags). Self-registers its free via on_finalize."""
+    import nvshmem.core
+
+    t = nvshmem.core.tensor(tuple(shape), dtype=torch_dtype)
+    t_mc = nvshmem.core.get_multicast_tensor(nvshmem.core.Teams.TEAM_NODE, t)
+    on_finalize(lambda: (nvshmem.core.free_tensor(t_mc), nvshmem.core.free_tensor(t)))
+    return t, t_mc
+
+
 def make_barrier_flags(num_flags):
     import nvshmem.core
 
