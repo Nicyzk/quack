@@ -31,3 +31,6 @@ def make_epi_reduce_args(mD_mc, mD_peers, m, n, l, cta_m, cta_n, num_ranks):
         sync_barrier_mc=sync_barrier_mc,
         consumer_counters=counters,
     )
+
+def _split_rank_buffers():
+    return (tile_flags, tile_flags_mc), consumer_counters (mD_mc, mD_peers)

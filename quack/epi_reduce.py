@@ -1,14 +1,17 @@
 """Fused-communication (epi_reduce_mode) GEMM epilogue pieces; nothing here runs on
 its own — gemm_sm100's kernel binds each piece into the shared GemmBase machinery.
 Sections below: host contract / reducer tile scheduler / cross-launch exit barrier /
-producer -> reducer tile signal / multimem reduce + store.
+multimem reduce + store. The split-rank protocol itself (flag contract, producer
+partial commit, reducer spin + epoch counters) lives in gemm_base's
+epilogue_split_rank / split_rank_partial_commit, the cross-rank siblings of the
+split-K pair.
 
-Dataflow: the producer runs epilogue(skip_epi_ops=True) via epilogue_split_k — D partials
-through the normal TMA path into symmetric D, then the tile signal. The reducer runs
-epilogue() between two bound functions: multimem ld_reduce in, EVT/C_load/aux
-TileStores unchanged in the middle, register-direct store out (this rank's slab for
-reduce_scatter, multimem_st broadcast for all_reduce). Pipelines: epi_pipeline stages
-C for the reducer; epi_store_pipeline backs the producer's D store;
+Dataflow: both warp groups run epilogue_split_rank. The producer's finalize action
+is split_rank_partial_commit — register-direct d_dtype D partials into symmetric D,
+then the tile signal. The reducer's is epilogue() between two bound functions:
+multimem ld_reduce in, EVT/C_load/aux TileStores unchanged in the middle,
+register-direct store out (this rank's slab for reduce_scatter, multimem_st
+broadcast for all_reduce). Pipelines: epi_pipeline stages C for the reducer;
 epi_reduce_store_pipeline backs the reducer's aux stores."""
 
 from typing import NamedTuple, Optional
@@ -112,26 +115,6 @@ def epi_reduce_exit_slot(params: EpiReduceSchedulerParams) -> Int32:
     cluster_id, cta_m, cta_n = clc_block_to_static_scheduler_coord(cluster_shape_mn)
     slot_layout = cute.make_layout((*cluster_shape_mn, params.num_persistent_clusters))
     return slot_layout((cta_m, cta_n, cluster_id))
-
-
-# ---- producer -> reducer tile signal ----
-
-
-@cute.jit
-def signal_partial_committed(
-    tile_flags_mc: cute.Tensor, tile_id: Int32, in_bounds: cutlass.Boolean
-) -> None:
-    """+1 on every rank's copy of this tile's flag: this rank's partial for the tile
-    is in symmetric D. Flags are monotonic (never reset); consumers epoch-track via
-    consumer_counters. Passed to epilogue_split_k as signal_finalized_tile — the local
-    finalizer's "tile committed" is, globally, one partial of the cross-rank reduce.
-    The caller binds addressing (tile_id, OOB guard); the wrapper owns ordering
-    (drains the finalizer's D partial TMA stores before this release)."""
-    if in_bounds:
-        with cute.arch.elect_one():
-            utils.distributed.multimem_red_add1(
-                lock_ptr=tile_flags_mc.iterator + tile_id, scope="gpu", order="release"
-            )
 
 
 # ---- multimem reduce + store ----
