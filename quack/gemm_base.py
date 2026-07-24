@@ -20,7 +20,7 @@ from cutlass.utils.distributed import multimem_red_add1
 
 from quack.cute_dsl_utils import ParamsBase
 from quack.epi_ops import EpiSmemBytes, TileLoad, TileStore, VecReduce
-from quack.epi_reduce import EpiReduceArguments, frag_tile_op
+from quack.epi_reduce import EpiReduceArguments, frag_stripe_view, frag_tile_op
 from quack.gemm_config import SplitKMode
 from quack.pipeline import PipelineTmaAsync, PipelineTmaCpAsync
 from quack.rounding import RoundingMode, epilogue_sr_seed
@@ -630,8 +630,8 @@ class GemmBase:
         """
         finalizer_load_acc = load_acc_subtile
         if const_expr(self.split_k > 1 and self.split_k_mode != SplitKMode.SEPARATE):
-            # The flag and workspace are CuTe tensors addressed by tile coord and
-            # real (m, n) — their layouts own the address computation.
+            # The flag and workspace are CuTe tensors addressed by tile coord —
+            # their layouts own the address computation.
             assert self.acc_dtype == cutlass.Float32, "split_k workspace is f32"
             batch_idx, split_idx = tile_coord_mnkl[3], tile_coord_mnkl[2]
             # Per-tile flag; the epi-group barrier is the sem's sync policy, so all
@@ -643,45 +643,18 @@ class GemmBase:
                 tidx,
                 sync=epilogue_barrier,
             )
-            # Workspace view: split-K's reader is its writer (same tile, same
-            # threads), so the (row, col) geometry is irrelevant and the view maps
-            # fragment slots straight to a warp-dense interleave — thread t, chunk c
-            # of subtile e at e*(NT*frag) + c*(NT*vec) + t*vec. A geometric
-            # partition would put adjacent threads a full row apart per instruction
-            # (warp-scattered commits: measured +37% on SERIAL small grids).
-            ws = params.split_k_workspace
-            num_epi_threads = self.num_epi_warps * cute.arch.WARP_SIZE
-            frag_elems = cute.size(tRS_rD)
-            # Largest 16B-capped chunk dividing the fragment; vec == 1 degenerates
-            # to the warp-dense scalar interleave (odd fragments stay dense).
-            vec = math.gcd(frag_elems, 128 // ws.element_type.width)
-            epi_tile_shape = cute.zipped_divide(
-                cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
-            ).shape[1]
-            assert (
-                frag_elems * num_epi_threads * cute.size(epi_tile_shape)
-                == self.cta_tile_shape_mnk[0] * self.cta_tile_shape_mnk[1]
-            ), "split-K workspace stripe does not tile cta_tile_m * cta_tile_n"
-            sub_order = cute.make_ordered_layout(
-                epi_tile_shape, order=(0, 1) if const_expr(self.epi_m_major) else (1, 0)
-            )
-            ntile_m = ws.shape[0] // self.cta_tile_shape_mnk[0]
-            ntile_n = ws.shape[1] // self.cta_tile_shape_mnk[1]
-            tile_elems = self.cta_tile_shape_mnk[0] * self.cta_tile_shape_mnk[1]
-            ws_ptr = ws.iterator + (
-                tile_coord_mnkl[0] + ntile_m * (tile_coord_mnkl[1] + ntile_n * batch_idx)
-            ) * tile_elems
-            tRS_gWs = cute.make_tensor(
-                ws_ptr + tidx * vec,
-                cute.make_layout(
-                    ((vec, frag_elems // vec), 1, 1, *epi_tile_shape),
-                    stride=(
-                        (1, num_epi_threads * vec),
-                        0,
-                        0,
-                        *(s * num_epi_threads * frag_elems for s in sub_order.stride),
-                    ),
-                ),
+            # Warp-dense stripe view of this tile's workspace region — legal
+            # because split-K's reader is its writer; the geometric partition
+            # would warp-scatter the commits (see frag_stripe_view).
+            tRS_gWs = frag_stripe_view(
+                params.split_k_workspace,
+                tile_coord_mnkl,
+                self.cta_tile_shape_mnk[:2],
+                epi_tile,
+                self.epi_m_major,
+                self.num_epi_warps * cute.arch.WARP_SIZE,
+                tidx,
+                tRS_rD,
             )
 
             def load_acc_and_fold(tRS_rD_, epi_coord, **kwargs):
@@ -765,8 +738,7 @@ class GemmBase:
 
         Both warp groups call this wrapper, each from its own scheduler loop with
         its own coordinates (producer: global CTA tiles; reducer: slab-local tiles
-        for reduce_scatter, global tiles for all_reduce) — is_producer folds each
-        call site to its branch. ``epi_fn`` is the finalizer's once-per-tile
+        in both modes) — is_producer folds each call site to its branch. ``epi_fn`` is the finalizer's once-per-tile
         action, exactly as in epilogue_split_k: the reducer binds the full
         epilogue (multimem load_acc, commit_D) into it; the producer's finalize
         action is the rank's partial commit instead, and nesting through
@@ -809,10 +781,9 @@ class GemmBase:
         if const_expr(self.epi_reduce_mode is not None and not is_producer):
             assert epi_reduce_args is not None, "reducer needs epi_reduce_args"
             # Finalizer wait — the sibling of split-K's sem.wait_eq(S-1).
-            # reduce_scatter: tile_coord_mnkl is SLAB-LOCAL (the reducer walks its
-            # own slab's tiles); when the slab origin is not cta_m-aligned the tile
-            # straddles two producer tiles, so wait on both flags. all_reduce:
-            # tile_coord_mnkl is the global producer tile, one flag covers it.
+            # tile_coord_mnkl is SLAB-LOCAL in both modes (the reducer walks its own
+            # slab's tiles); when the slab origin is not cta_m-aligned the tile
+            # straddles two producer tiles, so wait on both flags.
             m, n, batch = tile_coord_mnkl[0], tile_coord_mnkl[1], tile_coord_mnkl[3]
 
             # Passed as args: DSL control flow can't close over outer variables.
@@ -832,26 +803,19 @@ class GemmBase:
             if tidx == 0:
                 counter = utils.elem_pointer(epi_reduce_args.consumer_counters, (m, n, batch))
                 base = cute.arch.load(counter.llvm_ptr, cutlass.Int32, sem="relaxed", scope="gpu")
-                if const_expr(self.epi_reduce_mode == "reduce_scatter"):
-                    cta_m = self.cta_tile_shape_mnk[0]
-                    slab_m = epi_reduce_args.mD_mc.shape[0] // self.num_ranks
-                    slab_row0 = self.rank_id * slab_m
-                    t0 = (slab_row0 + m * cta_m) // cta_m
-                    t1 = (slab_row0 + cutlass.min((m + 1) * cta_m, slab_m) - 1) // cta_m
+                cta_m = self.cta_tile_shape_mnk[0]
+                slab_m = epi_reduce_args.mD_mc.shape[0] // self.num_ranks
+                slab_row0 = self.rank_id * slab_m
+                t0 = (slab_row0 + m * cta_m) // cta_m
+                t1 = (slab_row0 + cutlass.min((m + 1) * cta_m, slab_m) - 1) // cta_m
+                spin_flag(
+                    utils.elem_pointer(epi_reduce_args.tile_flags, (t0, n, batch)),
+                    base,
+                    self.num_ranks,
+                )
+                if t1 != t0:
                     spin_flag(
-                        utils.elem_pointer(epi_reduce_args.tile_flags, (t0, n, batch)),
-                        base,
-                        self.num_ranks,
-                    )
-                    if t1 != t0:
-                        spin_flag(
-                            utils.elem_pointer(epi_reduce_args.tile_flags, (t1, n, batch)),
-                            base,
-                            self.num_ranks,
-                        )
-                else:
-                    spin_flag(
-                        utils.elem_pointer(epi_reduce_args.tile_flags, (m, n, batch)),
+                        utils.elem_pointer(epi_reduce_args.tile_flags, (t1, n, batch)),
                         base,
                         self.num_ranks,
                     )

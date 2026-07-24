@@ -995,21 +995,16 @@ class GemmSm100(GemmTmaBase):
             tile_sched_params, scheduler_args.max_active_clusters
         )
         # epi_reduce warps get their own static persistent scheduler (the GEMM keeps
-        # quack's CLC). reduce_scatter: slab-anchored tiles of this rank's M/TP slab
-        # (slab-local coords; a tile straddling two producer tiles dual-waits in
-        # epilogue_split_rank, the last tile's overhang rows are predicated in the
-        # reduce/commit callbacks). all_reduce: the PRODUCER tiles whose rows
-        # intersect the rank's band — the first/last tile may be partially owned.
+        # quack's CLC): slab-anchored tiles of this rank's M/TP slab, slab-local
+        # coords in BOTH modes (C/colvec/aux are m/TP-shaped). A tile straddling two
+        # producer tiles dual-waits in epilogue_split_rank; the last tile's overhang
+        # rows are predicated in the reduce/commit callbacks.
         epi_reduce_sched_params = None
         if const_expr(self.epi_reduce_mode is not None):
             full_ntile = tile_sched_args.problem_shape_ntile_mnl
             cta_m = self.cta_tile_shape_mnk[0]
             slab_m = mD.shape[0] // self.num_ranks
-            slab_row0 = self.rank_id * slab_m
-            if const_expr(self.epi_reduce_mode == "reduce_scatter"):
-                visit_ntile_m = (slab_m + cta_m - 1) // cta_m
-            else:
-                visit_ntile_m = (slab_row0 + slab_m - 1) // cta_m - slab_row0 // cta_m + 1
+            visit_ntile_m = (slab_m + cta_m - 1) // cta_m
             slab_ntile = (visit_ntile_m, full_ntile[1], full_ntile[2])
             epi_reduce_sched_params = EpiReduceSchedulerParams.create(
                 slab_ntile, self.cluster_shape_mnk, scheduler_args.max_active_clusters
@@ -1678,21 +1673,15 @@ class GemmSm100(GemmTmaBase):
                 )
                 do_epi_load_barrier_wait = Boolean(True)
                 # Under epi_reduce: walk the reducer's scheduler, staging C per epi_tile.
-                # reduce_scatter: slab-anchored tiles — slab-local coords index the
+                # Slab-anchored tiles in both modes — slab-local coords index the
                 # slab-sized C directly; the last tile's overhang rows go OOB on the TMA
                 # descriptor and zero-fill (discarded by the commit predication).
-                # all_reduce: global band tiles on full-M C as-is.
                 mC_epi = mC_mnl
                 if const_expr(self.epi_reduce_mode is not None):
                     tile_scheduler = make_epi_reduce_tile_scheduler(epi_reduce_sched_params)
                     slab_m = mD_mnl.shape[0] // self.num_ranks
-                    slab_row0 = self.rank_id * slab_m
                     cta_m = self.cta_tile_shape_mnk[0]
-                    if const_expr(self.epi_reduce_mode == "reduce_scatter"):
-                        visit_tiles_m = (slab_m + cta_m - 1) // cta_m
-                    else:
-                        t_lo = slab_row0 // cta_m
-                        visit_tiles_m = (slab_row0 + slab_m - 1) // cta_m - t_lo + 1
+                    visit_tiles_m = (slab_m + cta_m - 1) // cta_m
                 else:
                     tile_scheduler = TileSchedulerCls()
                 work_tile = tile_scheduler.initial_work_tile_info()
@@ -1701,20 +1690,12 @@ class GemmSm100(GemmTmaBase):
                     in_slab = Boolean(True)
                     if const_expr(self.epi_reduce_mode is not None):
                         slab_coord = work_tile.tile_idx
-                        if const_expr(self.epi_reduce_mode == "reduce_scatter"):
-                            tile_coord_mnkl = (
-                                slab_coord[0],
-                                slab_coord[1],
-                                Int32(0),
-                                slab_coord[2],
-                            )
-                        else:
-                            tile_coord_mnkl = (
-                                t_lo + slab_coord[0],
-                                slab_coord[1],
-                                Int32(0),
-                                slab_coord[2],
-                            )
+                        tile_coord_mnkl = (
+                            slab_coord[0],
+                            slab_coord[1],
+                            Int32(0),
+                            slab_coord[2],
+                        )
                         # Cluster rounding: the last cluster's CTA 1 can get a phantom coord —
                         # skip, mirroring the epi_reduce warps' skip so epi_pipeline stage
                         # accounting stays aligned.
@@ -2172,40 +2153,31 @@ class GemmSm100(GemmTmaBase):
 
                 slab_m = mD_mc.shape[0] // self.num_ranks
                 slab_row0 = rank_id * slab_m
-                # reduce_scatter: slab-anchored tiles (slab-local coords; last tile may
-                # overhang slab_m). all_reduce: the producer tiles whose rows intersect
-                # this rank's band (global coords; edge tiles partially owned).
-                if const_expr(self.epi_reduce_mode == "reduce_scatter"):
-                    visit_tiles_m = (slab_m + cta_m - 1) // cta_m
-                else:
-                    t_lo = slab_row0 // cta_m
-                    visit_tiles_m = (slab_row0 + slab_m - 1) // cta_m - t_lo + 1
-                # Epilogue operand frame follows the OUTPUT shard: reduce_scatter's
-                # C/colvec/aux are slab-sized and the slab-anchored walk indexes them
-                # directly; all_reduce's are full-M in the global frame as-is.
-                if const_expr(self.epi_reduce_mode == "reduce_scatter"):
-                    varlen_manager_epi = VarlenManager.create(
-                        varlen_manager.params,
-                        len_m_static=varlen_manager.len_m(Int32(0)) // self.num_ranks,
-                        len_k_static=varlen_manager.len_k(Int32(0)),
-                        len_n_static=varlen_manager.len_n(),
-                    )
-                else:
-                    varlen_manager_epi = varlen_manager
+                # Slab-anchored tiles in BOTH modes (slab-local coords; the last tile
+                # may overhang slab_m). C/colvec/aux are m/TP-shaped in both modes, so
+                # the slab-local walk indexes them directly.
+                visit_tiles_m = (slab_m + cta_m - 1) // cta_m
+                varlen_manager_epi = VarlenManager.create(
+                    varlen_manager.params,
+                    len_m_static=varlen_manager.len_m(Int32(0)) // self.num_ranks,
+                    len_k_static=varlen_manager.len_k(Int32(0)),
+                    len_n_static=varlen_manager.len_n(),
+                )
                 # Tiles of this rank's D view and the workspace mc view (real pointers;
                 # the kernel's mD is a TMA coordinate tensor and cannot back generic
-                # stores). reduce_scatter anchors both at the slab origin, so the
-                # slab-local tile coord addresses global rows slab_row0 + m * cta_m; the
-                # workspace padding keeps the overhang tile in bounds.
-                mD_self, mWs_mc = d_peer_tensors[rank_id], ws_mc
-                if const_expr(self.epi_reduce_mode == "reduce_scatter"):
-                    mD_self = cute.domain_offset((slab_row0, 0, 0), mD_self)
-                    mWs_mc = cute.domain_offset((slab_row0, 0, 0), mWs_mc)
+                # stores), all anchored at the slab origin: the slab-local tile coord
+                # addresses global rows slab_row0 + m * cta_m, and the workspace
+                # padding keeps the overhang tile in bounds.
+                mD_self = cute.domain_offset((slab_row0, 0, 0), d_peer_tensors[rank_id])
+                mWs_mc = cute.domain_offset((slab_row0, 0, 0), ws_mc)
                 gD_local = cute.local_tile(mD_self, (cta_m, cta_n), (None, None, None))
                 gWs_mc = cute.local_tile(mWs_mc, (cta_m, cta_n), (None, None, None))
                 if const_expr(self.epi_reduce_mode == "all_reduce"):
-                    # AR commits through the mc partition (16B multimem_st chunks).
-                    gD_mc = cute.local_tile(mD_mc, (cta_m, cta_n), (None, None, None))
+                    # AR commits through the mc partition (16B multimem_st chunks),
+                    # slab-anchored like the rest.
+                    gD_mc = cute.local_tile(
+                        cute.domain_offset((slab_row0, 0, 0), mD_mc), (cta_m, cta_n), (None, None, None)
+                    )
 
                 epi_reduce_store_pipeline = self.make_epi_reduce_store_pipeline()
 
@@ -2216,21 +2188,12 @@ class GemmSm100(GemmTmaBase):
                     if in_slab:
                         iket.range_push("epi_reduce")
                         n_tile, batch = slab_coord[1], slab_coord[2]
-                        if const_expr(self.epi_reduce_mode == "reduce_scatter"):
-                            # Slab-local tile: valid rows run to the slab end (the last
-                            # tile's overhang past slab_m is zeroed / skip-stored).
-                            m_idx = slab_coord[0]
-                            row_lo = Int32(0)
-                            row_hi = cutlass.min(Int32(cta_m), slab_m - m_idx * cta_m)
-                        else:
-                            # Global band tile: a boundary-straddling tile is visited by
-                            # both owning ranks, each keeping its own rows.
-                            m_idx = t_lo + slab_coord[0]
-                            tile_row0 = m_idx * cta_m
-                            row_lo = cutlass.max(Int32(0), slab_row0 - tile_row0)
-                            row_hi = cutlass.min(Int32(cta_m), slab_row0 + slab_m - tile_row0)
+                        # Valid rows run to the slab end (the last tile's overhang past
+                        # slab_m is zeroed / skip-stored).
+                        m_idx = slab_coord[0]
+                        row_limit = slab_m - m_idx * cta_m
                         col_limit = mD_mc.shape[1] - n_tile * cta_n
-                        full_tile = row_lo == 0 and row_hi == cta_m and col_limit >= cta_n
+                        full_tile = row_limit >= cta_m and col_limit >= cta_n
                         tRS_gWs_mc = thr_copy_r2s.partition_D(
                             cute.flat_divide(gWs_mc[None, None, m_idx, n_tile, batch], epi_tile)
                         )
@@ -2242,9 +2205,9 @@ class GemmSm100(GemmTmaBase):
                             tRS_gD_mc = thr_copy_r2s.partition_D(
                                 cute.flat_divide(gD_mc[None, None, m_idx, n_tile, batch], epi_tile)
                             )
-                        # One coord for everything: the epilogue's operand frame and the
-                        # flag/counter derivation in epilogue_split_rank agree by mode
-                        # (RS: slab-local; AR: global).
+                        # One slab-local coord for everything: the epilogue's operand
+                        # frame (m/TP-shaped C/colvec/aux) and the flag/counter
+                        # derivation in epilogue_split_rank.
                         tile_coord_mnkl = (m_idx, n_tile, Int32(0), batch)
                         # The reducer runs the shared epilogue; these two callbacks close
                         # over this tile's workspace/D partitions and row/col limits.
@@ -2252,8 +2215,7 @@ class GemmSm100(GemmTmaBase):
                             reduce_frag_subtile,
                             tRS_gWs_mc,
                             tRS_cD,
-                            row_lo,
-                            row_hi,
+                            row_limit,
                             col_limit,
                         )
                         commit_D = partial(
@@ -2261,8 +2223,7 @@ class GemmSm100(GemmTmaBase):
                             tRS_gD,
                             tRS_gD_mc,
                             tRS_cD,
-                            row_lo,
-                            row_hi,
+                            row_limit,
                             col_limit,
                             full_tile,
                             self.epi_reduce_mode == "all_reduce",

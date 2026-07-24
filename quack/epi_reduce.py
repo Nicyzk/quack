@@ -9,7 +9,7 @@ cross-rank siblings of the split-K pair.
 Dataflow: both warp groups run epilogue_split_rank. The producer's finalize action
 is split_rank_partial_commit — the partial D tile in d_dtype at its real (m, n) in
 the flat symmetric workspace (frag_tile_op), then the tile signal. The reducer
-walks its own tiles (reduce_scatter: slab-anchored; all_reduce: producer tiles)
+walks its slab-anchored tiles (slab-local coords in BOTH modes)
 and runs epilogue() between two bound functions: multimem ld_reduce of its tile
 through the workspace mc view in (reduce_frag_subtile), EVT/C_load/aux TileStores
 unchanged in the middle, real-address store out (reduce_scatter: this rank's D
@@ -17,6 +17,7 @@ slab; all_reduce: 16B multimem_st chunks through the mc partition). Pipelines:
 epi_pipeline stages C for the reducer; epi_reduce_store_pipeline backs the
 reducer's aux stores."""
 
+import math
 from typing import Literal, NamedTuple, Optional
 
 import cutlass
@@ -124,13 +125,16 @@ def epi_reduce_exit_slot(params: EpiReduceSchedulerParams) -> Int32:
 
 
 # ---- workspace tile ops: partial store / cross-rank reduce / D commit ----
-# Workspaces are flat (M_pad, N_pad, L), addressed by real coordinates: padding
-# keeps every cta tile anchored inside the problem fully in bounds (no predication
-# on workspace access), and vectors run along N so arbitrary M anchors keep
-# alignment. frag_tile_op is THE workspace access op — split-K's commit/fold bind
-# its local ops (gemm_base), split-rank's producer and reducer share it with only
-# the view differing (producer: its (m, n) tile; reducer: slab-anchored for
-# reduce_scatter, through the mc view).
+# frag_tile_op is THE workspace access op; callers pick the view, and the view
+# form follows the workspace's READERS:
+# - readers beyond the writer (split-rank: reducers in other ranks' slab frames)
+#   -> flat (M_pad, N_pad, L) coordinate tensor, geometric partition (local_tile +
+#   flat_divide + partition_D). Padding keeps every cta tile anchored inside the
+#   problem fully in bounds (no predication on workspace access); vectors run
+#   along N so arbitrary M anchors keep alignment.
+# - reader IS the writer (split-K) -> frag_stripe_view: warp-dense fragment-order
+#   interleave over opaque per-tile regions, legal precisely because nobody else
+#   ever reads the bytes.
 
 
 @cute.jit
@@ -187,26 +191,72 @@ def frag_tile_op(
 
 
 @cute.jit
+def frag_stripe_view(
+    ws: cute.Tensor,
+    tile_coord_mnkl: cute.Coord,
+    cta_tile_shape_mn: cutlass.Constexpr,
+    epi_tile: cute.Tile,
+    epi_m_major: cutlass.Constexpr[bool],
+    num_threads: cutlass.Constexpr[int],
+    tidx: Int32,
+    tRS_rD: cute.Tensor,
+) -> cute.Tensor:
+    """Warp-dense view of one tile's workspace region in the writer's fragment
+    order — thread t, chunk c of subtile e at e*(NT*frag) + c*(NT*vec) + t*vec, so
+    each instruction's warp footprint is one dense span. Legal exactly when the
+    workspace's reader is its writer (split-K: every split of a tile builds this
+    identical view); a workspace with cross-frame readers must use the geometric
+    partition of a flat coordinate tensor instead — adjacent threads then sit a
+    full row apart per instruction (warp-scattered; measured +37% on SERIAL small
+    grids). ws is (E, ntile_m, ntile_n, L), per-tile regions contiguous;
+    vec = gcd(frag, 16B/elem) keeps odd fragments dense down to the scalar
+    interleave. Returns the partitioned profile frag_tile_op indexes by
+    epi_coord."""
+    frag_elems = cute.size(tRS_rD)
+    vec = math.gcd(frag_elems, 128 // ws.element_type.width)
+    epi_tile_shape = cute.zipped_divide(cute.make_layout(cta_tile_shape_mn), epi_tile).shape[1]
+    assert (
+        frag_elems * num_threads * cute.size(epi_tile_shape)
+        == cta_tile_shape_mn[0] * cta_tile_shape_mn[1]
+    ), "workspace stripe does not tile cta_tile_m * cta_tile_n"
+    sub_order = cute.make_ordered_layout(
+        epi_tile_shape, order=(0, 1) if const_expr(epi_m_major) else (1, 0)
+    )
+    gWs_tile = ws[None, tile_coord_mnkl[0], tile_coord_mnkl[1], tile_coord_mnkl[3]]
+    return cute.make_tensor(
+        gWs_tile.iterator + tidx * vec,
+        cute.make_layout(
+            ((vec, frag_elems // vec), 1, 1, *epi_tile_shape),
+            stride=(
+                (1, num_threads * vec),
+                0,
+                0,
+                *(s * num_threads * frag_elems for s in sub_order.stride),
+            ),
+        ),
+    )
+
+
+@cute.jit
 def reduce_frag_subtile(
     tRS_gWs_mc: cute.Tensor,
     tRS_cD: cute.Tensor,
-    row_lo: Int32,
-    row_hi: Int32,
+    row_limit: Int32,
     col_limit: Int32,
     tRS_rD: cute.Tensor,
     epi_coord: cute.Coord,
 ) -> None:
     """Reduce this subtile's workspace tile across all ranks into tRS_rD
     (frag_tile_op through the mc view); passed to epilogue() as load_acc_subtile
-    by the reducer warps. Lanes outside [row_lo, row_hi) (foreign slab rows / M
-    tail) or past col_limit are zeroed: keeps visit reductions exact."""
+    by the reducer warps. Lanes past row_limit (the slab tail's overhang) or
+    col_limit (N tail) are zeroed: keeps visit reductions exact."""
     tmp = cute.make_rmem_tensor(tRS_rD.layout.shape, tRS_gWs_mc.element_type)
     frag_tile_op("multimem_ld_reduce", tRS_gWs_mc, tmp, epi_coord)
     tRS_rD.store(tmp.load().to(tRS_rD.element_type))
     tRS_cD_cur = tRS_cD[None, None, None, epi_coord[0], epi_coord[1]]
     for i in cutlass.range_constexpr(cute.size(tRS_rD)):
         crd = tRS_cD_cur[i]
-        if crd[0] < row_lo or crd[0] >= row_hi or crd[1] >= col_limit:
+        if crd[0] >= row_limit or crd[1] >= col_limit:
             tRS_rD[i] = 0.0
 
 
@@ -215,8 +265,7 @@ def commit_frag_subtile(
     tRS_gD: cute.Tensor,
     tRS_gD_mc: Optional[cute.Tensor],
     tRS_cD: cute.Tensor,
-    row_lo: Int32,
-    row_hi: Int32,
+    row_limit: Int32,
     col_limit: Int32,
     full_tile: cutlass.Boolean,
     all_reduce: cutlass.Constexpr[bool],
@@ -247,7 +296,7 @@ def commit_frag_subtile(
         else:
             for i in cutlass.range_constexpr(cute.size(tmp_out)):
                 crd = tRS_cD_cur[i]
-                if crd[0] >= row_lo and crd[0] < row_hi and crd[1] < col_limit:
+                if crd[0] < row_limit and crd[1] < col_limit:
                     tRS_gD_cur[i] = tmp_out[i]
     else:
         gD_mc_cur = tRS_gD_mc[None, None, None, epi_coord[0], epi_coord[1]]
@@ -264,7 +313,7 @@ def commit_frag_subtile(
         gD_mc_v = cute.zipped_divide(gD_mc_f, (vec,))
         for v in cutlass.range_constexpr(cute.size(tmp_out) // vec):
             crd = tRS_cD_cur[v * vec]
-            if crd[0] >= row_lo and crd[0] < row_hi and crd[1] < col_limit:
+            if crd[0] < row_limit and crd[1] < col_limit:
                 chunk = cute.make_tensor(tmp_out.iterator + v * vec, cute.make_layout(vec))
                 v32 = cute.recast_tensor(chunk, cutlass.Int32)
                 utils.distributed.multimem_st_4xb32(
