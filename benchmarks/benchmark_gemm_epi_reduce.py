@@ -142,7 +142,7 @@ def run(args):
     use_2cta = cluster_M % 2 == 0 and tile_M in (128, 256)
     cta_m = tile_M // (2 if use_2cta else 1)
     epi_reduce_args = make_epi_reduce_args(
-        d_torch_gpu_mc, d_peer_torch, m, n, l, cta_m, tile_N, world_size
+        d_torch_gpu_mc, d_peer_torch, m, n, l, cta_m, tile_N, cluster_M, cluster_N, world_size
     )
 
     # No host-side barriers in the loop: the kernel owns cross-invocation sync

@@ -167,12 +167,12 @@ def _compile_gemm(
             else None
         ),
         split_k_workspace=(
-            # (cta_tile_m * cta_tile_n, ntile_m, ntile_n, L) raw-f32-partials regions,
-            # one flat fragment stripe per output tile.
+            # flat (M_pad, N_pad, L) f32 partials buffer over the cluster-rounded
+            # tile grid; the kernel views per-tile stripe regions.
             fake_tensor(
                 Float32,
-                (cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()),
-                leading_dim=0,
+                (cute.sym_int(), cute.sym_int(), cute.sym_int()),
+                leading_dim=1,
                 divisibility=4,
             )
             if split_k > 1 and split_k_mode != SplitKMode.SEPARATE
@@ -301,13 +301,15 @@ def _split_k_buffers(D, split_k_mode, tile_M, tile_N, cluster_M, cluster_N, sm10
 
     One Int32 completion flag per output tile (SERIAL: turnstile in split order,
     deterministic; PARALLEL: arrival counter, not deterministic) plus a flat f32
-    region per tile holding the non-finalizing splits' raw accumulator fragments.
-    The scheduler's CTA tile ids are cluster-rounded (a boundary cluster can
-    contain CTAs whose tile is fully out of bounds but which still run the
-    protocol), so tile counts are rounded up to cluster multiples. The per-CTA
-    tile M must match the kernel exactly (the workspace region stride is
-    cta_tile_m * tile_N): SM100/110 2-CTA MMA (cluster_M even, tile_M 128/256)
-    halves it.
+    buffer sized (M_pad, N_pad) per batch for the non-finalizing splits' raw
+    accumulator partials. The kernel views each tile's region as a warp-dense
+    fragment stripe (epilogue_split_k's view) — the shape here is a byte budget
+    over the cluster-rounded tile grid, not geometry. The scheduler's CTA tile ids
+    are cluster-rounded (a boundary cluster can contain CTAs whose tile is fully
+    out of bounds but which still run the protocol), so tile counts are rounded up
+    to cluster multiples — every tile owns an in-bounds region, no predication.
+    The per-CTA tile M must match the kernel exactly: SM100/110 2-CTA MMA
+    (cluster_M even, tile_M 128/256) halves it.
     """
     num_l, len_m, len_n = D.shape
     use_2cta = sm100 and cluster_M % 2 == 0 and tile_M in (128, 256)
@@ -316,21 +318,17 @@ def _split_k_buffers(D, split_k_mode, tile_M, tile_N, cluster_M, cluster_N, sm10
     ntile_n = (len_n + tile_N - 1) // tile_N
     ntile_m = (ntile_m + cluster_M - 1) // cluster_M * cluster_M
     ntile_n = (ntile_n + cluster_N - 1) // cluster_N * cluster_N
-    # Kernel-facing layouts are (ntile_m, ntile_n, L) and (E, ntile_m, ntile_n, L):
-    # the CuTe layouts own the address computation, so the kernel just slices them
-    # at (pid_m, pid_n, batch).
+    # Kernel-facing layouts are (ntile_m, ntile_n, L) and (M_pad, N_pad, L): the
+    # CuTe layouts own the address computation, so the kernel just slices them at
+    # (pid_m, pid_n, batch) / real coordinates.
     semaphore = torch.zeros((num_l, ntile_m, ntile_n), dtype=torch.int32, device=D.device)
-    tile_elems = cta_tile_m * tile_N
+    m_pad, n_pad = ntile_m * cta_tile_m, ntile_n * tile_N
     if split_k_mode == SplitKMode.SERIAL:
         # Split 0's in-order plain store initializes each region.
-        workspace = torch.empty(
-            (num_l, ntile_m, ntile_n, tile_elems), dtype=torch.float32, device=D.device
-        )
+        workspace = torch.empty((num_l, m_pad, n_pad), dtype=torch.float32, device=D.device)
     else:
         # PARALLEL: every split red.adds in arrival order; no initializing store.
-        workspace = torch.zeros(
-            (num_l, ntile_m, ntile_n, tile_elems), dtype=torch.float32, device=D.device
-        )
+        workspace = torch.zeros((num_l, m_pad, n_pad), dtype=torch.float32, device=D.device)
     return semaphore, workspace
 
 
@@ -654,7 +652,7 @@ def run_gemm_plan(
                 split_k_semaphore.permute(1, 2, 0) if split_k_semaphore is not None else None
             ),
             split_k_workspace=(
-                split_k_workspace.permute(3, 1, 2, 0) if split_k_semaphore is not None else None
+                split_k_workspace.permute(1, 2, 0) if split_k_semaphore is not None else None
             ),
         )
     scheduler_args = plan_scheduler_args(

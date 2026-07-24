@@ -247,15 +247,15 @@ def _compile_gemm_epi(
         if fake is not None:
             fields[name] = fake
     if split_k > 1 and split_k_mode != SplitKMode.SEPARATE:
-        # Mirrors quack.gemm: (ntile_m, ntile_n, L) Int32 per-tile flag and
-        # (cta_tile_m * cta_tile_n, ntile_m, ntile_n, L) f32 partials stripes.
+        # Mirrors quack.gemm: (ntile_m, ntile_n, L) Int32 per-tile flag and flat
+        # (M_pad, N_pad, L) f32 partials buffer (kernel views per-tile stripes).
         fields["split_k_semaphore"] = make_fake_tensor(
             Int32, (cute.sym_int(), cute.sym_int(), cute.sym_int()), leading_dim=1
         )
         fields["split_k_workspace"] = make_fake_tensor(
             Float32,
-            (cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()),
-            leading_dim=0,
+            (cute.sym_int(), cute.sym_int(), cute.sym_int()),
+            leading_dim=1,
             divisibility=4,
         )
     epi_args = GemmCls.EpilogueArguments(**fields)
@@ -552,7 +552,7 @@ def run_gemm_epi_plan(
             plan.is_sm100_family,
         )
         fields["split_k_semaphore"] = sem.permute(1, 2, 0)
-        fields["split_k_workspace"] = ws.permute(3, 1, 2, 0)
+        fields["split_k_workspace"] = ws.permute(1, 2, 0)
     epi_args = plan.gemm_cls.EpilogueArguments._make(fields.values())
     scheduler_args = plan_scheduler_args(plan, tile_count_semaphore, ag_args=ag_args, A=A)
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)

@@ -1455,16 +1455,35 @@ class EpiMod:
                     )
             use_2cta = cluster_M % 2 == 0 and tile_M in (128, 256)
             cta_m = tile_M // (2 if use_2cta else 1)
-            n_tiles = (n_gemm + tile_N - 1) // tile_N
-            ntiles = ((m + cta_m - 1) // cta_m) * n_tiles * mnl[2]
-            if era.tile_flags.numel() < ntiles or era.tile_flags_mc.numel() < ntiles:
-                raise ValueError(f"epi_reduce_args.tile_flags needs >= {ntiles} entries")
+            ntile_m = (m + cta_m - 1) // cta_m
+            ntile_n = (n_gemm + tile_N - 1) // tile_N
+            ntile_m = (ntile_m + cluster_M - 1) // cluster_M * cluster_M
+            ntile_n = (ntile_n + cluster_N - 1) // cluster_N * cluster_N
+            # Flags/counters/workspace are addressed by coordinate through their own
+            # layouts, so a buffer allocated for another (shape, config) is silent
+            # mis-addressing — require the exact grid make_epi_reduce_args allocates
+            # for this config (shape-correct implies address-correct).
+            tile_grid = (ntile_m, ntile_n, mnl[2])
+            for name, t in (
+                ("tile_flags", era.tile_flags),
+                ("tile_flags_mc", era.tile_flags_mc),
+                ("consumer_counters", era.consumer_counters),
+            ):
+                if tuple(t.shape) != tile_grid:
+                    raise ValueError(
+                        f"epi_reduce_args.{name}: cluster-rounded tile grid {tile_grid} "
+                        f"expected, got {tuple(t.shape)}"
+                    )
+            ws_shape = ((ntile_m + 1) * cta_m, ntile_n * tile_N, mnl[2])
+            for name, t in (("workspace", era.workspace), ("workspace_mc", era.workspace_mc)):
+                if tuple(t.shape) != ws_shape:
+                    raise ValueError(
+                        f"epi_reduce_args.{name}: flat padded {ws_shape} expected, "
+                        f"got {tuple(t.shape)}"
+                    )
             num_sms = torch.cuda.get_device_properties(A.device).multi_processor_count
             if era.sync_barrier.numel() < num_sms or era.sync_barrier_mc.numel() < num_sms:
                 raise ValueError(f"epi_reduce_args.sync_barrier needs >= {num_sms} entries")
-            slab_tiles = ((m_epi + cta_m - 1) // cta_m) * n_tiles * mnl[2]
-            if era.consumer_counters.numel() < slab_tiles:
-                raise ValueError(f"epi_reduce_args.consumer_counters needs >= {slab_tiles} entries")
         if packed_c:
             if C.stride(-1) == 1 or varlen_m:
                 packed_shape = _tile_shape(batch, m, 2 * n_gemm, varlen_m)

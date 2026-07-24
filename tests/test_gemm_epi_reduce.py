@@ -111,7 +111,7 @@ def _run_gemm_epi_reduce(
     cta_m = tile_m // (2 if use_2cta else 1)
     # torch handles inside the args are the sole refs keeping the symmetric allocs alive
     epi_reduce_args = make_epi_reduce_args(
-        d_torch_gpu_mc, d_peer_torch, m, n, l, cta_m, tile_n, world_size
+        d_torch_gpu_mc, d_peer_torch, m, n, l, cta_m, tile_n, cluster_m, cluster_n, world_size
     )
     tf_torch = epi_reduce_args.tile_flags
     counters_torch = epi_reduce_args.consumer_counters

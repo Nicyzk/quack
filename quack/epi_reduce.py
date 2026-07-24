@@ -1,22 +1,23 @@
 """Fused-communication (epi_reduce_mode) GEMM epilogue pieces; nothing here runs on
 its own — gemm_sm100's kernel binds each piece into the shared GemmBase machinery.
 Sections below: host contract / reducer tile scheduler / cross-launch exit barrier /
-multimem reduce + store. The split-rank protocol itself (flag contract, producer
-partial commit, reducer spin + epoch counters) lives in gemm_base's
-epilogue_split_rank / split_rank_partial_commit, the cross-rank siblings of the
-split-K pair.
+workspace tile ops (partial store / cross-rank reduce / D commit). The split-rank
+protocol itself (flag contract, producer partial commit, reducer spin + epoch
+counters) lives in gemm_base's epilogue_split_rank / split_rank_partial_commit, the
+cross-rank siblings of the split-K pair.
 
 Dataflow: both warp groups run epilogue_split_rank. The producer's finalize action
-is split_rank_partial_commit — d_dtype fragment stripes into the symmetric
-workspace (_frag_stripe_op, split-K's addressing), then the tile signal. The
-reducer walks producer tiles intersecting its slab and runs epilogue() between two
-bound functions: stripe multimem ld_reduce in (same addressing, mc view),
-EVT/C_load/aux TileStores unchanged in the middle, real-address store out
-(reduce_scatter: this rank's D slab; all_reduce: 16B multimem_st chunks through
-the mc partition). Pipelines: epi_pipeline stages C for the reducer;
-epi_reduce_store_pipeline backs the reducer's aux stores."""
+is split_rank_partial_commit — the partial D tile in d_dtype at its real (m, n) in
+the flat symmetric workspace (frag_tile_op), then the tile signal. The reducer
+walks its own tiles (reduce_scatter: slab-anchored; all_reduce: producer tiles)
+and runs epilogue() between two bound functions: multimem ld_reduce of its tile
+through the workspace mc view in (reduce_frag_subtile), EVT/C_load/aux TileStores
+unchanged in the middle, real-address store out (reduce_scatter: this rank's D
+slab; all_reduce: 16B multimem_st chunks through the mc partition). Pipelines:
+epi_pipeline stages C for the reducer; epi_reduce_store_pipeline backs the
+reducer's aux stores."""
 
-from typing import Callable, NamedTuple, Optional
+from typing import Literal, NamedTuple, Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -24,6 +25,7 @@ import cutlass.utils as utils
 from cutlass import Int32, const_expr
 
 from quack.cute_dsl_utils import mlir_namedtuple
+from quack.dist_utils import multimem_ld_reduce_128b
 from quack.fast_math import FastDivmod
 
 
@@ -32,22 +34,23 @@ from quack.fast_math import FastDivmod
 
 @mlir_namedtuple
 class EpiReduceArguments(NamedTuple):
-    """Comm-side tensors for epi_reduce_mode. workspace/tile_flags/counters share one
-    problem shape's cluster-rounded (E, ntile_m, ntile_n, L) tile domain; sync_barrier
-    is per resident epi-reduce CTA slot, with num_sms allocation remaining a safe
-    upper bound."""
+    """Comm-side tensors for epi_reduce_mode. workspace is a flat (M_pad, N_pad, L)
+    d_dtype tensor addressed by real coordinates, padded so any cta tile anchored in
+    [0, M) x [0, N) is fully in bounds; tile_flags live on the cluster-rounded
+    (ntile_m, ntile_n, L) producer tile grid; sync_barrier is per resident
+    epi-reduce CTA slot, with num_sms allocation remaining a safe upper bound."""
 
     mD_mc: Optional[cute.Tensor] = None  # multicast view of symmetric D
     mD_peers: Optional[tuple] = None  # per-rank views of symmetric D
-    # d_dtype partial stripes, (cta_M * cta_N, ntile_m, ntile_n, L) symmetric
+    # d_dtype partial D, flat (M_pad, N_pad, L) symmetric
     workspace: Optional[cute.Tensor] = None
     workspace_mc: Optional[cute.Tensor] = None
-    # producer -> consumer, one flag per workspace tile slot
+    # producer -> consumer, one flag per (m, n, batch) producer tile
     tile_flags: Optional[cute.Tensor] = None
     tile_flags_mc: Optional[cute.Tensor] = None
     sync_barrier: Optional[cute.Tensor] = None  # exit barrier, one slot per resident CTA
     sync_barrier_mc: Optional[cute.Tensor] = None
-    # consumer-private epoch bases, indexed like tile_flags
+    # consumer-private epoch bases, indexed by the reducer's own tile coord
     consumer_counters: Optional[cute.Tensor] = None
 
 
@@ -120,41 +123,88 @@ def epi_reduce_exit_slot(params: EpiReduceSchedulerParams) -> Int32:
     return slot_layout((cta_m, cta_n, cluster_id))
 
 
-# ---- stripe reduce / commit ----
-# The reducer's two data-movement callbacks, both in the PRODUCER's r2s fragment
-# geometry (the stripe contract).
+# ---- workspace tile ops: partial store / cross-rank reduce / D commit ----
+# Workspaces are flat (M_pad, N_pad, L), addressed by real coordinates: padding
+# keeps every cta tile anchored inside the problem fully in bounds (no predication
+# on workspace access), and vectors run along N so arbitrary M anchors keep
+# alignment. frag_tile_op is THE workspace access op — split-K's commit/fold bind
+# its local ops (gemm_base), split-rank's producer and reducer share it with only
+# the view differing (producer: its (m, n) tile; reducer: slab-anchored for
+# reduce_scatter, through the mc view).
 
 
 @cute.jit
-def stripe_reduce_subtile(
-    stripe_op: Callable,
-    ws_mc_ptr: cute.Pointer,
-    num_threads: cutlass.Constexpr[int],
-    tidx: Int32,
+def frag_tile_op(
+    op: cutlass.Constexpr[Literal["store", "red_add", "load_add", "multimem_ld_reduce"]],
+    tRS_gWs: cute.Tensor,
+    tRS_rF: cute.Tensor,
+    epi_coord: cute.Coord,
+) -> None:
+    """One epi subtile of fragment tRS_rF vs the partitioned workspace view
+    tRS_gWs. The caller picks the workspace and the view; this op only moves data:
+
+    - "store":    plain store of the fragment (partial commits, split 0's init)
+    - "red_add":  one-way L2 red.add, no read-back (later splits' commits)
+    - "load_add": read the tile and add it INTO the fragment (split-K fold)
+    - "multimem_ld_reduce": read through a multicast view, reducing across ranks
+      into the fragment (split-rank fold; tRS_gWs must be the mc view)
+
+    Chunks are max_common_vector-sized, 16B-capped; the local ops take any width
+    down to scalar (SM90 wgmma f32 runs are 8B), multimem is hardware-fixed at 16B.
+    """
+    gWs_cur = tRS_gWs[None, None, None, epi_coord[0], epi_coord[1]]
+    gWs_f = cute.coalesce(gWs_cur)
+    vec = const_expr(
+        min(cute.max_common_vector(gWs_f, cute.coalesce(tRS_rF)), 128 // tRS_gWs.element_type.width)
+    )
+    if const_expr(op == "multimem_ld_reduce"):
+        assert vec == 128 // tRS_gWs.element_type.width, (
+            "multimem_ld_reduce needs 16B fragment n-runs (tmem-load atom too narrow)"
+        )
+    gWs_v = cute.zipped_divide(gWs_f, (vec,))
+    if const_expr(op == "load_add"):
+        frag = cute.make_rmem_tensor(tRS_rF.layout.shape, tRS_gWs.element_type)
+    else:
+        frag = tRS_rF
+    for v in cutlass.range_constexpr(cute.size(tRS_rF) // vec):
+        chunk = cute.make_tensor(frag.iterator + v * vec, cute.make_layout(vec))
+        if const_expr(op == "store"):
+            cute.autovec_copy(chunk, gWs_v[None, v])
+        elif const_expr(op == "red_add"):
+            if const_expr(vec == 1):
+                # nvvm.atomicrmw rejects 1-wide vectors; pass the scalar.
+                cute.arch.atomic_add(gWs_v[None, v].iterator, chunk[0])
+            else:
+                cute.arch.atomic_add(gWs_v[None, v].iterator, chunk.load())
+        elif const_expr(op == "load_add"):
+            cute.autovec_copy(gWs_v[None, v], chunk)
+        else:
+            x, y, z, w = multimem_ld_reduce_128b(tRS_rF.element_type)(gWs_v[None, v].iterator)
+            chunk_i32 = cute.recast_tensor(chunk, cutlass.Int32)
+            chunk_i32[0], chunk_i32[1], chunk_i32[2], chunk_i32[3] = x, y, z, w
+    if const_expr(op == "load_add"):
+        tRS_rF.store(tRS_rF.load() + frag.load())
+
+
+@cute.jit
+def reduce_frag_subtile(
+    tRS_gWs_mc: cute.Tensor,
     tRS_cD: cute.Tensor,
     row_lo: Int32,
     row_hi: Int32,
     col_limit: Int32,
-    subtile_layout: cute.Layout,
     tRS_rD: cute.Tensor,
     epi_coord: cute.Coord,
 ) -> None:
-    """Reduce this subtile's workspace stripes across all ranks into tRS_rD;
-    passed to epilogue() as load_acc_subtile by the reducer warps. stripe_op is
-    the bound _frag_stripe_op — the identical addressing the producers stored
-    with, read through the workspace's mc view. Lanes outside [row_lo, row_hi)
-    (foreign slab rows / M tail) or past col_limit are zeroed: keeps visit
-    reductions exact, and foreign rows belong to their owning rank."""
-    frag_elems = cute.size(tRS_rD)
-    epi_idx = subtile_layout(epi_coord)
-    tmp = cute.make_rmem_tensor(tRS_rD.layout.shape, ws_mc_ptr.dtype)
-    stripe_op(
-        "multimem_ld_reduce", ws_mc_ptr + epi_idx * num_threads * frag_elems,
-        tidx, num_threads, tmp,
-    )
+    """Reduce this subtile's workspace tile across all ranks into tRS_rD
+    (frag_tile_op through the mc view); passed to epilogue() as load_acc_subtile
+    by the reducer warps. Lanes outside [row_lo, row_hi) (foreign slab rows / M
+    tail) or past col_limit are zeroed: keeps visit reductions exact."""
+    tmp = cute.make_rmem_tensor(tRS_rD.layout.shape, tRS_gWs_mc.element_type)
+    frag_tile_op("multimem_ld_reduce", tRS_gWs_mc, tmp, epi_coord)
     tRS_rD.store(tmp.load().to(tRS_rD.element_type))
     tRS_cD_cur = tRS_cD[None, None, None, epi_coord[0], epi_coord[1]]
-    for i in cutlass.range_constexpr(frag_elems):
+    for i in cutlass.range_constexpr(cute.size(tRS_rD)):
         crd = tRS_cD_cur[i]
         if crd[0] < row_lo or crd[0] >= row_hi or crd[1] >= col_limit:
             tRS_rD[i] = 0.0
@@ -211,7 +261,7 @@ def commit_frag_subtile(
         assert vec == 128 // tRS_gD.element_type.width, (
             "all_reduce commit needs 16B fragment n-runs (tmem-load atom too narrow)"
         )
-        gD_mc_v = cute.zipped_divide(gD_mc_f, vec)
+        gD_mc_v = cute.zipped_divide(gD_mc_f, (vec,))
         for v in cutlass.range_constexpr(cute.size(tmp_out) // vec):
             crd = tRS_cD_cur[v * vec]
             if crd[0] >= row_lo and crd[0] < row_hi and crd[1] < col_limit:

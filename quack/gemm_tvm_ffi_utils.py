@@ -299,12 +299,13 @@ def make_fake_epi_reduce_args(d_dtype, num_ranks):
     d_fake = lambda: fake_tensor(
         d_dtype, (cute.sym_int(), cute.sym_int(), cute.sym_int()), leading_dim=1, divisibility=dvec
     )
-    # (cta_M * cta_N, ntile_m, ntile_n, L) d_dtype partial stripes, stripe-contiguous.
+    # flat (M_pad, N_pad, L) d_dtype partial D at real coordinates, N contiguous.
     ws_fake = lambda: fake_tensor(
-        d_dtype,
-        (cute.sym_int(), cute.sym_int(), cute.sym_int(), cute.sym_int()),
-        leading_dim=0,
-        divisibility=dvec,
+        d_dtype, (cute.sym_int(), cute.sym_int(), cute.sym_int()), leading_dim=1, divisibility=dvec
+    )
+    # (ntile_m, ntile_n, L) per-tile flags/counters, mirroring split_k_semaphore.
+    tile_grid = lambda: fake_tensor(
+        Int32, (cute.sym_int(), cute.sym_int(), cute.sym_int()), leading_dim=1
     )
     flags = lambda: fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=4)
     return EpiReduceArguments(
@@ -312,11 +313,11 @@ def make_fake_epi_reduce_args(d_dtype, num_ranks):
         mD_peers=tuple(d_fake() for _ in range(num_ranks)),
         workspace=ws_fake(),
         workspace_mc=ws_fake(),
-        tile_flags=flags(),
-        tile_flags_mc=flags(),
+        tile_flags=tile_grid(),
+        tile_flags_mc=tile_grid(),
         sync_barrier=flags(),
         sync_barrier_mc=flags(),
-        consumer_counters=flags(),
+        consumer_counters=tile_grid(),
     )
 
 
