@@ -315,7 +315,9 @@ def make_fake_scheduler_args(
         ),
         dispatch=(
             DispatchSchedulerArguments(
-                flags=fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1),
+                flags=fake_tensor(
+                    Int32, (cute.sym_int(), cute.sym_int()), leading_dim=1, divisibility=1
+                ),
                 # a 1-elem view into the host's source-block offsets: any 4 B alignment
                 first_src_row=fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1),
             )

@@ -227,12 +227,28 @@ class DispatchSchedulerArguments(NamedTuple):
     during the GEMM in source order, starting with the block at *first_src_row and wrapping.
     The scheduler walks each batch's M clusters in landing order (from the first cluster
     whose first gathered row is >= *first_src_row), and the load warp spins until
-    flags[cluster] reaches the cluster's M row count; cluster = M clusters of earlier
-    batches + cid_m. Needs mAIdx ascending within each batch and source blocks ascending
-    in A."""
+    flags[batch, cid_m] reaches the cluster's M row count. Needs mAIdx ascending within each
+    batch and source blocks ascending in A."""
 
-    flags: cute.Tensor  # (total M clusters,) Int32, +1 per landed M row
+    flags: cute.Tensor  # (num batches, >= max M clusters per batch) Int32, +1 per landed M row
     first_src_row: cute.Tensor  # (1,) Int32, device-resident
+
+
+@cute.jit
+def dispatch_wait_m_cluster(params, pid_m: Int32, batch_idx: Int32):
+    """Dispatch arrival gate, called by the AB-load warp before the tile's A loads: spin until
+    flags[batch_idx, cid_m] reaches the M cluster's row count. Takes the tile's coordinates,
+    not scheduler state (consumer warps read tiles from the scheduler's smem record). Relaxed
+    sys loads, as ag_wait_m_tile: the gated rows are read at L2, never through L1."""
+    block_size = params.tile_shape_mn[0] * params.cluster_shape_mnk[0]
+    cid_m = pid_m // params.cluster_shape_mnk[0]
+    seqlen = params.cu_seqlens_m[batch_idx + 1] - params.cu_seqlens_m[batch_idx]
+    num_rows = cutlass.min(seqlen - cid_m * block_size, block_size)
+    flags = params.dispatch.flags
+    ptr = flags.iterator + cute.crd2idx((batch_idx, cid_m), flags.layout)
+    val = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="sys")
+    while val < num_rows:
+        val = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="sys")
 
 
 # Grouping arguments together that should be passed to __call__
@@ -1483,25 +1499,6 @@ class VarlenMTileScheduler(TileScheduler):
         if first_cid_m == num_clusters_m:
             first_cid_m = Int32(0)
         return first_cid_m
-
-    @cute.jit
-    def dispatch_wait_m_cluster(self, pid_m: Int32):
-        """Dispatch arrival gate, called by the AB-load warp before the tile's A loads: spin
-        until flags[this tile's global M cluster] reaches the cluster's M row count. Relaxed
-        sys loads, as ag_wait_m_tile: the gated rows are read at L2, never through L1."""
-        params = self.params
-        block_size = params.tile_shape_mn[0] * params.cluster_shape_mnk[0]
-        cid_m = pid_m // params.cluster_shape_mnk[0]
-        batch_idx = self._current_batch_idx
-        seqlen = params.cu_seqlens_m[batch_idx + 1] - params.cu_seqlens_m[batch_idx]
-        num_rows = cutlass.min(seqlen - cid_m * block_size, block_size)
-        clusters_before = (
-            self._num_work_idx_before_cur_batch // params.problem_shape_ncluster_mnl[1]
-        )
-        ptr = params.dispatch.flags.iterator + (clusters_before + cid_m)
-        val = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="sys")
-        while val < num_rows:
-            val = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="sys")
 
     @cute.jit
     def _delinearize_work_idx(
