@@ -819,6 +819,7 @@ class GemmBase:
                 num_split_k=self.split_k,
                 ag=getattr(scheduler_args, "ag", None),
             )
+            assert getattr(scheduler_args, "dispatch", None) is None, "dispatch needs varlen_m"
         else:
             assert getattr(scheduler_args, "ag", None) is None, (
                 "AllGather+GEMM does not support varlen_m"
@@ -853,6 +854,8 @@ class GemmBase:
                 cluster_shape_mnk=self.cluster_shape_mnk,
                 tile_count_semaphore=scheduler_args.tile_count_semaphore,
                 persistence_mode=persistence_mode,
+                dispatch=getattr(scheduler_args, "dispatch", None),
+                a_idx=varlen_args.mAIdx,
             )
         return tile_sched_args
 

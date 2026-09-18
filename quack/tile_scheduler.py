@@ -221,6 +221,20 @@ class AgParams(NamedTuple):
     nclusters_m_per_chunk: Int32
 
 
+@mlir_namedtuple
+class DispatchSchedulerArguments(NamedTuple):
+    """MoE dispatch + grouped GEMM (varlen-M gather_A): A's source blocks land in local HBM
+    during the GEMM in source order, starting with the block at *first_src_row and wrapping.
+    The scheduler walks each batch's M clusters in landing order (from the first cluster
+    whose first gathered row is >= *first_src_row), and the load warp spins until
+    flags[cluster] reaches the cluster's M row count; cluster = M clusters of earlier
+    batches + cid_m. Needs mAIdx ascending within each batch and source blocks ascending
+    in A."""
+
+    flags: cute.Tensor  # (total M clusters,) Int32, +1 per landed M row
+    first_src_row: cute.Tensor  # (1,) Int32, device-resident
+
+
 # Grouping arguments together that should be passed to __call__
 @mlir_namedtuple
 class TileSchedulerOptions(NamedTuple):
@@ -230,6 +244,7 @@ class TileSchedulerOptions(NamedTuple):
     tile_count_semaphore: Optional[cute.Pointer] = None
     batch_idx_permute: Optional[cute.Tensor] = None
     ag: Optional[AgSchedulerArguments] = None
+    dispatch: Optional[DispatchSchedulerArguments] = None
 
 
 @dataclass
@@ -356,6 +371,7 @@ class TileScheduler:
         num_work_idx_before_cur_batch: Int32,
         cur_batch_end: Int32,
         cur_num_clusters_m: Int32,
+        cur_first_cid_m: Int32,
         phantom_retire: Int32,
         sched_smem: Optional[cute.Tensor],
         scheduler_pipeline: Optional[cutlass.pipeline.PipelineAsync],
@@ -376,6 +392,8 @@ class TileScheduler:
         # cu_seqlens window scan entirely. Unused (constant 0) for dense schedulers.
         self._cur_batch_end = cur_batch_end
         self._cur_num_clusters_m = cur_num_clusters_m
+        # Dispatch: the batch's first walked M cluster (see DispatchSchedulerArguments).
+        self._cur_first_cid_m = cur_first_cid_m
         self._phantom_retire = phantom_retire
         self._sched_smem = sched_smem
         self._scheduler_pipeline = scheduler_pipeline
@@ -446,6 +464,7 @@ class TileScheduler:
             Int32(0),  # num_work_idx_before_cur_batch
             Int32(0),  # cur_batch_end (empty window: first delinearize takes the scan)
             Int32(0),  # cur_num_clusters_m
+            Int32(0),  # cur_first_cid_m
             Int32(0),  # phantom_retire (set on a decoded-phantom steal)
             sched_smem,
             scheduler_pipeline,
@@ -1017,6 +1036,7 @@ class TileScheduler:
             self._num_work_idx_before_cur_batch,
             self._cur_batch_end,
             self._cur_num_clusters_m,
+            self._cur_first_cid_m,
             self._phantom_retire,
             self._sched_smem,
             self._scheduler_pipeline,
@@ -1039,6 +1059,7 @@ class TileScheduler:
                 self._num_work_idx_before_cur_batch,
                 self._cur_batch_end,
                 self._cur_num_clusters_m,
+                self._cur_first_cid_m,
                 self._phantom_retire,
                 self._sched_smem,
                 self._scheduler_pipeline,
@@ -1252,6 +1273,8 @@ class VarlenMTileSchedulerArguments:
     tile_count_semaphore: Optional[cute.Pointer] = None
     persistence_mode: cutlass.Constexpr[PersistenceMode] = PersistenceMode.NONE
     num_split_k: cutlass.Constexpr[int] = 1
+    dispatch: Optional[DispatchSchedulerArguments] = None
+    a_idx: Optional[cute.Tensor] = None  # mAIdx, read by dispatch
 
 
 class VarlenMTileScheduler(TileScheduler):
@@ -1272,6 +1295,8 @@ class VarlenMTileScheduler(TileScheduler):
         cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
         persistence_mode: cutlass.Constexpr[PersistenceMode]
         num_split_k: cutlass.Constexpr[int] = 1
+        dispatch: Optional[DispatchSchedulerArguments] = None
+        a_idx: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -1279,6 +1304,7 @@ class VarlenMTileScheduler(TileScheduler):
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "VarlenMTileScheduler.Params":
             assert args.num_split_k == 1, "split_k is not supported by VarlenMTileScheduler"
+            assert args.dispatch is None or args.a_idx is not None, "dispatch needs gather_A"
             # problem_shape_ntile_mnl[0] will be None for VarlenM
             problem_shape_ntile_mn = cute.select(args.problem_shape_ntile_mnl, mode=[0, 1])
             problem_shape_ncluster_mn = (
@@ -1327,6 +1353,8 @@ class VarlenMTileScheduler(TileScheduler):
                 else None,
                 args.cluster_shape_mnk,
                 args.persistence_mode,
+                dispatch=args.dispatch,
+                a_idx=args.a_idx if const_expr(args.dispatch is not None) else None,
             )
 
     @staticmethod
@@ -1435,6 +1463,47 @@ class VarlenMTileScheduler(TileScheduler):
         )
 
     @cute.jit
+    def _dispatch_first_cid_m(
+        self, batch_idx: Int32, num_clusters_m: Int32, block_size: cutlass.Constexpr[int]
+    ) -> Int32:
+        """Dispatch: the batch's first M cluster in landing order = the number of its clusters
+        whose first gathered row is below *first_src_row (0 if all are). Warp-cooperative:
+        one ballot per 32 clusters."""
+        params = self.params
+        lane_idx = cute.arch.lane_idx()
+        row_start = params.cu_seqlens_m[batch_idx]
+        first_src_row = params.dispatch.first_src_row[0]
+        first_cid_m = Int32(0)
+        for cid_start in cutlass.range(0, num_clusters_m, cute.arch.WARP_SIZE, unroll=1):
+            cid = cid_start + lane_idx
+            below = Boolean(False)
+            if cid < num_clusters_m:
+                below = Boolean(params.a_idx[row_start + cid * block_size] < first_src_row)
+            first_cid_m += cute.arch.popc(cute.arch.vote_ballot_sync(below))
+        if first_cid_m == num_clusters_m:
+            first_cid_m = Int32(0)
+        return first_cid_m
+
+    @cute.jit
+    def dispatch_wait_m_cluster(self, pid_m: Int32):
+        """Dispatch arrival gate, called by the AB-load warp before the tile's A loads: spin
+        until flags[this tile's global M cluster] reaches the cluster's M row count. Relaxed
+        sys loads, as ag_wait_m_tile: the gated rows are read at L2, never through L1."""
+        params = self.params
+        block_size = params.tile_shape_mn[0] * params.cluster_shape_mnk[0]
+        cid_m = pid_m // params.cluster_shape_mnk[0]
+        batch_idx = self._current_batch_idx
+        seqlen = params.cu_seqlens_m[batch_idx + 1] - params.cu_seqlens_m[batch_idx]
+        num_rows = cutlass.min(seqlen - cid_m * block_size, block_size)
+        clusters_before = (
+            self._num_work_idx_before_cur_batch // params.problem_shape_ncluster_mnl[1]
+        )
+        ptr = params.dispatch.flags.iterator + (clusters_before + cid_m)
+        val = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="sys")
+        while val < num_rows:
+            val = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="sys")
+
+    @cute.jit
     def _delinearize_work_idx(
         self,
         work_idx: Int32,
@@ -1459,6 +1528,7 @@ class VarlenMTileScheduler(TileScheduler):
         num_work_idx_before_cur_batch = self._num_work_idx_before_cur_batch
         cur_batch_end = self._cur_batch_end
         num_clusters_m = self._cur_num_clusters_m
+        first_cid_m = self._cur_first_cid_m
         num_clusters_cumulative, clusters_in_problems = Int32(0), Int32(0)
         is_valid = True if const_expr(is_valid_ is None) else is_valid_
         # Fast path: the work index lands in the batch resolved by the previous call
@@ -1520,6 +1590,10 @@ class VarlenMTileScheduler(TileScheduler):
                         num_work_idx_before_cur_batch
                         + num_clusters_m * params.problem_shape_ncluster_mnl[1]
                     )
+                    if const_expr(params.dispatch is not None):
+                        first_cid_m = self._dispatch_first_cid_m(
+                            batch_idx, num_clusters_m, block_size
+                        )
         else:
             batch_idx = Int32(num_batch)
 
@@ -1530,6 +1604,10 @@ class VarlenMTileScheduler(TileScheduler):
         if is_valid:
             cluster_id_in_problem = next_tile_idx - num_work_idx_before_cur_batch
             cid_m, cid_n = self._swizzle_cta(cluster_id_in_problem, num_clusters_m, loc=loc, ip=ip)
+            if const_expr(params.dispatch is not None):  # walk the batch in landing order
+                cid_m += first_cid_m
+                if cid_m >= num_clusters_m:
+                    cid_m -= num_clusters_m
         pid_m, pid_n = self._cluster_id_to_cta_id(
             cid_m, cid_n, block_zero_only=block_zero_only, loc=loc, ip=ip
         )
@@ -1538,4 +1616,5 @@ class VarlenMTileScheduler(TileScheduler):
         self._num_work_idx_before_cur_batch = num_work_idx_before_cur_batch
         self._cur_batch_end = cur_batch_end
         self._cur_num_clusters_m = num_clusters_m
+        self._cur_first_cid_m = first_cid_m
         return WorkTileInfo(tile_coord_mnkl, is_valid)

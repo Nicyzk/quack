@@ -1331,6 +1331,9 @@ class GemmSm100(GemmTmaBase):
                         ag_last_gate,
                     )
                     iket.range_pop()
+                # MoE dispatch: block until this tile's M cluster's A rows have landed.
+                if const_expr(getattr(tile_sched_params, "dispatch", None) is not None):
+                    tile_scheduler.dispatch_wait_m_cluster(tile_coord_mnkl[0])
                 # Local_tile partition global tensors
                 mma_tile_coord_mnl = (
                     tile_coord_mnkl[0] // cute.size(tiled_mma.thr_id.shape),

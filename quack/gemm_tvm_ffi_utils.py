@@ -13,7 +13,11 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.compile_utils import div_for_dtype, fake_batched  # noqa: F401  (re-exported)
 from quack.gemm_config import SplitKMode
 from quack.cute_dsl_utils import get_compile_target_capacity, torch2cute_dtype_map
-from quack.tile_scheduler import AgSchedulerArguments, TileSchedulerOptions
+from quack.tile_scheduler import (
+    AgSchedulerArguments,
+    DispatchSchedulerArguments,
+    TileSchedulerOptions,
+)
 from quack.varlen_utils import VarlenArguments
 
 
@@ -256,6 +260,7 @@ def make_scheduler_args(
     tile_count_semaphore,
     batch_idx_permute=None,
     ag_args=None,  # quack.gemm.AllGatherArguments or None
+    dispatch_args=None,  # (flags, first_src_row) tensors, see DispatchSchedulerArguments
 ):
     return TileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
@@ -276,10 +281,13 @@ def make_scheduler_args(
             else None
         ),
         batch_idx_permute=batch_idx_permute,
+        dispatch=DispatchSchedulerArguments(*dispatch_args) if dispatch_args is not None else None,
     )
 
 
-def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym, has_ag=False):
+def make_fake_scheduler_args(
+    has_semaphore, has_batch_idx_permute, l_sym, has_ag=False, has_dispatch=False
+):
     return TileSchedulerOptions(
         max_active_clusters=Int32(1),
         max_swizzle_size=Int32(8),
@@ -303,6 +311,15 @@ def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym, has_ag
         batch_idx_permute=(
             fake_tensor(Int32, (l_sym,), leading_dim=0, divisibility=4)
             if has_batch_idx_permute
+            else None
+        ),
+        dispatch=(
+            DispatchSchedulerArguments(
+                flags=fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1),
+                # a 1-elem view into the host's source-block offsets: any 4 B alignment
+                first_src_row=fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1),
+            )
+            if has_dispatch
             else None
         ),
     )
