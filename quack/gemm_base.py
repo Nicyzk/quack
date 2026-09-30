@@ -856,6 +856,7 @@ class GemmBase:
                 persistence_mode=persistence_mode,
                 dispatch=getattr(scheduler_args, "dispatch", None),
                 a_idx=varlen_args.mAIdx,
+                combine=getattr(scheduler_args, "combine", None),
             )
         return tile_sched_args
 

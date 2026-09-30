@@ -26,7 +26,12 @@ from quack import pipeline_checks
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm, reinterpret_packed_fp6
 from quack.gemm_config import SplitKMode
 from quack.operand_transform.transform import TransformAOperand
-from quack.tile_scheduler import TileSchedulerOptions, ag_wait_m_tile
+from quack.tile_scheduler import (
+    TileSchedulerOptions,
+    ag_wait_m_tile,
+    combine_signal_m_cluster,
+    dispatch_wait_m_cluster,
+)
 from quack.varlen_utils import VarlenArguments, VarlenManager
 
 # return PipelineStateWAdvance instead of PipelineState
@@ -1081,6 +1086,9 @@ class GemmSm90(GemmTmaBase):
                             ag_last_gate,
                         )
                         iket.range_pop()
+                    # MoE dispatch: block until this tile's M cluster's A rows have landed.
+                    if const_expr(getattr(tile_sched_params, "dispatch", None) is not None):
+                        dispatch_wait_m_cluster(tile_sched_params, tile_coord_mnkl[0], batch_idx)
                     iket.range_push("tma_load")
                     # Local_tile partition global tensors
                     copy_A, prefetch_A = None, None
@@ -1438,6 +1446,11 @@ class GemmSm90(GemmTmaBase):
                     tidx,
                     is_tma_warp,
                 )
+                # MoE combine: publish the stored D tile (flags[batch, cid_m] += 1 per N tile once its
+                # bulk stores drained) so a transfer kernel can push the M cluster's rows.
+                if const_expr(getattr(tile_sched_params, "combine", None) is not None):
+                    if is_tma_warp:
+                        combine_signal_m_cluster(tile_sched_params, tile_coord_mnkl[0], batch_idx)
 
                 if const_expr(self.pingpong):
                     # With pingpong, 2 WGs write two different output tiles to the same smem,

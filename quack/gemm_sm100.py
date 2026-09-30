@@ -39,6 +39,7 @@ from quack.dsl.smem_struct import Reserved, partitioned_struct
 from quack.tile_scheduler import (
     TileSchedulerOptions,
     ag_wait_m_tile,
+    combine_signal_m_cluster,
     dispatch_wait_m_cluster,
 )
 from quack.varlen_utils import VarlenArguments, VarlenManager
@@ -2016,6 +2017,11 @@ class GemmSm100(GemmTmaBase):
                     epi_tidx,
                     is_tma_warp,
                 )
+                # MoE combine: publish the stored D tile (flags[batch, cid_m] += 1 per N tile once its
+                # bulk stores drained) so a transfer kernel can push the M cluster's rows.
+                if const_expr(getattr(tile_sched_params, "combine", None) is not None):
+                    if is_tma_warp:
+                        combine_signal_m_cluster(tile_sched_params, tile_coord_mnkl[0], batch_idx)
                 # acc_pipeline.consumer_release was already called in self.epi_load_acc_subtile
                 acc_consumer_state.advance()
                 iket.range_pop()

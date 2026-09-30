@@ -15,6 +15,7 @@ from quack.gemm_config import SplitKMode
 from quack.cute_dsl_utils import get_compile_target_capacity, torch2cute_dtype_map
 from quack.tile_scheduler import (
     AgSchedulerArguments,
+    CombineSchedulerArguments,
     DispatchSchedulerArguments,
     TileSchedulerOptions,
 )
@@ -261,6 +262,7 @@ def make_scheduler_args(
     batch_idx_permute=None,
     ag_args=None,  # quack.gemm.AllGatherArguments or None
     dispatch_args=None,  # (flags, first_src_row) tensors, see DispatchSchedulerArguments
+    combine_args=None,  # (flags, row_key, first_src_row) tensors, see CombineSchedulerArguments
 ):
     return TileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
@@ -282,11 +284,12 @@ def make_scheduler_args(
         ),
         batch_idx_permute=batch_idx_permute,
         dispatch=DispatchSchedulerArguments(*dispatch_args) if dispatch_args is not None else None,
+        combine=CombineSchedulerArguments(*combine_args) if combine_args is not None else None,
     )
 
 
 def make_fake_scheduler_args(
-    has_semaphore, has_batch_idx_permute, l_sym, has_ag=False, has_dispatch=False
+    has_semaphore, has_batch_idx_permute, l_sym, has_ag=False, has_dispatch=False, has_combine=False
 ):
     return TileSchedulerOptions(
         max_active_clusters=Int32(1),
@@ -322,6 +325,17 @@ def make_fake_scheduler_args(
                 first_src_row=fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1),
             )
             if has_dispatch
+            else None
+        ),
+        combine=(
+            CombineSchedulerArguments(
+                flags=fake_tensor(
+                    Int32, (cute.sym_int(), cute.sym_int()), leading_dim=1, divisibility=1
+                ),
+                row_key=fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1),
+                first_src_row=fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1),
+            )
+            if has_combine
             else None
         ),
     )
