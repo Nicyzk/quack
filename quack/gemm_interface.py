@@ -544,8 +544,11 @@ def gemm_tuned(
     if gather_A:
         assert varlen, "gather_A requires either varlen_m or varlen_k"
         assert config.cluster_n == 1, "gather_A requires cluster_n=1"
-    if varlen_m:
-        assert not config.swap_ab, "Variable-length sequences not supported with swap_ab"
+    if varlen_m and config.swap_ab:
+        # The kernel runs it as varlen_n (tokens on the MMA's N side); SM100 plain path only.
+        assert config.device_capacity in (10, 11) and not gather_A, (
+            "swap_ab + varlen_m needs SM100 without gather_A"
+        )
     if quant_out:
         # Explicit-config calls skip the autotune prune; re-assert the SFD
         # constraint set (see _sfd_ok in prune_invalid_gemm_configs).
@@ -720,6 +723,9 @@ def _gemm_execute(
     C_d = (C if not swap else C.mT) if C is not None else None
     rowvec_d = bias if not swap else None
     colvec_d = bias if swap else None
+    # Swapped, the caller's ragged M is the kernel's ragged N.
+    cu_seqlens_n_d = cu_seqlens_m if swap else None
+    cu_seqlens_m_d = cu_seqlens_m if not swap else None
     if dispatch_plan is not None:
         # Warm replay: the interface plan key vouches for the metadata, so skip
         # the dispatch layer's own mode derivation, key, and lookup.
@@ -735,8 +741,9 @@ def _gemm_execute(
             alpha=alpha,
             beta=beta,
             sr_seed=sr_seed,
-            cu_seqlens_m=cu_seqlens_m,
+            cu_seqlens_m=cu_seqlens_m_d,
             cu_seqlens_k=cu_seqlens_k,
+            cu_seqlens_n=cu_seqlens_n_d,
             A_idx=A_idx,
             batch_idx_permute=batch_idx_permute,
             SFA=SFA,
@@ -771,8 +778,9 @@ def _gemm_execute(
         colvec_bias=colvec_d,
         alpha=alpha,
         beta=beta,
-        cu_seqlens_m=cu_seqlens_m,
+        cu_seqlens_m=cu_seqlens_m_d,
         cu_seqlens_k=cu_seqlens_k,
+        cu_seqlens_n=cu_seqlens_n_d,
         A_idx=A_idx,
         batch_idx_permute=batch_idx_permute,
         add_to_output=add_to_output,

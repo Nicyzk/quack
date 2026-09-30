@@ -963,9 +963,12 @@ class TileScheduler:
         elif const_expr(params.persistence_mode == PersistenceMode.DYNAMIC):
             next_work_linear_idx = Int32(0)
             if cute.arch.lane_idx() == 0:
-                # If varlen_m, problem_shape_ncluster_mnl[0] is None, so we use atomic_add
+                # If varlen, the ragged dim's cluster count is None, so we use atomic_add
                 # instead of atomic_inc, and at the end of the kernel must reset the semaphore to 0.
-                if const_expr(params.problem_shape_ncluster_mnl[0] is not None):
+                if const_expr(
+                    params.problem_shape_ncluster_mnl[0] is not None
+                    and params.problem_shape_ncluster_mnl[1] is not None
+                ):
                     next_work_linear_idx = num_persistent_clusters + prims.atomicrmw(
                         prims.AtomicOp.INC,
                         params.tile_count_semaphore.llvm_ptr,
@@ -1311,8 +1314,8 @@ class TriangularTileScheduler(TileScheduler):
 @dataclass
 class VarlenMTileSchedulerArguments:
     problem_shape_ntile_mnl: cute.Shape
-    total_m: Int32
-    cu_seqlens_m: cute.Tensor
+    total_m: Int32  # total extent of the ragged dim
+    cu_seqlens_m: cute.Tensor  # cu_seqlens of the ragged dim
     raster_order: cutlass.Constexpr[RasterOrderOption]
     group_size: Int32
     tile_shape_mn: cutlass.Constexpr[cute.Shape]
@@ -1323,6 +1326,7 @@ class VarlenMTileSchedulerArguments:
     dispatch: Optional[DispatchSchedulerArguments] = None
     a_idx: Optional[cute.Tensor] = None  # mAIdx, read by dispatch
     combine: Optional[CombineSchedulerArguments] = None
+    varlen_dim: cutlass.Constexpr[int] = 0  # 0: ragged M (varlen_m), 1: ragged N (varlen_n)
 
 
 class VarlenMTileScheduler(TileScheduler):
@@ -1346,6 +1350,7 @@ class VarlenMTileScheduler(TileScheduler):
         dispatch: Optional[DispatchSchedulerArguments] = None
         a_idx: Optional[cute.Tensor] = None
         combine: Optional[CombineSchedulerArguments] = None
+        varlen_dim: cutlass.Constexpr[int] = 0
 
         @staticmethod
         @cute.jit
@@ -1354,11 +1359,17 @@ class VarlenMTileScheduler(TileScheduler):
         ) -> "VarlenMTileScheduler.Params":
             assert args.num_split_k == 1, "split_k is not supported by VarlenMTileScheduler"
             assert args.dispatch is None or args.a_idx is not None, "dispatch needs gather_A"
-            # problem_shape_ntile_mnl[0] will be None for VarlenM
+            assert args.varlen_dim == 0 or (args.dispatch is None and args.combine is None), (
+                "dispatch / combine need varlen_m"
+            )
+            # problem_shape_ntile_mnl[varlen_dim] is None: the ragged dim is per batch
             problem_shape_ntile_mn = cute.select(args.problem_shape_ntile_mnl, mode=[0, 1])
+            fixed = 1 - args.varlen_dim
+            ncluster_fixed = cute.ceil_div(
+                problem_shape_ntile_mn[fixed], args.cluster_shape_mnk[fixed]
+            )
             problem_shape_ncluster_mn = (
-                None,
-                cute.ceil_div(problem_shape_ntile_mn[1], args.cluster_shape_mnk[1]),
+                (None, ncluster_fixed) if const_expr(args.varlen_dim == 0) else (ncluster_fixed, None)
             )
             problem_shape_ncluster_mnl = problem_shape_ncluster_mn + (
                 args.problem_shape_ntile_mnl[2],
@@ -1405,11 +1416,21 @@ class VarlenMTileScheduler(TileScheduler):
                 dispatch=args.dispatch,
                 a_idx=args.a_idx if const_expr(args.dispatch is not None) else None,
                 combine=args.combine,
+                varlen_dim=args.varlen_dim,
             )
 
     @staticmethod
     def to_underlying_arguments(args: TileSchedulerArguments, *, loc=None, ip=None) -> Params:
         return VarlenMTileScheduler.Params.create(args, loc=loc, ip=ip)
+
+    def _block_size(self) -> int:
+        """Rows of the ragged dim covered by one cluster."""
+        vd = self.params.varlen_dim
+        return self.params.tile_shape_mn[vd] * self.params.cluster_shape_mnk[vd]
+
+    def _ncluster_fixed(self) -> Int32:
+        """Cluster count of the non-ragged dim."""
+        return self.params.problem_shape_ncluster_mnl[1 - self.params.varlen_dim]
 
     @staticmethod
     @cute.jit
@@ -1432,14 +1453,15 @@ class VarlenMTileScheduler(TileScheduler):
         loc=None,
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
-        block_size = params.tile_shape_mn[0] * params.cluster_shape_mnk[0]
+        vd = params.varlen_dim
+        block_size = params.tile_shape_mn[vd] * params.cluster_shape_mnk[vd]
         num_batch = params.problem_shape_ncluster_mnl[2]
         # Tight upper bound on sum(ceil(len_i / block)) given only (total_m, L):
         # achieved by adversarial lengths ≡ 1 (mod block), so no smaller grid is safe
         # without per-batch seqlens (a too-small grid = tiles with no work index =
         # wrong results under CLC). cancel_pending_tail makes the padding slots cheap.
         total_clusters_m_max = (params.total_m + num_batch * (block_size - 1)) // block_size
-        total_clusters_max = total_clusters_m_max * params.problem_shape_ncluster_mnl[1]
+        total_clusters_max = total_clusters_m_max * params.problem_shape_ncluster_mnl[1 - vd]
         if const_expr(params.persistence_mode in [PersistenceMode.NONE, PersistenceMode.CLC]):
             return (
                 params.cluster_shape_mnk[0] * total_clusters_max,
@@ -1456,38 +1478,40 @@ class VarlenMTileScheduler(TileScheduler):
 
     @cute.jit
     def _swizzle_cta(
-        self, cluster_id_in_problem: Int32, num_clusters_m: Int32, *, loc=None, ip=None
+        self, cluster_id_in_problem: Int32, num_clusters_var: Int32, *, loc=None, ip=None
     ) -> Tuple[Int32, Int32]:
         params = self.params
+        # num_clusters_var is the batch's cluster count along the ragged dim
+        if const_expr(params.varlen_dim == 0):
+            num_clusters_m, num_clusters_n = num_clusters_var, params.problem_shape_ncluster_mnl[1]
+        else:
+            num_clusters_m, num_clusters_n = params.problem_shape_ncluster_mnl[0], num_clusters_var
+        if const_expr(params.raster_order == RasterOrder.AlongM):
+            ncluster_fast, ncluster_slow = num_clusters_m, num_clusters_n
+        else:
+            ncluster_fast, ncluster_slow = num_clusters_n, num_clusters_m
         # CTA Swizzle to promote L2 data reuse
         if const_expr(params.num_clusters_in_group_fdd is not None):
             group_id, id_in_group = divmod(cluster_id_in_problem, params.num_clusters_in_group_fdd)
             num_clusters_in_group = params.num_clusters_in_group_fdd.divisor
-        else:
-            assert params.raster_order == RasterOrder.AlongN
-            num_clusters_in_group = params.group_size * num_clusters_m
+        else:  # the slow dim is the ragged one
+            num_clusters_in_group = params.group_size * ncluster_slow
             group_id = cluster_id_in_problem // num_clusters_in_group
             id_in_group = cluster_id_in_problem - group_id * num_clusters_in_group
         cid_fast_in_group, cid_slow = Int32(0), Int32(0)
         if const_expr(params.group_size_fdd is not None and params.group_size_tail_fdd is not None):
-            num_clusters = num_clusters_m * params.problem_shape_ncluster_mnl[1]
+            num_clusters = num_clusters_m * num_clusters_n
             if (group_id + 1) * num_clusters_in_group <= num_clusters:
                 cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_fdd)
             else:  # tail part
                 cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_tail_fdd)
-        else:
-            assert params.raster_order == RasterOrder.AlongM
+        else:  # the fast dim is the ragged one
             group_size_actual = cutlass.min(
-                params.group_size, num_clusters_m - group_id * params.group_size
+                params.group_size, ncluster_fast - group_id * params.group_size
             )
             cid_slow = id_in_group // group_size_actual
             cid_fast_in_group = id_in_group - cid_slow * group_size_actual
         if group_id % 2 == 1:  # serpentine order
-            ncluster_slow = (
-                params.problem_shape_ncluster_mnl[1]
-                if params.raster_order == RasterOrder.AlongM
-                else num_clusters_m
-            )
             cid_slow = ncluster_slow - 1 - cid_slow
         cid_fast = group_id * params.group_size + cid_fast_in_group
         cid_m, cid_n = cid_fast, cid_slow
@@ -1553,7 +1577,8 @@ class VarlenMTileScheduler(TileScheduler):
         params = self.params
         lane_idx = cute.arch.lane_idx()
         num_batch = self.params.problem_shape_ncluster_mnl[2]
-        block_size = params.tile_shape_mn[0] * params.cluster_shape_mnk[0]
+        block_size = self._block_size()
+        ncluster_fixed = self._ncluster_fixed()
         batch_idx = self._current_batch_idx
         next_tile_idx = work_idx
 
@@ -1590,7 +1615,7 @@ class VarlenMTileScheduler(TileScheduler):
                     num_clusters_m = self._get_num_m_blocks(
                         lane_idx, bidb_start=batch_idx, block_size=block_size
                     )
-                    num_clusters = num_clusters_m * params.problem_shape_ncluster_mnl[1]
+                    num_clusters = num_clusters_m * ncluster_fixed
                     num_clusters_cumulative = utils.warp_prefix_sum(num_clusters, lane_idx)
                     # Total number of blocks for the next 31 problems, same for all lanes
                     clusters_in_problems = cute.arch.shuffle_sync(
@@ -1621,10 +1646,7 @@ class VarlenMTileScheduler(TileScheduler):
                     )
                     num_clusters_m = cute.arch.shuffle_sync(num_clusters_m, batch_idx_in_problems)
                     num_work_idx_before_cur_batch = problems_start_tile + num_clusters_prev_lane
-                    cur_batch_end = (
-                        num_work_idx_before_cur_batch
-                        + num_clusters_m * params.problem_shape_ncluster_mnl[1]
-                    )
+                    cur_batch_end = num_work_idx_before_cur_batch + num_clusters_m * ncluster_fixed
                     if const_expr(params.dispatch is not None):
                         first_cid_m = self._first_cid_m(
                             batch_idx,

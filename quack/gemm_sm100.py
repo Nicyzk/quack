@@ -384,7 +384,18 @@ class GemmSm100(GemmTmaBase):
             mma_inst_shape_n,
             mma_inst_k,
         )
-        # Configure tiled mma
+        # varlen_n: MMA-N variants selected per tile from the block's valid rows (the
+        # instruction N is static, so one tiled_mma per size; 64-granular).
+        self.varlen_n_granule = 64
+        self.mma_n_variants = ()
+        if const_expr(varlen_args.mCuSeqlensN is not None):
+            assert self.mma_tiler[1] <= 256 and self.cluster_shape_mnk[1] == 1, (
+                "varlen_n needs tile_n <= 256 (one MMA instruction) and cluster_n == 1"
+            )
+            assert not self.blockscaled
+            self.mma_n_variants = tuple(
+                n for n in range(self.varlen_n_granule, self.mma_tiler[1], self.varlen_n_granule)
+            )        # Configure tiled mma
         if const_expr(not self.blockscaled):
             self.tiled_mma = sm100_utils.make_trivial_tiled_mma(
                 self.a_dtype,
@@ -773,10 +784,19 @@ class GemmSm100(GemmTmaBase):
         assert (varlen_args.mAIdx is not None) == self.gather_A
         varlen_m = varlen_args.mCuSeqlensM is not None
         varlen_k = varlen_args.mCuSeqlensK is not None
+        varlen_n = varlen_args.mCuSeqlensN is not None
         # Stash for epilogue ops (epi_to_underlying_arguments runs later and
         # SFD needs the varlen mode to shape its logical scale layout).
         self.varlen_m = varlen_m
         self.varlen_k = varlen_k
+        self.varlen_n = varlen_n
+        if const_expr(varlen_n):
+            assert not self.blockscaled, "varlen_n does not support blockscaled"
+            assert not self.gather_A, "varlen_n does not support gather_A"
+            assert not any(
+                getattr(epilogue_args, op.name, None) is not None
+                for op in getattr(type(self), "_epi_ops", ())
+            ), "varlen_n does not support epilogue ops yet"
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes(epilogue_args, varlen_args)
@@ -962,7 +982,7 @@ class GemmSm100(GemmTmaBase):
             tma_tensor_d,
             tma_atom_c,
             tma_tensor_c,
-        ) = self.make_tma_epilogue_atoms_and_tensors(mD, mC, epilogue_args, varlen_m)
+        ) = self.make_tma_epilogue_atoms_and_tensors(mD, mC, epilogue_args, varlen_m, varlen_n)
 
         epilogue_params = self.epi_to_underlying_arguments(epilogue_args)
         varlen_params = VarlenManager.to_underlying_arguments(varlen_args)
@@ -977,7 +997,7 @@ class GemmSm100(GemmTmaBase):
             c_smem_layout = cute.slice_(self.epi_c_smem_layout_staged, (None, None, 0))
             self.epi_load_bytes_per_stage += cute.size_in_bytes(self.c_dtype, c_smem_layout)
 
-        TileSchedulerCls = self.get_scheduler_class(varlen_m=varlen_m)
+        TileSchedulerCls = self.get_scheduler_class(varlen_m=varlen_m, varlen_n=varlen_n)
         tile_sched_args = self.get_scheduler_arguments(
             mA, mB, mD, scheduler_args, varlen_args, epilogue_args
         )
@@ -1138,6 +1158,7 @@ class GemmSm100(GemmTmaBase):
         varlen_m = const_expr(varlen_params.cu_seqlens_m is not None)
         varlen_k = const_expr(varlen_params.cu_seqlens_k is not None)
         assert not (varlen_m and varlen_k)
+        assert not (varlen_params.cu_seqlens_n is not None and (varlen_m or varlen_k))
         if const_expr(self.gather_A):
             assert varlen_m or varlen_k
         has_D = const_expr(mD_mnl is not None)
@@ -1213,6 +1234,33 @@ class GemmSm100(GemmTmaBase):
         sA = storage.sA.get_tensor(a_smem_load_layout.outer, swizzle=a_smem_load_layout.inner)
         # (MMA, MMA_N, MMA_K, STAGE)
         sB = storage.sB.get_tensor(b_smem_layout.outer, swizzle=b_smem_layout.inner)
+        # varlen_n MMA-N variants: the smaller tiled_mmas and a one-stage view of sB with
+        # each variant's rows (a B fragment must match its atom's shape); the MMA warp
+        # builds the fragments and re-bases the B one per stage.
+        # Two atoms per variant, ACCUMULATE off (first k-block) and on (the rest), set once
+        # here: set() yields a new value that the DSL only threads through dynamic loops /
+        # ifs for tracked local variables, not for atoms held in a list.
+        mma_variant_atoms = []
+        for n_var in self.mma_n_variants:
+            tm0, tm1 = (
+                sm100_utils.make_trivial_tiled_mma(
+                    self.a_dtype,
+                    self.b_dtype,
+                    self.a_major_mode,
+                    self.b_major_mode,
+                    self.acc_dtype,
+                    self.cta_group,
+                    (self.mma_inst_shape_mnk[0], n_var),
+                )
+                for _ in range(2)
+            )
+            tm0.set(tcgen05.Field.ACCUMULATE, False)
+            tm1.set(tcgen05.Field.ACCUMULATE, True)
+            sB_v_layout = sm100_utils.make_smem_layout_b(
+                tm0, (self.mma_tiler[0], n_var, self.mma_tiler[2]), self.b_smem_dtype, 1
+            )
+            sB_v = storage.sB.get_tensor(sB_v_layout.outer, swizzle=sB_v_layout.inner)
+            mma_variant_atoms.append((n_var, tm0, tm1, sB_v))
         sAIdx = None
         if const_expr(self.gather_A):
             a_idx_smem_dim = self.cta_tile_shape_mnk[0] if varlen_m else self.cta_tile_shape_mnk[2]
@@ -1352,11 +1400,39 @@ class GemmSm100(GemmTmaBase):
                         (mma_tile_coord_mnl[0], None),
                     )
                 # (bN, bK, RestK)
-                gB_nk = cute.local_tile(
-                    varlen_manager.offset_batch_B(mB_nkl, batch_idx),
-                    cute.select(self.mma_tiler, [1, 2]),
-                    (mma_tile_coord_mnl[1], None),
-                )
+                if const_expr(varlen_manager.varlen_n):
+                    # Even split: the tile starts at its block's first row (see VarlenManager).
+                    # A 2-CTA MMA of N rows takes B rows [0, N/2) from CTA 0 and [N/2, N) from
+                    # CTA 1, but partition_B slices the pair at tile_n/2: shift CTA 1's origin
+                    # back so the variant's second half is the block's rows [N/2, N).
+                    n_valid = varlen_manager.block_n_valid(
+                        batch_idx,
+                        mma_tile_coord_mnl[1],
+                        self.cta_tile_shape_mnk[1],
+                        self.varlen_n_granule,
+                    )
+                    n_inst = cute.ceil_div(n_valid, self.varlen_n_granule) * self.varlen_n_granule
+                    row_shift = Int32(0)
+                    if const_expr(cute.size(tiled_mma.thr_id.shape) == 2):
+                        row_shift = mma_tile_coord_v * (n_inst - self.cta_tile_shape_mnk[1]) // 2
+                    gB_nk = cute.local_tile(
+                        varlen_manager.offset_block_B(
+                            mB_nkl,
+                            batch_idx,
+                            mma_tile_coord_mnl[1],
+                            self.cta_tile_shape_mnk[1],
+                            self.varlen_n_granule,
+                            row_shift,
+                        ),
+                        cute.select(self.mma_tiler, [1, 2]),
+                        (0, None),
+                    )
+                else:
+                    gB_nk = cute.local_tile(
+                        varlen_manager.offset_batch_B(mB_nkl, batch_idx),
+                        cute.select(self.mma_tiler, [1, 2]),
+                        (mma_tile_coord_mnl[1], None),
+                    )
                 if const_expr(self.blockscaled):
                     # (bM, bK)
                     # SFA uses the tile-aligned per-batch offset (padded SF layout), not
@@ -1715,6 +1791,29 @@ class GemmSm100(GemmTmaBase):
             tCrB = tiled_mma.make_fragment_B(sB)
             # (MMA, MMA_M, MMA_N, STAGE)
             tCtAcc_base = cute.make_tensor(acc_tmem_ptr, tCtAcc_fake.layout)
+            # varlen_n MMA-N variants: same A, the first n_var rows of the B stage and the
+            # first n_var accumulator columns: the base fragment layout
+            # ((lanes, cols), 1, 1, STAGE) with the column extent replaced, same strides.
+            mma_variants = []
+            acc_layout = tCtAcc_fake.layout
+            for n_var, tm0, tm1, sB_v in mma_variant_atoms:
+                tA_v = tm0.make_fragment_A(sA_mma)
+                # (MMA, MMA_N, MMA_K, STAGE): the one-stage view's fragment on the base
+                # fragment's descriptor iterator, with the base's stage stride
+                tB_v1 = tm0.make_fragment_B(sB_v)[None, None, None, 0]
+                tB_v = cute.make_tensor(
+                    tCrB.iterator,
+                    cute.make_layout(
+                        (*tB_v1.layout.shape, tCrB.layout.shape[3]),
+                        stride=(*tB_v1.layout.stride, tCrB.layout.stride[3]),
+                    ),
+                )
+                acc_v_layout = cute.make_layout(
+                    ((acc_layout.shape[0][0], n_var), 1, 1, acc_layout.shape[3]),
+                    stride=acc_layout.stride,
+                )
+                acc_v = cute.make_tensor(acc_tmem_ptr, acc_v_layout)
+                mma_variants.append((n_var, tm0, tm1, tA_v, tB_v, acc_v))
 
             if const_expr(self.blockscaled):
                 # Make SFA tmem tensor
@@ -1808,24 +1907,99 @@ class GemmSm100(GemmTmaBase):
                             cute.ceil_div(k_len % self.mma_tiler[2], self.sf_vec_size) % num_insts
                         )
                 iket.range_push("mma")
-                ab_consumer_state, acc_producer_state, tiled_mma = self.mma(
-                    ab_pipeline,
-                    acc_pipeline,
-                    ab_consumer_state,
-                    acc_producer_state,
-                    tiled_mma,
-                    tCrA,
-                    tCrB,
-                    tCtAcc,
-                    k_tile_cnt,
-                    is_leader_cta,
-                    cta_rank_in_cluster,
-                    tCtSFA,
-                    tCtSFB_mma,
-                    copy_s2t_sfa,
-                    copy_s2t_sfb,
-                    sf_valid_insts,
-                )
+                if const_expr(len(mma_variants) > 0):
+                    # varlen_n: select the MMA-N variant once per tile from the block's valid
+                    # rows (variant i serves ceil(rows / granule) == i + 1, the base atom the
+                    # full tile); each branch runs the plain straight-line mainloop
+                    n_valid = varlen_manager.block_n_valid(
+                        batch_idx,
+                        tile_coord_mnkl[1],
+                        self.cta_tile_shape_mnk[1],
+                        self.varlen_n_granule,
+                    )
+                    n_sel = cute.ceil_div(n_valid, self.varlen_n_granule)
+                    assert len(mma_variants) == 3, "varlen_n: tile_n must be 256"
+                    (_, v0_tm0, v0_tm1, v0_a, v0_b, v0_acc) = mma_variants[0]
+                    (_, v1_tm0, v1_tm1, v1_a, v1_b, v1_acc) = mma_variants[1]
+                    (_, v2_tm0, v2_tm1, v2_a, v2_b, v2_acc) = mma_variants[2]
+                    if n_sel == 1:
+                        ab_consumer_state, acc_producer_state, _ = self.mma(
+                            ab_pipeline,
+                            acc_pipeline,
+                            ab_consumer_state,
+                            acc_producer_state,
+                            v0_tm0,
+                            v0_a,
+                            v0_b,
+                            v0_acc[None, None, None, acc_stage_idx],
+                            k_tile_cnt,
+                            is_leader_cta,
+                            cta_rank_in_cluster,
+                            tiled_mma_acc=v0_tm1,
+                        )
+                    elif n_sel == 2:
+                        ab_consumer_state, acc_producer_state, _ = self.mma(
+                            ab_pipeline,
+                            acc_pipeline,
+                            ab_consumer_state,
+                            acc_producer_state,
+                            v1_tm0,
+                            v1_a,
+                            v1_b,
+                            v1_acc[None, None, None, acc_stage_idx],
+                            k_tile_cnt,
+                            is_leader_cta,
+                            cta_rank_in_cluster,
+                            tiled_mma_acc=v1_tm1,
+                        )
+                    elif n_sel == 3:
+                        ab_consumer_state, acc_producer_state, _ = self.mma(
+                            ab_pipeline,
+                            acc_pipeline,
+                            ab_consumer_state,
+                            acc_producer_state,
+                            v2_tm0,
+                            v2_a,
+                            v2_b,
+                            v2_acc[None, None, None, acc_stage_idx],
+                            k_tile_cnt,
+                            is_leader_cta,
+                            cta_rank_in_cluster,
+                            tiled_mma_acc=v2_tm1,
+                        )
+                    else:
+                        ab_consumer_state, acc_producer_state, tiled_mma = self.mma(
+                            ab_pipeline,
+                            acc_pipeline,
+                            ab_consumer_state,
+                            acc_producer_state,
+                            tiled_mma,
+                            tCrA,
+                            tCrB,
+                            tCtAcc,
+                            k_tile_cnt,
+                            is_leader_cta,
+                            cta_rank_in_cluster,
+                        )
+                else:
+                    ab_consumer_state, acc_producer_state, tiled_mma = self.mma(
+                        ab_pipeline,
+                        acc_pipeline,
+                        ab_consumer_state,
+                        acc_producer_state,
+                        tiled_mma,
+                        tCrA,
+                        tCrB,
+                        tCtAcc,
+                        k_tile_cnt,
+                        is_leader_cta,
+                        cta_rank_in_cluster,
+                        tCtSFA,
+                        tCtSFB_mma,
+                        copy_s2t_sfa,
+                        copy_s2t_sfb,
+                        sf_valid_insts,
+                    )
                 if const_expr(self.overlap_accum_sf):
                     # After iter 0, 2, ..., shift tmem ptr by -256.
                     # After iter 1, 3, ..., shift tmem ptr by 256.
@@ -1931,13 +2105,25 @@ class GemmSm100(GemmTmaBase):
                     d_batch_idx = batch_idx
                     if const_expr(self.split_k > 1 and self.split_k_mode == SplitKMode.SEPARATE):
                         d_batch_idx = tile_scheduler.get_combined_batch_idx(batch_idx, split_idx)
+                    if const_expr(varlen_manager.varlen_n):
+                        mD_blk = varlen_manager.offset_block_epi(
+                            mD_mnl,
+                            d_batch_idx,
+                            tile_coord_mnkl[1],
+                            self.cta_tile_shape_mnk[1],
+                            self.varlen_n_granule,
+                        )
+                        d_tile_coord = (tile_coord_mnkl[0], Int32(0), *tile_coord_mnkl[2:])
+                    else:
+                        mD_blk = varlen_manager.offset_batch_epi(mD_mnl, d_batch_idx)
+                        d_tile_coord = tile_coord_mnkl
                     copy_D, _, _ = self.epilog_gmem_copy_and_partition(
                         tma_atom_d,
-                        varlen_manager.offset_batch_epi(mD_mnl, d_batch_idx),
+                        mD_blk,
                         self.cta_tile_shape_mnk[:2],
                         epi_tile,
                         sD,
-                        tile_coord_mnkl,
+                        d_tile_coord,
                     )
 
                 copy_C = None  # We're using a separate warp to load C
@@ -2234,11 +2420,18 @@ class GemmSm100(GemmTmaBase):
         copy_s2t_sfa: Optional[Callable] = None,
         copy_s2t_sfb: Optional[Callable] = None,
         sf_valid_insts_last_tile: Optional[Int32] = None,
+        # varlen_n MMA-N variant: `tiled_mma` has ACCUMULATE preset off and `tiled_mma_acc`
+        # on; neither is set() here (a set() on an atom that is not a tracked local is
+        # not threaded through the dynamic loop)
+        tiled_mma_acc: Optional[cute.TiledMma] = None,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState, cute.TiledMma]:
         blockscaled = const_expr(copy_s2t_sfa is not None)
         if const_expr(blockscaled):
             assert all(x is not None for x in (tCtSFA, tCtSFB))
             assert copy_s2t_sfb is not None
+        preset_acc = const_expr(tiled_mma_acc is not None)
+        if const_expr(preset_acc):
+            assert not blockscaled
         skip_sf_pad_insts = const_expr(sf_valid_insts_last_tile is not None)
         # If gather_A and use_2cta_instrs, the cp.async for the non-leader CTA will
         # arrive at an mbarrier on the non-leader CTA side, then the mma warp of the non-leader
@@ -2254,7 +2447,8 @@ class GemmSm100(GemmTmaBase):
         if is_leader_cta:
             acc_pipeline.producer_acquire(acc_producer_state)
         # Reset the ACCUMULATE field for each tile
-        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+        if const_expr(not preset_acc):
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
         # Mma mainloop
         num_k_blocks = cute.size(tCrA, mode=[2])
         for k_tile in cutlass.range(k_tile_cnt, unroll=1):
@@ -2320,6 +2514,13 @@ class GemmSm100(GemmTmaBase):
                             tiled_mma.set(tcgen05.Field.SFB, tCtSFB[sf_kblock_coord].iterator)
                             cute.gemm(tiled_mma, acc, tCrA[k_blk_coord], tCrB[k_blk_coord], acc)
                             tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+                    elif const_expr(preset_acc):
+                        # The tile's first k-block uses the ACCUMULATE-off atom, all others
+                        # the ACCUMULATE-on one (no set(), see the parameter note)
+                        if k_tile == 0 and k_blk_idx == 0:
+                            cute.gemm(tiled_mma, acc, tCrA[k_blk_coord], tCrB[k_blk_coord], acc)
+                        else:
+                            cute.gemm(tiled_mma_acc, acc, tCrA[k_blk_coord], tCrB[k_blk_coord], acc)
                     else:
                         cute.gemm(tiled_mma, acc, tCrA[k_blk_coord], tCrB[k_blk_coord], acc)
                         tiled_mma.set(tcgen05.Field.ACCUMULATE, True)

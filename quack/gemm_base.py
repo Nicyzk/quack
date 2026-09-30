@@ -756,9 +756,9 @@ class GemmBase:
                         epi_store_pipeline.producer_tail()
         return epi_read_state, epi_producer_state
 
-    def get_scheduler_class(self, varlen_m: bool = False):
+    def get_scheduler_class(self, varlen_m: bool = False, varlen_n: bool = False):
         """Return the scheduler class to use. Override in subclasses for custom schedulers."""
-        return TileScheduler if not varlen_m else VarlenMTileScheduler
+        return TileScheduler if not (varlen_m or varlen_n) else VarlenMTileScheduler
 
     def resolve_epi_m_major(self, epilogue_args: EpilogueArguments):
         return True
@@ -782,7 +782,31 @@ class GemmBase:
                 persistence_mode = PersistenceMode.DYNAMIC
             else:
                 persistence_mode = PersistenceMode.STATIC
-        if const_expr(varlen_args.mCuSeqlensM is None):
+        if const_expr(varlen_args.mCuSeqlensN is not None):
+            # varlen_n (swap-AB grouped GEMM): the ragged dim is N; A is (M, K, L) per batch.
+            assert getattr(scheduler_args, "ag", None) is None
+            assert getattr(scheduler_args, "dispatch", None) is None
+            assert getattr(scheduler_args, "combine", None) is None
+            assert self.split_k == 1, "split_k does not support varlen_n"
+            assert not self.gather_A, "varlen_n does not support gather_A"
+            problem_shape_ntile_mnl = (
+                cute.ceil_div(cute.size(mA, mode=[0]), self.cta_tile_shape_mnk[0]),
+                None,
+                varlen_args.mCuSeqlensN.shape[0] - 1,
+            )
+            tile_sched_args = VarlenMTileSchedulerArguments(
+                problem_shape_ntile_mnl=problem_shape_ntile_mnl,
+                total_m=cute.size(mB, mode=[0]),
+                cu_seqlens_m=varlen_args.mCuSeqlensN,
+                raster_order=scheduler_args.raster_order,
+                group_size=scheduler_args.max_swizzle_size,
+                tile_shape_mn=self.cta_tile_shape_mnk[:2],
+                cluster_shape_mnk=self.cluster_shape_mnk,
+                tile_count_semaphore=scheduler_args.tile_count_semaphore,
+                persistence_mode=persistence_mode,
+                varlen_dim=1,
+            )
+        elif const_expr(varlen_args.mCuSeqlensM is None):
             num_problems = (
                 mD.shape[2]
                 if mD is not None
@@ -1129,6 +1153,7 @@ class GemmTmaBase(GemmBase):
         mC: Optional[cute.Tensor],
         epilogue_args,
         varlen_m: bool,
+        varlen_n: bool = False,
     ):
         add_to_output = const_expr(
             hasattr(epilogue_args, "add_to_output") and epilogue_args.add_to_output
@@ -1138,16 +1163,22 @@ class GemmTmaBase(GemmBase):
         # kernel); partials travel through the f32 workspace, not through D.
         tma_atom_d, tma_tensor_d = None, None
         if const_expr(mD is not None):
+            if const_expr(varlen_m or varlen_n):
+                # Ragged store: TMA clips rows (cols) past the sequence end.
+                mD_tma = copy_utils.create_ragged_tensor_for_tma(
+                    mD, ragged_dim=0 if varlen_m else 1, ptr_shift=True
+                )
+            else:
+                mD_tma = mD
             tma_atom_d, tma_tensor_d = self._make_tma_epi_atoms_and_tensors(
-                copy_utils.create_ragged_tensor_for_tma(mD, ragged_dim=0, ptr_shift=True)
-                if varlen_m
-                else mD,
+                mD_tma,
                 self.epi_smem_layout_staged,
                 self.epi_tile,
                 op_type="store" if not add_to_output else "add",
             )
         tma_atom_c, tma_tensor_c = None, None
         if const_expr(mC is not None):
+            assert not varlen_n, "varlen_n does not support C yet"
             # Same zero-fill contract as A: with an active M-fold sink, C rows
             # past a sequence end must load as zero, not the next sequence's.
             tma_atom_c, tma_tensor_c = self._make_tma_epi_atoms_and_tensors(
