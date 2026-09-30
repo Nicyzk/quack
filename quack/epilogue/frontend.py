@@ -451,9 +451,21 @@ class EpiMod:
         )
 
     def _mint(
-        self, kind_sig, sm, paired_acc, packed_c, prepass_sig, rounding, arg_forms, add_to_output
+        self,
+        kind_sig,
+        sm,
+        paired_acc,
+        packed_c,
+        prepass_sig,
+        rounding,
+        arg_forms,
+        add_to_output,
+        pair_dim="n",
     ):
+        # pair_dim "m": acc pairs over M rows (swap-AB gated, see TileStore pair_dim)
         key = (kind_sig, sm, paired_acc, packed_c, prepass_sig, rounding, arg_forms, add_to_output)
+        if pair_dim != "n":
+            key += (pair_dim,)
         cls = self._minted.get(key)
         if cls is not None:
             return cls
@@ -475,7 +487,7 @@ class EpiMod:
         for out_name in self.outputs:
             op = self.output_ops.get(out_name)
             if op is None:
-                op = TileStore(out_name, gated=paired_acc)
+                op = TileStore(out_name, gated=paired_acc, pair_dim=pair_dim)
             elif paired_acc and not op.gated:
                 raise ValueError(f"output op {out_name!r} must be gated in acc_pair mode")
             epi_ops.append(op)
@@ -504,7 +516,7 @@ class EpiMod:
         # trace-time constexpr and invisible to the FFI field walk.
         Args.add_to_output = add_to_output
         cls_name = (
-            f"GemmMod_{self._ident}_{'g' if paired_acc else ''}{'p' if packed_c else ''}_"
+            f"GemmMod_{self._ident}_{('g' + pair_dim if paired_acc else '')}{'p' if packed_c else ''}_"
             f"{'_'.join(k for _, k in kind_sig) or 'none'}"
             f"{''.join(f'_{n}{f}' for n, f in arg_forms)}_sm{sm}"
             # rounding / add_to_output are call-time knobs on an otherwise
@@ -532,6 +544,7 @@ class EpiMod:
                 "_epi_mod_outputs": self.outputs,
                 "_epi_mod_sinks": tuple(self.sinks),
                 "_epi_mod_group_n": 2 if paired_acc else 1,
+                "_epi_mod_pair_dim": pair_dim,
                 "_epi_mod_packed_cd": packed_c,
                 "_epi_mod_prepass_fn": staticmethod(self.prepass) if self.prepass else None,
                 "_epi_mod_prepass_operands": prepass_sig,

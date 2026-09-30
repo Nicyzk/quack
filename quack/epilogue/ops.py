@@ -65,7 +65,7 @@ def assume_stride_divisibility(tensor):
     return cute.make_tensor(tensor.iterator, cute.make_layout(tensor.shape, stride=new_stride))
 
 
-def setup_epi_tensor(gemm, tensor, epi_tile=None, op_type="store", stage=None):
+def setup_epi_tensor(gemm, tensor, epi_tile=None, op_type="store", stage=None, ragged_dim=0):
     """Create copy metadata + smem layout for a supplemental epilogue tensor.
 
     Args:
@@ -73,6 +73,7 @@ def setup_epi_tensor(gemm, tensor, epi_tile=None, op_type="store", stage=None):
         tensor: The global memory tensor to set up for the epilogue.
         epi_tile: Epilogue tile shape. Defaults to gemm.epi_tile.
         op_type: "store" or "load".
+        ragged_dim: the varlen dim the TMA store clips (0 = rows / varlen_m, 1 = cols / varlen_n).
 
     Returns:
         (copy_atom, tensor, smem_layout_staged, epi_tile). copy_atom is None for pre-TMA archs.
@@ -89,7 +90,7 @@ def setup_epi_tensor(gemm, tensor, epi_tile=None, op_type="store", stage=None):
     # into the TMA descriptor. Loads don't currently support varlen_m, so skip the
     # ragging conversion.
     tma_input = (
-        copy_utils.create_ragged_tensor_for_tma(tensor, ragged_dim=0, ptr_shift=True)
+        copy_utils.create_ragged_tensor_for_tma(tensor, ragged_dim=ragged_dim, ptr_shift=True)
         if op_type != "load" and cute.rank(tensor) == 2
         else tensor
     )
@@ -793,6 +794,13 @@ def _gated_epi_tile_fn(gemm, epi_tile):
     return (epi_tile[0], epi_tile[1] // 2)
 
 
+def _gated_m_epi_tile_fn(gemm, epi_tile):
+    """Halve the M dimension of the epi_tile for gated postact paired over M rows."""
+    if isinstance(epi_tile[0], cute.Layout):
+        return (cute.recast_layout(2, 1, epi_tile[0]), epi_tile[1])
+    return (epi_tile[0] // 2, epi_tile[1])
+
+
 class TileStore(EpiOp):
     """Tile-sized output tensor stored via TMA (e.g. postact).
 
@@ -811,6 +819,10 @@ class TileStore(EpiOp):
         gated: half-of-GEMM-N output paired over adjacent accumulator N lanes
             (implies the halved epi tile; 16-bit n-major only; tile_N % 32 on
             SM90)
+        pair_dim: "n" (above) or "m": half-of-GEMM-M output paired over the
+            rows r / r+8 each thread holds from the 16dp256b accumulator load
+            (swap-AB gated: gate/up weight rows interleaved per 8 rows; SM100,
+            16-bit m-major aux, 32 accumulator rows per epilogue warp)
         rounding: per-op RoundingMode override; None = the kernel-global
             ``gemm.rounding_mode`` (the legacy mixin behavior)
         store_pred_fn: optional ``(gemm, tile_coord_mnkl) -> Boolean``
@@ -824,13 +836,22 @@ class TileStore(EpiOp):
     """
 
     def __init__(
-        self, name, epi_tile_fn=None, gated=False, rounding=None, store_pred_fn=None, quant=None
+        self,
+        name,
+        epi_tile_fn=None,
+        gated=False,
+        rounding=None,
+        store_pred_fn=None,
+        quant=None,
+        pair_dim="n",
     ):
         super().__init__(name)
+        assert pair_dim in ("n", "m")
         if gated and epi_tile_fn is None:
-            epi_tile_fn = _gated_epi_tile_fn
+            epi_tile_fn = _gated_epi_tile_fn if pair_dim == "n" else _gated_m_epi_tile_fn
         self.epi_tile_fn = epi_tile_fn
         self.gated = gated
+        self.pair_dim = pair_dim
         self.rounding = rounding
         self.store_pred_fn = store_pred_fn
         if quant is not None:
@@ -843,6 +864,7 @@ class TileStore(EpiOp):
         return (
             _callable_config_key(self.epi_tile_fn),
             self.gated,
+            self.pair_dim,
             self.rounding,
             _callable_config_key(self.store_pred_fn),
             self.quant.cache_key() if self.quant is not None else None,
@@ -892,6 +914,10 @@ class TileStore(EpiOp):
             n = fctx.n
         leading = 1 if (major == "n" or self.epi_tile_fn is not None) else 0
         batch = fctx.l if (fctx.batched and not fctx.varlen_m) else None
+        if self.gated and self.pair_dim == "m":
+            # (half the GEMM M, n), m-major: a fresh M sym, M contiguous
+            m = cute.sym_int(divisibility=div_for_dtype(dtype))
+            return fake_batched(dtype, m, fctx.n, batch, 0, div_for_dtype(dtype))
         if fctx.swapped:
             # Crossing order is caller-oriented (n_k, m_k); the caller-stride
             # major label flips with the shape order, so ``leading`` is
@@ -924,8 +950,14 @@ class TileStore(EpiOp):
             assert tensor.element_type.width == 16 or (
                 gemm.arch in (100, 120) and tensor.element_type.width in (4, 8)
             ), "gated aux output must be 16-bit (or fp8/fp4 on SM100/SM120)"
-            assert gemm.d_layout is None or gemm.d_layout.is_n_major_c()
-            assert layout.is_n_major_c()
+            if self.pair_dim == "m":
+                assert gemm.arch == 100 and tensor.element_type.width == 16, (
+                    "M-paired gated aux: SM100, 16-bit"
+                )
+                assert layout.is_m_major_c(), "M-paired gated aux must be m-major"
+            else:
+                assert gemm.d_layout is None or gemm.d_layout.is_n_major_c()
+                assert layout.is_n_major_c()
             if gemm.arch == 90:
                 assert gemm.cta_tile_shape_mnk[1] % 32 == 0, (
                     "gated epilogue on SM90 requires tile_N divisible by 32"
@@ -934,7 +966,10 @@ class TileStore(EpiOp):
         setattr(gemm, self._dtype_gemm_attr(), tensor.element_type)
         epi_tile = self.epi_tile_fn(gemm, gemm.epi_tile) if self.epi_tile_fn else None
         tma_atom, tma_tensor, smem_layout, epi_tile_out = setup_epi_tensor(
-            gemm, tensor, epi_tile=epi_tile
+            gemm,
+            tensor,
+            epi_tile=epi_tile,
+            ragged_dim=1 if getattr(gemm, "varlen_n", False) else 0,
         )
         return {
             self._tma_atom_key(): tma_atom,
@@ -1038,6 +1073,24 @@ class TileStore(EpiOp):
                 copy_atom_postact_c, tiled_mma_gated_postact
             )
             return cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_c_atom)
+        if self.gated and self.pair_dim == "m" and gemm.arch == 100:
+            # The 16dp256b load's (r, r+8) row pairs collapsed: thread t of epilogue warp w owns
+            # postact row 16w + 8*m2 + t/4 (m2 = its 16-row group) at columns 8g + 2(t%4) + j,
+            # in the pair view's (j, g, m2) register order; one element per copy, m-major tile.
+            cta_m, num_warps = gemm.cta_tile_shape_mnk[0], gemm.num_epi_warps
+            assert cta_m == 32 * num_warps, (
+                "M-paired gated aux needs 32 accumulator rows per epilogue warp"
+            )
+            half_m = cta_m // 2
+            epi_n = cute.size(getattr(params, self._epi_tile_key())[1])
+            layout_tv = cute.make_layout(
+                ((4, 8, num_warps), ((2, epi_n // 8), 2, 1)),
+                stride=((2 * half_m, 1, 16), ((half_m, 8 * half_m), 8, 0)),
+            )
+            atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), getattr(gemm, self._dtype_gemm_attr())
+            )
+            return cute.make_tiled_copy(atom, layout_tv, (half_m, epi_n))
         if self.gated and gemm.arch == 100:
             # Gated aux is half of D's N, but make_tiled_copy_S inherits D's full-N
             # tiler and over-emits 2x — harmless under (4,1) (stride-0 duplicate),
@@ -1081,17 +1134,31 @@ class TileStore(EpiOp):
         tiled_copy_aux_r2s = self._make_tiled_copy_r2s(gemm, params, tiled_copy_r2s, tiled_copy_t2r)
         tRS_sAux = tiled_copy_aux_r2s.get_slice(tidx).partition_D(smem_tensor)
         batch_idx = tile_coord_mnkl[3]
+        cta_m, cta_n = gemm.cta_tile_shape_mnk[:2]
         if self.gated:
-            tile_shape_mn = (gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[1] // 2)
+            tile_shape_mn = (cta_m, cta_n // 2) if self.pair_dim == "n" else (cta_m // 2, cta_n)
         else:
-            tile_shape_mn = gemm.cta_tile_shape_mnk[:2]
+            tile_shape_mn = (cta_m, cta_n)
+        if const_expr(varlen_manager.varlen_n):
+            # Ragged to the block's rows along N (as the D store); the n coordinate is folded in.
+            mAux = varlen_manager.offset_block_epi(
+                getattr(params, self.name),
+                batch_idx,
+                tile_coord_mnkl[1],
+                cta_n,
+                gemm.varlen_n_granule,
+            )
+            aux_coord = (tile_coord_mnkl[0], Int32(0), *tile_coord_mnkl[2:])
+        else:
+            mAux = varlen_manager.offset_batch_epi(getattr(params, self.name), batch_idx)
+            aux_coord = tile_coord_mnkl
         copy_aux, _, _ = gemm.epilog_gmem_copy_and_partition(
             getattr(params, self._tma_atom_key()),
-            varlen_manager.offset_batch_epi(getattr(params, self.name), batch_idx),
+            mAux,
             tile_shape_mn,
             getattr(params, self._epi_tile_key()),
             smem_tensor,
-            tile_coord_mnkl,
+            aux_coord,
         )
         pred = self.store_pred_fn(gemm, tile_coord_mnkl) if self.store_pred_fn else None
         return (tiled_copy_aux_r2s, tRS_sAux, copy_aux, pred)
@@ -1127,8 +1194,14 @@ class TileStore(EpiOp):
     @cute.jit
     def store_r2s(self, gemm, tiled_copy, frag_out, tRS_s_stage, tidx):
         """Copy one converted subtile from registers to this op's smem stage."""
-        # Need contiguous for Sm80 and Sm120 where acc layout is ((2, 2), MMA_M, MMA_N)
-        cute.copy(tiled_copy, tiled_copy.retile(frag_out).contiguous(), tRS_s_stage)
+        if const_expr(self.gated and self.pair_dim == "m" and gemm.arch == 100):
+            # The pair view's registers already follow the tiled copy's value order; the dtype
+            # convert flattened their nesting, so view them in the store partition's (V, 1, 1) shape
+            src = cute.make_tensor(frag_out.iterator, cute.make_layout(tRS_s_stage.shape))
+            cute.copy(tiled_copy, src, tRS_s_stage)
+        else:
+            # Need contiguous for Sm80 and Sm120 where acc layout is ((2, 2), MMA_M, MMA_N)
+            cute.copy(tiled_copy, tiled_copy.retile(frag_out).contiguous(), tRS_s_stage)
 
 
 class DStore(EpiOp):

@@ -395,7 +395,7 @@ class GemmSm100(GemmTmaBase):
             assert not self.blockscaled
             self.mma_n_variants = tuple(
                 n for n in range(self.varlen_n_granule, self.mma_tiler[1], self.varlen_n_granule)
-            )        # Configure tiled mma
+            )  # Configure tiled mma
         if const_expr(not self.blockscaled):
             self.tiled_mma = sm100_utils.make_trivial_tiled_mma(
                 self.a_dtype,
@@ -510,10 +510,19 @@ class GemmSm100(GemmTmaBase):
                     tile_load_layout = LayoutEnum.from_tensor(tile_load_tensor)
                     tile_load_dtype = tile_load_tensor.element_type
                     break
+        # No D: the epi tile, the accumulator load and the r2s fragment follow the aux store's layout
+        self.epi_d_layout = self.d_layout
+        if self.epi_d_layout is None:
+            for op in getattr(self, "_epi_ops", ()):
+                if op.is_tile_store() and getattr(epilogue_args, op.name, None) is not None:
+                    self.epi_d_layout = LayoutEnum.from_tensor(getattr(epilogue_args, op.name))
+                    break
+        if self.epi_d_layout is None:
+            self.epi_d_layout = LayoutEnum.ROW_MAJOR
         self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
             self.cta_tile_shape_mnk,
             self.use_2cta_instrs,
-            self.d_layout if self.d_layout is not None else LayoutEnum.ROW_MAJOR,
+            self.epi_d_layout,
             self.d_dtype if self.d_dtype is not None else cutlass.BFloat16,
             layout_c=self.c_layout if self.c_layout is not None else tile_load_layout,
             elem_ty_c=self.c_dtype if self.c_dtype is not None else tile_load_dtype,
@@ -794,9 +803,9 @@ class GemmSm100(GemmTmaBase):
             assert not self.blockscaled, "varlen_n does not support blockscaled"
             assert not self.gather_A, "varlen_n does not support gather_A"
             assert not any(
-                getattr(epilogue_args, op.name, None) is not None
+                getattr(epilogue_args, op.name, None) is not None and not op.is_tile_store()
                 for op in getattr(type(self), "_epi_ops", ())
-            ), "varlen_n does not support epilogue ops yet"
+            ), "varlen_n supports only tile-store epilogue ops"
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes(epilogue_args, varlen_args)
@@ -2056,7 +2065,7 @@ class GemmSm100(GemmTmaBase):
 
             tTR_rD = cute.make_rmem_tensor(tTR_rAcc.shape, self.acc_dtype)
             tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
-                tiled_copy_t2r, self.d_layout, self.d_dtype, tTR_rD, sD, epi_tidx
+                tiled_copy_t2r, self.epi_d_layout, self.d_dtype, tTR_rD, sD, epi_tidx
             )
             tRS_rC, tSR_rC, tSR_sC = None, None, None
             tiled_copy_s2r = None
@@ -2597,7 +2606,7 @@ class GemmSm100(GemmTmaBase):
         # Make tiledCopy for tensor memory load
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
             self.cta_tile_shape_mnk,
-            self.d_layout if self.d_layout is not None else LayoutEnum.ROW_MAJOR,
+            self.epi_d_layout,
             self.d_dtype if self.d_dtype is not None else cutlass.BFloat16,
             self.acc_dtype,
             epi_tile,

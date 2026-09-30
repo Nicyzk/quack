@@ -251,7 +251,17 @@ class _EpiModMixinBase(ComposableEpiMixin):
             # GemmGatedMixin: flat_divide pair views built OUTSIDE the loop so
             # every in-loop access is a plain loop index (the SM100 vectorizer
             # rejects affine indices like 2*i), scalar calls + vectorize=True.
-            aux_shape = cute.recast_layout(2, 1, tRS_rD.layout).shape
+            # pair_dim "m": the 16dp256b load's rows r / r+8 sit at register stride 2 (TileStore
+            # pair_dim), so the pair view strides the registers instead of taking neighbors.
+            pair_m = const_expr(getattr(self, "_epi_mod_pair_dim", "n") == "m")
+            pair_tiler = cute.make_layout(2, stride=2) if pair_m else cute.make_layout(2)
+            if const_expr(pair_m):
+                assert all(kind in ("scalar", "apply") for _, kind in self._epi_mod_operands), (
+                    "M-paired gated fn takes only the accumulator (and scalars / apply ops)"
+                )
+            acc_pair = cute.flat_divide(tRS_rD, pair_tiler)
+            acc0, acc1 = acc_pair[0, ...], acc_pair[1, ...]
+            aux_shape = acc0.shape if pair_m else cute.recast_layout(2, 1, tRS_rD.layout).shape
             outs = tuple(
                 cute.make_rmem_tensor(aux_shape, self.acc_dtype) for _ in self._epi_mod_outputs
             )
@@ -263,11 +273,8 @@ class _EpiModMixinBase(ComposableEpiMixin):
                 for _ in self._epi_mod_sinks
             )
             sink_views = tuple(
-                (p[0, ...], p[1, ...])
-                for p in (cute.flat_divide(t, cute.make_layout(2)) for t in sink_tmps)
+                (p[0, ...], p[1, ...]) for p in (cute.flat_divide(t, pair_tiler) for t in sink_tmps)
             )
-            acc_pair = cute.flat_divide(tRS_rD, cute.make_layout(2))
-            acc0, acc1 = acc_pair[0, ...], acc_pair[1, ...]
             n_groups = cute.size(acc0)
 
             def _dense(view):
