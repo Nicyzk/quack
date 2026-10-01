@@ -195,3 +195,71 @@ def make_smem_layout_tma_gather_a(
         ip=ip,
     )
     return a_smem_layout_staged
+
+
+def _b_smem_shape_n_k(tiled_mma, mma_tiler_mnk, *, loc=None, ip=None):
+    """This CTA's B rows and K per stage (N/2 of the MMA tile under 2-CTA)."""
+    b_smem_shape = tiled_mma.partition_shape_B(
+        cute.dice(mma_tiler_mnk, (None, 1, 1), loc=loc, ip=ip)
+    )
+    return (
+        cute.size(b_smem_shape[0][0], loc=loc, ip=ip) * b_smem_shape[1],
+        cute.size(b_smem_shape[0][1], loc=loc, ip=ip) * b_smem_shape[2],
+    )
+
+
+@dsl_user_op
+def make_smem_layout_atom_tma_gather_b(
+    tiled_mma: cute.TiledMma,
+    mma_tiler_mnk: cute.Tile,
+    b_dtype: Type[Numeric],
+    gather_size: int = 4,
+    *,
+    loc=None,
+    ip=None,
+) -> Union[cute.Layout, cute.ComposedLayout]:
+    """SMEM load layout atom for K-major B with TMA gather4 (the A atom above, on B's rows)."""
+    assert tiled_mma.op.b_major_mode == OperandMajorMode.K, "gather_B needs K-major B"
+    b_smem_shape_n_k = _b_smem_shape_n_k(tiled_mma, mma_tiler_mnk, loc=loc, ip=ip)
+    b_smem_layout_atom = sm100_utils_og.make_smem_layout_atom(
+        sm100_utils_og.get_smem_layout_atom_ab(
+            tiled_mma.op.b_major_mode, b_dtype, b_smem_shape_n_k, loc=loc, ip=ip
+        ),
+        b_dtype,
+        loc=loc,
+        ip=ip,
+    )
+    smem_layout = b_smem_layout_atom.outer
+    return cute.make_composed_layout(
+        b_smem_layout_atom.inner,
+        0,
+        cute.make_layout(
+            (gather_size, smem_layout.shape[1]), stride=smem_layout.stride, loc=loc, ip=ip
+        ),
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def make_smem_layout_tma_gather_b(
+    tiled_mma: cute.TiledMma,
+    mma_tiler_mnk: cute.Tile,
+    b_dtype: Type[Numeric],
+    num_stages: int,
+    *,
+    loc=None,
+    ip=None,
+) -> Union[cute.Layout, cute.ComposedLayout]:
+    """SMEM load layout for K-major B with TMA gather4."""
+    b_smem_shape_n_k = _b_smem_shape_n_k(tiled_mma, mma_tiler_mnk, loc=loc, ip=ip)
+    b_smem_layout_atom = make_smem_layout_atom_tma_gather_b(
+        tiled_mma, mma_tiler_mnk, b_dtype, loc=loc, ip=ip
+    )
+    return cute.tile_to_shape(
+        b_smem_layout_atom,
+        cute.append(b_smem_shape_n_k, num_stages, loc=loc, ip=ip),
+        order=(0, 1, 2),
+        loc=loc,
+        ip=ip,
+    )

@@ -341,7 +341,9 @@ def make_fake_scheduler_args(
     )
 
 
-def make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=None, cu_seqlens_n=None):
+def make_varlen_args(
+    cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=None, cu_seqlens_n=None, B_idx=None
+):
     if cu_seqlens_m is None and cu_seqlens_k is None and cu_seqlens_n is None:
         return None
     return VarlenArguments(
@@ -350,6 +352,7 @@ def make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=None, cu_seql
         mCuSeqlensN=cu_seqlens_n,
         mAIdx=A_idx,
         mCuTilesM=cu_tiles_m,
+        mBIdx=B_idx,
     )
 
 
@@ -366,12 +369,17 @@ def compute_cu_tiles_m(cu_seqlens_m, tile_m_cta):
 
 
 def make_fake_varlen_args(
-    varlen_m, varlen_k, gather_A, aidx_len, has_cu_tiles_m=False, varlen_n=False
+    varlen_m, varlen_k, gather_A, aidx_len, has_cu_tiles_m=False, varlen_n=False, gather_B=False
 ):
     if not varlen_m and not varlen_k and not varlen_n:
         return None
     num_seqlens = cute.sym_int()
     return VarlenArguments(
+        mBIdx=(
+            fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=4)
+            if gather_B
+            else None
+        ),
         mCuSeqlensM=(
             fake_tensor(Int32, (num_seqlens,), leading_dim=0, divisibility=4) if varlen_m else None
         ),
@@ -563,6 +571,7 @@ def make_fake_gemm_tensors(
     a_mma_dtype=None,
     b_mma_dtype=None,
     varlen_n=False,
+    gather_B=False,
 ):
     """Create fake tensors for mA, mB, mD, mC with shared sym_ints.
     Pass dtype=None to get None for that tensor (e.g. optional C).
@@ -653,10 +662,12 @@ def make_fake_gemm_tensors(
         mD = fake_batched(d_dtype, m, dc_n, None, d_leading, div_d)
         mC = fake_batched(c_dtype, m, dc_n, None, c_leading, div_c)
     elif varlen_n:
-        # n is total_n: the flattened N dimension of B/D/C; A is per-batch
+        # n is total_n: the flattened N dimension of B/D/C; A is per-batch.
+        # gather_B: B is the row pool the indices point into, its own row count.
         n = cute.sym_int()
+        b_n = cute.sym_int() if gather_B else n
         mA = fake_batched(a_dtype, m, a_k_sym, l, a_leading, div_a)
-        mB = fake_batched(b_dtype, n, b_k_sym, None, b_leading, div_b)
+        mB = fake_batched(b_dtype, b_n, b_k_sym, None, b_leading, div_b)
         mD = fake_batched(d_dtype, m, n, None, d_leading, div_d)
         mC = fake_batched(c_dtype, m, n, None, c_leading, div_c)
     elif varlen_k:

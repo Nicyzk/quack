@@ -25,6 +25,8 @@ class VarlenArguments(NamedTuple):
     # sinks); the tile scheduler's m index is sequence-local, so a batchless
     # per-M-tile buffer needs this offset to keep sequences' rows disjoint.
     mCuTilesM: Optional[cute.Tensor] = None
+    # varlen_n row gather (swap-AB tokens on B): B row of GEMM row i is mBIdx[i], (total_n,)
+    mBIdx: Optional[cute.Tensor] = None
 
 
 class VarlenManager:
@@ -35,6 +37,7 @@ class VarlenManager:
         cu_seqlens_n: Optional[cute.Tensor] = None
         mAIdx: Optional[cute.Tensor] = None
         cu_tiles_m: Optional[cute.Tensor] = None
+        mBIdx: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -45,6 +48,7 @@ class VarlenManager:
                 cu_seqlens_n=args.mCuSeqlensN,
                 mAIdx=args.mAIdx,
                 cu_tiles_m=args.mCuTilesM,
+                mBIdx=args.mBIdx,
             )
 
     def __init__(
@@ -69,6 +73,7 @@ class VarlenManager:
         self.varlen_k = const_expr(params.cu_seqlens_k is not None)
         self.varlen_n = const_expr(params.cu_seqlens_n is not None)
         self.gather_A = const_expr(params.mAIdx is not None)
+        self.gather_B = const_expr(params.mBIdx is not None)
         self._loc = loc
         self._ip = ip
 
@@ -81,6 +86,7 @@ class VarlenManager:
         assert not (args.mCuSeqlensN is not None and args.mAIdx is not None), (
             "varlen_n does not support gather_A"
         )
+        assert args.mBIdx is None or args.mCuSeqlensN is not None, "gather_B needs varlen_n"
         return VarlenManager.Params.create(args, loc=loc, ip=ip)
 
     @staticmethod
@@ -207,6 +213,14 @@ class VarlenManager:
         else:
             mA_mk = mA_mkl[None, None, batch_idx]
         return mA_mk
+
+    def offset_block_BIdx(
+        self, batch_idx: Int32, pid_n: Int32, tile_n: int, granule: int, row_shift: Int32
+    ) -> cute.Tensor:
+        """mBIdx at block pid_n's first row + row_shift (a CTA's share of the block)."""
+        b = self.block_n_rows(batch_idx, tile_n, granule)
+        offset = self.params.cu_seqlens_n[batch_idx] + pid_n * b + row_shift
+        return cute.domain_offset((offset,), self.params.mBIdx)
 
     def offset_batch_AIdx(self, batch_idx: Int32) -> cute.Tensor:
         params = self.params

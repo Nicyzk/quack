@@ -794,9 +794,15 @@ class GemmBase:
                 None,
                 varlen_args.mCuSeqlensN.shape[0] - 1,
             )
+            # The ragged dim's rows bound the grid; under gather_B mB is the row pool, not the rows
+            total_n = (
+                varlen_args.mBIdx.shape[0]
+                if const_expr(varlen_args.mBIdx is not None)
+                else cute.size(mB, mode=[0])
+            )
             tile_sched_args = VarlenMTileSchedulerArguments(
                 problem_shape_ntile_mnl=problem_shape_ntile_mnl,
-                total_m=cute.size(mB, mode=[0]),
+                total_m=total_n,
                 cu_seqlens_m=varlen_args.mCuSeqlensN,
                 raster_order=scheduler_args.raster_order,
                 group_size=scheduler_args.max_swizzle_size,
