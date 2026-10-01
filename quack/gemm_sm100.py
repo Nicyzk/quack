@@ -1443,9 +1443,10 @@ class GemmSm100(GemmTmaBase):
                         ag_last_gate,
                     )
                     iket.range_pop()
-                # MoE dispatch: block until this tile's M cluster's A rows have landed.
+                # MoE dispatch: block until this tile's block of the ragged dim has landed.
                 if const_expr(getattr(tile_sched_params, "dispatch", None) is not None):
-                    dispatch_wait_m_cluster(tile_sched_params, tile_coord_mnkl[0], batch_idx)
+                    vd = const_expr(getattr(tile_sched_params, "varlen_dim", 0))
+                    dispatch_wait_m_cluster(tile_sched_params, tile_coord_mnkl[vd], batch_idx)
                 # Local_tile partition global tensors
                 mma_tile_coord_mnl = (
                     tile_coord_mnkl[0] // cute.size(tiled_mma.thr_id.shape),
@@ -1829,7 +1830,7 @@ class GemmSm100(GemmTmaBase):
 
         # Specialized TMA epi load warp
         if warp_idx == self.epi_load_warp_id:
-            if const_expr(self.gather_A):
+            if const_expr(self.has_idx_prefetch):
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
             # PDL: wait for prior kernel before any C TMA loads (matches cutlass C++ epi_load)
             if const_expr(self.use_pdl and has_epi_load):
@@ -1909,7 +1910,7 @@ class GemmSm100(GemmTmaBase):
 
         # Specialized MMA warp
         if warp_idx == self.mma_warp_id:
-            if const_expr(self.gather_A):
+            if const_expr(self.has_idx_prefetch):
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
             # Retrieving tensor memory ptr and make accumulator tensor
             tmem.wait_for_alloc()
@@ -2165,7 +2166,7 @@ class GemmSm100(GemmTmaBase):
         # Specialized epilogue warps
         #
         if warp_idx < self.mma_warp_id:
-            if const_expr(self.gather_A):
+            if const_expr(self.has_idx_prefetch):
                 cute.arch.setmaxregister_increase(self.num_regs_epi)
             # Alloc tensor memory buffer
             tmem.allocate(self.num_tmem_alloc_cols)
@@ -2336,8 +2337,9 @@ class GemmSm100(GemmTmaBase):
                 # MoE combine: publish the stored D tile (flags[batch, cid_m] += 1 per N tile once its
                 # bulk stores drained) so a transfer kernel can push the M cluster's rows.
                 if const_expr(getattr(tile_sched_params, "combine", None) is not None):
+                    vd = const_expr(getattr(tile_sched_params, "varlen_dim", 0))
                     if is_tma_warp:
-                        combine_signal_m_cluster(tile_sched_params, tile_coord_mnkl[0], batch_idx)
+                        combine_signal_m_cluster(tile_sched_params, tile_coord_mnkl[vd], batch_idx)
                 # acc_pipeline.consumer_release was already called in self.epi_load_acc_subtile
                 acc_consumer_state.advance()
                 iket.range_pop()

@@ -29,6 +29,17 @@ class VarlenArguments(NamedTuple):
     mBIdx: Optional[cute.Tensor] = None
 
 
+VARLEN_N_GRANULE = 64  # the varlen_n MMA-N variants' row granule (gemm_sm100.varlen_n_granule)
+
+
+@cute.jit
+def varlen_n_block_rows(n: Int32, tile_n: cutlass.Constexpr[int], granule: cutlass.Constexpr[int]) -> Int32:
+    """varlen_n even split: n rows cut into ceil(n / tile_n) blocks of ceil(n / blocks) rows rounded up to
+    `granule`, so no block is a thin tail. Shared by the kernel, the tile scheduler's gates and the walks."""
+    num_blocks = cute.ceil_div(n, tile_n)
+    return cute.ceil_div(cute.ceil_div(n, num_blocks), granule) * granule
+
+
 class VarlenManager:
     @dataclass
     class Params:
@@ -126,13 +137,9 @@ class VarlenManager:
         else:
             return self._len_n_static
 
-    # varlen_n even split: a sequence of n rows is cut into ceil(n / tile_n) blocks of
-    # ceil(n / num_blocks) rows rounded up to `granule` (the MMA-N variants), so no
-    # block is a thin tail. Block j covers rows [j * b, min((j + 1) * b, n)).
+    # varlen_n even split (varlen_n_block_rows): block j covers rows [j * b, min((j + 1) * b, n)).
     def block_n_rows(self, batch_idx: Int32, tile_n: int, granule: int) -> Int32:
-        n = self.len_n(batch_idx)
-        num_blocks = cute.ceil_div(n, tile_n)
-        return cute.ceil_div(cute.ceil_div(n, num_blocks), granule) * granule
+        return varlen_n_block_rows(self.len_n(batch_idx), tile_n, granule)
 
     def block_n_valid(self, batch_idx: Int32, pid_n: Int32, tile_n: int, granule: int) -> Int32:
         """Rows of block pid_n (the last block may be shorter)."""

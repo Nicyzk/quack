@@ -15,6 +15,7 @@ import quack.utils as utils
 from quack.fast_math import FastDivmod
 from quack.pipeline import PipelineStateWAdvance
 from quack.cute_dsl_utils import mlir_namedtuple
+from quack.varlen_utils import VARLEN_N_GRANULE, varlen_n_block_rows
 
 
 class RasterOrderOption(IntEnum):
@@ -250,31 +251,46 @@ class CombineSchedulerArguments(NamedTuple):
 
 
 @cute.jit
-def dispatch_wait_m_cluster(params, pid_m: Int32, batch_idx: Int32):
-    """Dispatch arrival gate, called by the AB-load warp before the tile's A loads: spin until
-    flags[batch_idx, cid_m] reaches the M cluster's row count. Takes the tile's coordinates,
+def ragged_block_rows(params, batch_idx: Int32) -> Int32:
+    """Rows of one gated block of the ragged dim: the M cluster under varlen_m, the even-split
+    N block under varlen_n (varlen_n_block_rows)."""
+    vd = const_expr(getattr(params, "varlen_dim", 0))
+    if const_expr(vd == 0):
+        return Int32(params.tile_shape_mn[0] * params.cluster_shape_mnk[0])
+    seqlen = params.cu_seqlens_m[batch_idx + 1] - params.cu_seqlens_m[batch_idx]
+    return varlen_n_block_rows(seqlen, params.tile_shape_mn[1], VARLEN_N_GRANULE)
+
+
+@cute.jit
+def dispatch_wait_m_cluster(params, pid: Int32, batch_idx: Int32):
+    """Dispatch arrival gate, called by the AB-load warp before the tile's gathered loads: spin
+    until flags[batch_idx, block] reaches the block's row count; pid = the tile's coordinate
+    along the ragged dim (M under varlen_m, N under varlen_n). Takes the tile's coordinates,
     not scheduler state (consumer warps read tiles from the scheduler's smem record). Relaxed
     sys loads, as ag_wait_m_tile: the gated rows are read at L2, never through L1."""
-    block_size = params.tile_shape_mn[0] * params.cluster_shape_mnk[0]
-    cid_m = pid_m // params.cluster_shape_mnk[0]
+    vd = const_expr(getattr(params, "varlen_dim", 0))
+    block_rows = ragged_block_rows(params, batch_idx)
+    cid = pid // params.cluster_shape_mnk[vd]
     seqlen = params.cu_seqlens_m[batch_idx + 1] - params.cu_seqlens_m[batch_idx]
-    num_rows = cutlass.min(seqlen - cid_m * block_size, block_size)
+    num_rows = cutlass.min(seqlen - cid * block_rows, block_rows)
     flags = params.dispatch.flags
-    ptr = flags.iterator + cute.crd2idx((batch_idx, cid_m), flags.layout)
+    ptr = flags.iterator + cute.crd2idx((batch_idx, cid), flags.layout)
     val = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="sys")
     while val < num_rows:
         val = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="sys")
 
 
 @cute.jit
-def combine_signal_m_cluster(params, pid_m: Int32, batch_idx: Int32):
+def combine_signal_m_cluster(params, pid: Int32, batch_idx: Int32):
     """Combine publish, called by the epilogue's TMA-store warp at the end of a tile: drain the
     warp's bulk stores (the tile's D rows are in HBM), then one release-add on
-    flags[batch_idx, cid_m] (gpu scope: the transfer kernel runs on this GPU)."""
+    flags[batch_idx, block] (gpu scope: the transfer kernel runs on this GPU); pid = the
+    tile's coordinate along the ragged dim, the count target = the fixed dim's CTA tiles."""
     cute.arch.cp_async_bulk_commit_group()
     cute.arch.cp_async_bulk_wait_group(0, read=False)
     cute.arch.fence_proxy("async")
-    cid_m = pid_m // params.cluster_shape_mnk[0]
+    vd = const_expr(getattr(params, "varlen_dim", 0))
+    cid_m = pid // params.cluster_shape_mnk[vd]
     flags = params.combine.flags
     ptr = flags.iterator + cute.crd2idx((batch_idx, cid_m), flags.layout)
     with cute.arch.elect_one():
@@ -1358,9 +1374,8 @@ class VarlenMTileScheduler(TileScheduler):
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "VarlenMTileScheduler.Params":
             assert args.num_split_k == 1, "split_k is not supported by VarlenMTileScheduler"
-            assert args.dispatch is None or args.a_idx is not None, "dispatch needs gather_A"
-            assert args.varlen_dim == 0 or (args.dispatch is None and args.combine is None), (
-                "dispatch / combine need varlen_m"
+            assert args.dispatch is None or args.a_idx is not None, (
+                "dispatch needs the gathered rows' index (mAIdx / mBIdx)"
             )
             # problem_shape_ntile_mnl[varlen_dim] is None: the ragged dim is per batch
             problem_shape_ntile_mn = cute.select(args.problem_shape_ntile_mnl, mode=[0, 1])
@@ -1541,15 +1556,15 @@ class VarlenMTileScheduler(TileScheduler):
         self,
         batch_idx: Int32,
         num_clusters_m: Int32,
-        block_size: cutlass.Constexpr[int],
         row_key: cute.Tensor,
         first_src_row: Int32,
     ) -> Int32:
-        """Dispatch / combine: the batch's first M cluster in landing (pushing) order = the
-        number of its clusters whose first row's key is below first_src_row (0 if all are).
-        Warp-cooperative: one ballot per 32 clusters."""
+        """Dispatch / combine: the batch's first block of the ragged dim in landing (pushing)
+        order = the number of its blocks whose first row's key is below first_src_row (0 if
+        all are). Warp-cooperative: one ballot per 32 blocks."""
         params = self.params
         lane_idx = cute.arch.lane_idx()
+        block_size = ragged_block_rows(params, batch_idx)
         row_start = params.cu_seqlens_m[batch_idx]
         first_cid_m = Int32(0)
         for cid_start in cutlass.range(0, num_clusters_m, cute.arch.WARP_SIZE, unroll=1):
@@ -1651,7 +1666,6 @@ class VarlenMTileScheduler(TileScheduler):
                         first_cid_m = self._first_cid_m(
                             batch_idx,
                             num_clusters_m,
-                            block_size,
                             params.a_idx,
                             params.dispatch.first_src_row[0],
                         )
@@ -1659,7 +1673,6 @@ class VarlenMTileScheduler(TileScheduler):
                         first_cid_m = self._first_cid_m(
                             batch_idx,
                             num_clusters_m,
-                            block_size,
                             params.combine.row_key,
                             params.combine.first_src_row[0],
                         )
@@ -1674,9 +1687,16 @@ class VarlenMTileScheduler(TileScheduler):
             cluster_id_in_problem = next_tile_idx - num_work_idx_before_cur_batch
             cid_m, cid_n = self._swizzle_cta(cluster_id_in_problem, num_clusters_m, loc=loc, ip=ip)
             if const_expr(params.dispatch is not None or params.combine is not None):
-                cid_m += first_cid_m  # walk the batch in landing (pushing) order
-                if cid_m >= num_clusters_m:
-                    cid_m -= num_clusters_m
+                # walk the batch in landing (pushing) order: rotate the ragged dim's coordinate
+                # (num_clusters_m is that dim's block count)
+                if const_expr(params.varlen_dim == 0):
+                    cid_m += first_cid_m
+                    if cid_m >= num_clusters_m:
+                        cid_m -= num_clusters_m
+                else:
+                    cid_n += first_cid_m
+                    if cid_n >= num_clusters_m:
+                        cid_n -= num_clusters_m
         pid_m, pid_n = self._cluster_id_to_cta_id(
             cid_m, cid_n, block_zero_only=block_zero_only, loc=loc, ip=ip
         )
