@@ -261,7 +261,7 @@ def make_scheduler_args(
     tile_count_semaphore,
     batch_idx_permute=None,
     ag_args=None,  # quack.gemm.AllGatherArguments or None
-    dispatch_args=None,  # (flags, first_src_row) tensors, see DispatchSchedulerArguments
+    dispatch_args=None,  # (flags, first_src_row[, row_key]) tensors, see DispatchSchedulerArguments
     combine_args=None,  # (flags, row_key, first_src_row) tensors, see CombineSchedulerArguments
 ):
     return TileSchedulerOptions(
@@ -289,7 +289,8 @@ def make_scheduler_args(
 
 
 def make_fake_scheduler_args(
-    has_semaphore, has_batch_idx_permute, l_sym, has_ag=False, has_dispatch=False, has_combine=False
+    has_semaphore, has_batch_idx_permute, l_sym, has_ag=False, has_dispatch=False, has_combine=False,
+    has_dispatch_row_key=False,
 ):
     return TileSchedulerOptions(
         max_active_clusters=Int32(1),
@@ -323,6 +324,11 @@ def make_fake_scheduler_args(
                 ),
                 # a 1-elem view into the host's source-block offsets: any 4 B alignment
                 first_src_row=fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1),
+                row_key=(
+                    fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1)
+                    if has_dispatch_row_key
+                    else None
+                ),
             )
             if has_dispatch
             else None

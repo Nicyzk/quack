@@ -228,11 +228,13 @@ class DispatchSchedulerArguments(NamedTuple):
     during the GEMM in source order, starting with the block at *first_src_row and wrapping.
     The scheduler walks each batch's M clusters in landing order (from the first cluster
     whose first gathered row is >= *first_src_row), and the load warp spins until
-    flags[batch, cid_m] reaches the cluster's M row count. Needs mAIdx ascending within each
+    flags[batch, cid_m] reaches the cluster's M row count. Needs the rows' source key (mAIdx /
+    mBIdx, or row_key when the GEMM reads the landed rows without a gather) ascending within each
     batch and source blocks ascending in A."""
 
     flags: cute.Tensor  # (num batches, >= max M clusters per batch) Int32, +1 per landed M row
     first_src_row: cute.Tensor  # (1,) Int32, device-resident
+    row_key: Optional[cute.Tensor] = None  # (rows,) Int32 each row's source key; None = mAIdx / mBIdx
 
 
 @mlir_namedtuple
@@ -1375,7 +1377,7 @@ class VarlenMTileScheduler(TileScheduler):
         ) -> "VarlenMTileScheduler.Params":
             assert args.num_split_k == 1, "split_k is not supported by VarlenMTileScheduler"
             assert args.dispatch is None or args.a_idx is not None, (
-                "dispatch needs the gathered rows' index (mAIdx / mBIdx)"
+                "dispatch needs the rows' source key (mAIdx / mBIdx or dispatch.row_key)"
             )
             # problem_shape_ntile_mnl[varlen_dim] is None: the ragged dim is per batch
             problem_shape_ntile_mn = cute.select(args.problem_shape_ntile_mnl, mode=[0, 1])

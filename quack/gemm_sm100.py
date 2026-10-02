@@ -218,6 +218,10 @@ class GemmSm100(GemmTmaBase):
         gather_A: bool = False,
         use_tma_gather: bool = False,
         gather_B: bool = False,  # varlen_n: B rows by index (mBIdx), TMA gather4
+        # varlen_n: the MMA-N sizes a tile may run at (ascending multiples of 16 below tile_n);
+        # a tile runs the smallest one covering its block's valid rows, else the full tile.
+        # None: every 64 (the even-split block granule)
+        varlen_n_variants: Optional[Tuple[int, ...]] = None,
         use_clc_persistence: bool = True,
         concat_layout: tuple | None = None,
         use_pdl: bool = True,
@@ -279,6 +283,7 @@ class GemmSm100(GemmTmaBase):
         if use_tma_gather:
             assert gather_A, "TMA gather requires gather_A=True"
         self.gather_B = gather_B
+        self.varlen_n_variants = varlen_n_variants
         if gather_B:
             assert not gather_A, "gather_A and gather_B are exclusive"
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather B"
@@ -400,8 +405,15 @@ class GemmSm100(GemmTmaBase):
                 "varlen_n needs tile_n <= 256 (one MMA instruction) and cluster_n == 1"
             )
             assert not self.blockscaled
-            self.mma_n_variants = tuple(
-                n for n in range(self.varlen_n_granule, self.mma_tiler[1], self.varlen_n_granule)
+            self.mma_n_variants = (
+                tuple(self.varlen_n_variants)
+                if self.varlen_n_variants is not None
+                else tuple(range(self.varlen_n_granule, self.mma_tiler[1], self.varlen_n_granule))
+            )
+            assert all(
+                n % 16 == 0 and 0 < n < self.mma_tiler[1] for n in self.mma_n_variants
+            ) and list(self.mma_n_variants) == sorted(set(self.mma_n_variants)), (
+                "varlen_n_variants must be ascending multiples of 16 below tile_n"
             )  # Configure tiled mma
         if const_expr(not self.blockscaled):
             self.tiled_mma = sm100_utils.make_trivial_tiled_mma(
@@ -1477,7 +1489,7 @@ class GemmSm100(GemmTmaBase):
                         self.cta_tile_shape_mnk[1],
                         self.varlen_n_granule,
                     )
-                    n_inst = cute.ceil_div(n_valid, self.varlen_n_granule) * self.varlen_n_granule
+                    n_inst = self.varlen_n_inst(n_valid)
                     row_shift = Int32(0)
                     if const_expr(cute.size(tiled_mma.thr_id.shape) == 2):
                         row_shift = mma_tile_coord_v * (n_inst - self.cta_tile_shape_mnk[1]) // 2
@@ -1743,9 +1755,7 @@ class GemmSm100(GemmTmaBase):
                         n_valid = varlen_manager.block_n_valid(
                             batch_idx, tile_coord_mnkl[1], tile_N, self.varlen_n_granule
                         )
-                        n_inst = (
-                            cute.ceil_div(n_valid, self.varlen_n_granule) * self.varlen_n_granule
-                        )
+                        n_inst = self.varlen_n_inst(n_valid)
                         cta_shift = Int32(0)
                         if const_expr(use_2cta_instrs):
                             cta_shift = mma_tile_coord_v * n_inst // 2
@@ -2040,65 +2050,32 @@ class GemmSm100(GemmTmaBase):
                 iket.range_push("mma")
                 if const_expr(len(mma_variants) > 0):
                     # varlen_n: select the MMA-N variant once per tile from the block's valid
-                    # rows (variant i serves ceil(rows / granule) == i + 1, the base atom the
-                    # full tile); each branch runs the plain straight-line mainloop
+                    # rows (the smallest variant covering them, the base atom the full tile);
+                    # each branch runs the plain straight-line mainloop
                     n_valid = varlen_manager.block_n_valid(
                         batch_idx,
                         tile_coord_mnkl[1],
                         self.cta_tile_shape_mnk[1],
                         self.varlen_n_granule,
                     )
-                    n_sel = cute.ceil_div(n_valid, self.varlen_n_granule)
-                    assert len(mma_variants) == 3, "varlen_n: tile_n must be 256"
-                    (_, v0_tm0, v0_tm1, v0_a, v0_b, v0_acc) = mma_variants[0]
-                    (_, v1_tm0, v1_tm1, v1_a, v1_b, v1_acc) = mma_variants[1]
-                    (_, v2_tm0, v2_tm1, v2_a, v2_b, v2_acc) = mma_variants[2]
-                    if n_sel == 1:
-                        ab_consumer_state, acc_producer_state, _ = self.mma(
-                            ab_pipeline,
-                            acc_pipeline,
-                            ab_consumer_state,
-                            acc_producer_state,
-                            v0_tm0,
-                            v0_a,
-                            v0_b,
-                            v0_acc[None, None, None, acc_stage_idx],
-                            k_tile_cnt,
-                            is_leader_cta,
-                            cta_rank_in_cluster,
-                            tiled_mma_acc=v0_tm1,
-                        )
-                    elif n_sel == 2:
-                        ab_consumer_state, acc_producer_state, _ = self.mma(
-                            ab_pipeline,
-                            acc_pipeline,
-                            ab_consumer_state,
-                            acc_producer_state,
-                            v1_tm0,
-                            v1_a,
-                            v1_b,
-                            v1_acc[None, None, None, acc_stage_idx],
-                            k_tile_cnt,
-                            is_leader_cta,
-                            cta_rank_in_cluster,
-                            tiled_mma_acc=v1_tm1,
-                        )
-                    elif n_sel == 3:
-                        ab_consumer_state, acc_producer_state, _ = self.mma(
-                            ab_pipeline,
-                            acc_pipeline,
-                            ab_consumer_state,
-                            acc_producer_state,
-                            v2_tm0,
-                            v2_a,
-                            v2_b,
-                            v2_acc[None, None, None, acc_stage_idx],
-                            k_tile_cnt,
-                            is_leader_cta,
-                            cta_rank_in_cluster,
-                            tiled_mma_acc=v2_tm1,
-                        )
-                    else:
+                    n_inst = self.varlen_n_inst(n_valid)
+                    for n_var, v_tm0, v_tm1, v_a, v_b, v_acc in mma_variants:
+                        if n_inst == n_var:
+                            ab_consumer_state, acc_producer_state, _ = self.mma(
+                                ab_pipeline,
+                                acc_pipeline,
+                                ab_consumer_state,
+                                acc_producer_state,
+                                v_tm0,
+                                v_a,
+                                v_b,
+                                v_acc[None, None, None, acc_stage_idx],
+                                k_tile_cnt,
+                                is_leader_cta,
+                                cta_rank_in_cluster,
+                                tiled_mma_acc=v_tm1,
+                            )
+                    if n_inst == self.cta_tile_shape_mnk[1]:
                         ab_consumer_state, acc_producer_state, tiled_mma = self.mma(
                             ab_pipeline,
                             acc_pipeline,
@@ -2552,6 +2529,16 @@ class GemmSm100(GemmTmaBase):
             if k_tile + 1 < k_tile_cnt:
                 peek_ab_empty_status = ab_pipeline.producer_try_acquire(ab_producer_state)
         return ab_producer_state, a_prefetch_consumer_state
+
+    @cute.jit
+    def varlen_n_inst(self, n_valid: Int32) -> Int32:
+        """varlen_n: the MMA-N a block of n_valid rows runs at — the smallest variant covering
+        it, else the full tile. The B load's CTA split and the MMA-N pick both use it."""
+        n_inst = Int32(self.cta_tile_shape_mnk[1])
+        for n_var in reversed(self.mma_n_variants):
+            if n_valid <= n_var:
+                n_inst = Int32(n_var)
+        return n_inst
 
     @cute.jit
     def mma(

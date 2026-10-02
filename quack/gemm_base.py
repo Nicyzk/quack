@@ -786,8 +786,12 @@ class GemmBase:
             # varlen_n (swap-AB grouped GEMM): the ragged dim is N; A is (M, K, L) per batch.
             # Dispatch / combine gate the even-split N blocks (tile_scheduler.ragged_block_rows).
             assert getattr(scheduler_args, "ag", None) is None
-            assert getattr(scheduler_args, "dispatch", None) is None or self.gather_B, (
-                "dispatch under varlen_n needs gather_B"
+            dispatch = getattr(scheduler_args, "dispatch", None)
+            row_key = varlen_args.mBIdx  # the dispatch walk's key: the gathered rows' index, or the landed rows' key
+            if const_expr(dispatch is not None and row_key is None):
+                row_key = dispatch.row_key
+            assert dispatch is None or row_key is not None, (
+                "dispatch under varlen_n needs the rows' source key (gather_B's mBIdx or dispatch.row_key)"
             )
             assert self.split_k == 1, "split_k does not support varlen_n"
             assert not self.gather_A, "varlen_n does not support gather_A"
@@ -812,8 +816,8 @@ class GemmBase:
                 cluster_shape_mnk=self.cluster_shape_mnk,
                 tile_count_semaphore=scheduler_args.tile_count_semaphore,
                 persistence_mode=persistence_mode,
-                dispatch=getattr(scheduler_args, "dispatch", None),
-                a_idx=varlen_args.mBIdx,
+                dispatch=dispatch,
+                a_idx=row_key,
                 combine=getattr(scheduler_args, "combine", None),
                 varlen_dim=1,
             )
