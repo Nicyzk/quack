@@ -11,6 +11,12 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
+from quack.umma_dynamic import (
+    instr_desc_f16,
+    smem_desc_sw128_k,
+    tcgen05_fence_after_thread_sync,
+    umma_f16_2sm,
+)
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -222,6 +228,9 @@ class GemmSm100(GemmTmaBase):
         # a tile runs the smallest one covering its block's valid rows, else the full tile.
         # None: every 64 (the even-split block granule)
         varlen_n_variants: Optional[Tuple[int, ...]] = None,
+        # varlen_n: no compiled variants; each tile's MMAs carry a runtime instruction descriptor
+        # with N = the block's rows rounded to 16 (bf16/f16, K-major, 2-CTA; quack.umma_dynamic)
+        varlen_n_dynamic_n: bool = False,
         use_clc_persistence: bool = True,
         concat_layout: tuple | None = None,
         use_pdl: bool = True,
@@ -284,6 +293,7 @@ class GemmSm100(GemmTmaBase):
             assert gather_A, "TMA gather requires gather_A=True"
         self.gather_B = gather_B
         self.varlen_n_variants = varlen_n_variants
+        self.varlen_n_dynamic = varlen_n_dynamic_n
         if gather_B:
             assert not gather_A, "gather_A and gather_B are exclusive"
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather B"
@@ -406,10 +416,21 @@ class GemmSm100(GemmTmaBase):
             )
             assert not self.blockscaled
             self.mma_n_variants = (
-                tuple(self.varlen_n_variants)
+                ()
+                if self.varlen_n_dynamic
+                else tuple(self.varlen_n_variants)
                 if self.varlen_n_variants is not None
                 else tuple(range(self.varlen_n_granule, self.mma_tiler[1], self.varlen_n_granule))
             )
+            if self.varlen_n_dynamic:
+                assert (
+                    self.a_dtype in (cutlass.BFloat16, cutlass.Float16)
+                    and self.b_dtype in (cutlass.BFloat16, cutlass.Float16)
+                    and self.acc_dtype == cutlass.Float32
+                    and self.use_2cta_instrs
+                    and self.a_major_mode == tcgen05.OperandMajorMode.K
+                    and self.b_major_mode == tcgen05.OperandMajorMode.K
+                ), "varlen_n_dynamic_n: bf16/f16 K-major operands, f32 accumulator, 2-CTA MMA"
             assert all(
                 n % 16 == 0 and 0 < n < self.mma_tiler[1] for n in self.mma_n_variants
             ) and list(self.mma_n_variants) == sorted(set(self.mma_n_variants)), (
@@ -2048,7 +2069,27 @@ class GemmSm100(GemmTmaBase):
                             cute.ceil_div(k_len % self.mma_tiler[2], self.sf_vec_size) % num_insts
                         )
                 iket.range_push("mma")
-                if const_expr(len(mma_variants) > 0):
+                if const_expr(self.varlen_n_dynamic and varlen_manager.varlen_n):
+                    # varlen_n: the tile's MMAs at the block's rows rounded to 16, a runtime N
+                    n_valid = varlen_manager.block_n_valid(
+                        batch_idx,
+                        tile_coord_mnkl[1],
+                        self.cta_tile_shape_mnk[1],
+                        self.varlen_n_granule,
+                    )
+                    ab_consumer_state, acc_producer_state = self.mma_dynamic_n(
+                        ab_pipeline,
+                        acc_pipeline,
+                        ab_consumer_state,
+                        acc_producer_state,
+                        sA_mma,
+                        sB,
+                        tCtAcc.iterator.toint(),
+                        k_tile_cnt,
+                        is_leader_cta,
+                        self.varlen_n_inst(n_valid),
+                    )
+                elif const_expr(len(mma_variants) > 0):
                     # varlen_n: select the MMA-N variant once per tile from the block's valid
                     # rows (the smallest variant covering them, the base atom the full tile);
                     # each branch runs the plain straight-line mainloop
@@ -2532,13 +2573,77 @@ class GemmSm100(GemmTmaBase):
 
     @cute.jit
     def varlen_n_inst(self, n_valid: Int32) -> Int32:
-        """varlen_n: the MMA-N a block of n_valid rows runs at — the smallest variant covering
-        it, else the full tile. The B load's CTA split and the MMA-N pick both use it."""
+        """varlen_n: the MMA-N a block of n_valid rows runs at — the rows rounded to 16 under
+        varlen_n_dynamic_n, else the smallest variant covering them, else the full tile. The B
+        load's CTA split and the MMA-N pick both use it."""
         n_inst = Int32(self.cta_tile_shape_mnk[1])
-        for n_var in reversed(self.mma_n_variants):
-            if n_valid <= n_var:
-                n_inst = Int32(n_var)
+        if const_expr(self.varlen_n_dynamic):
+            n_inst = cutlass.max(cute.ceil_div(n_valid, 16) * 16, Int32(16))
+        else:
+            for n_var in reversed(self.mma_n_variants):
+                if n_valid <= n_var:
+                    n_inst = Int32(n_var)
         return n_inst
+
+    @cute.jit
+    def mma_dynamic_n(
+        self,
+        ab_pipeline: cutlass.pipeline.PipelineAsync,
+        acc_pipeline: cutlass.pipeline.PipelineAsync,
+        ab_consumer_state: cutlass.pipeline.PipelineState,
+        acc_producer_state: cutlass.pipeline.PipelineState,
+        sA: cute.Tensor,
+        sB: cute.Tensor,
+        tmem_addr: Int32,
+        k_tile_cnt: Int32,
+        is_leader_cta: Boolean,
+        n_inst: Int32,
+    ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
+        """mma() for a varlen_n tile under varlen_n_dynamic_n: the same waits, release and
+        accumulator handoff, the MMAs issued as tcgen05.mma.cta_group::2.kind::f16 with a
+        runtime instruction descriptor of N = n_inst on hand-built SW128 K-major descriptors
+        over this CTA's stage (the pair's MMA reads each CTA's first n_inst / 2 B rows)."""
+        a_stage0, b_stage0 = sA[None, None, None, 0], sB[None, None, None, 0]
+        a_base, b_base = a_stage0.iterator.toint(), b_stage0.iterator.toint()
+        a_stage_bytes = cute.size_in_bytes(self.a_dtype, a_stage0.layout)
+        b_stage_bytes = cute.size_in_bytes(self.b_dtype, b_stage0.layout)
+        k_blk_bytes = self.mma_inst_shape_mnk[2] * self.a_dtype.width // 8  # one MMA's K inside the swizzle row
+        num_k_blocks = self.cta_tile_shape_mnk[2] // self.mma_inst_shape_mnk[2]
+        idesc = instr_desc_f16(
+            n_inst, self.mma_tiler[0], self.a_dtype == cutlass.BFloat16, self.b_dtype == cutlass.BFloat16
+        )
+        peek_ab_full_status = Boolean(True)
+        if 0 < k_tile_cnt and is_leader_cta:
+            peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
+        if is_leader_cta:
+            acc_pipeline.producer_acquire(acc_producer_state)
+        for k_tile in cutlass.range(k_tile_cnt, unroll=1):
+            if is_leader_cta:
+                ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
+                tcgen05_fence_after_thread_sync()
+                a_addr = a_base + ab_consumer_state.index * Int32(a_stage_bytes)
+                b_addr = b_base + ab_consumer_state.index * Int32(b_stage_bytes)
+                for k_blk in cutlass.range_constexpr(num_k_blocks):
+                    accumulate = Int32(1)
+                    if const_expr(k_blk == 0):
+                        accumulate = cutlass.min(k_tile, Int32(1))  # the tile's first MMA overwrites
+                    with cute.arch.elect_one():
+                        umma_f16_2sm(
+                            tmem_addr,
+                            smem_desc_sw128_k(a_addr + Int32(k_blk * k_blk_bytes)),
+                            smem_desc_sw128_k(b_addr + Int32(k_blk * k_blk_bytes)),
+                            idesc,
+                            accumulate,
+                        )
+                ab_pipeline.consumer_release(ab_consumer_state)
+            ab_consumer_state.advance()
+            peek_ab_full_status = Boolean(True)
+            if k_tile + 1 < k_tile_cnt and is_leader_cta:
+                peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
+        if is_leader_cta:
+            acc_pipeline.producer_commit(acc_producer_state)
+        acc_producer_state.advance()
+        return ab_consumer_state, acc_producer_state
 
     @cute.jit
     def mma(
