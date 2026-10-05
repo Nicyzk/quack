@@ -348,7 +348,7 @@ def make_fake_scheduler_args(
 
 
 def make_varlen_args(
-    cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=None, cu_seqlens_n=None, B_idx=None
+    cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=None, cu_seqlens_n=None, B_idx=None, cu_tiles_n=None
 ):
     if cu_seqlens_m is None and cu_seqlens_k is None and cu_seqlens_n is None:
         return None
@@ -359,6 +359,7 @@ def make_varlen_args(
         mAIdx=A_idx,
         mCuTilesM=cu_tiles_m,
         mBIdx=B_idx,
+        mCuTilesN=cu_tiles_n,
     )
 
 
@@ -375,7 +376,8 @@ def compute_cu_tiles_m(cu_seqlens_m, tile_m_cta):
 
 
 def make_fake_varlen_args(
-    varlen_m, varlen_k, gather_A, aidx_len, has_cu_tiles_m=False, varlen_n=False, gather_B=False
+    varlen_m, varlen_k, gather_A, aidx_len, has_cu_tiles_m=False, varlen_n=False, gather_B=False,
+    has_cu_tiles_n=False,
 ):
     if not varlen_m and not varlen_k and not varlen_n:
         return None
@@ -384,6 +386,11 @@ def make_fake_varlen_args(
         mBIdx=(
             fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=4)
             if gather_B
+            else None
+        ),
+        mCuTilesN=(
+            fake_tensor(Int32, (num_seqlens,), leading_dim=0, divisibility=4)
+            if has_cu_tiles_n
             else None
         ),
         mCuSeqlensM=(

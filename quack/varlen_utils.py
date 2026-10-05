@@ -27,6 +27,9 @@ class VarlenArguments(NamedTuple):
     mCuTilesM: Optional[cute.Tensor] = None
     # varlen_n row gather (swap-AB tokens on B): B row of GEMM row i is mBIdx[i], (total_n,)
     mBIdx: Optional[cute.Tensor] = None
+    # varlen_n blockscaled: per-sequence even-split block prefix (num_seqs + 1,), cumsum of
+    # ceil(seqlen / tile_n); block slot cu_tiles_n[b] + j owns B's SF atoms for block j of sequence b.
+    mCuTilesN: Optional[cute.Tensor] = None
 
 
 VARLEN_N_GRANULE = 64  # the varlen_n MMA-N variants' row granule (gemm_sm100.varlen_n_granule)
@@ -49,6 +52,7 @@ class VarlenManager:
         mAIdx: Optional[cute.Tensor] = None
         cu_tiles_m: Optional[cute.Tensor] = None
         mBIdx: Optional[cute.Tensor] = None
+        cu_tiles_n: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -60,6 +64,7 @@ class VarlenManager:
                 mAIdx=args.mAIdx,
                 cu_tiles_m=args.mCuTilesM,
                 mBIdx=args.mBIdx,
+                cu_tiles_n=args.mCuTilesN,
             )
 
     def __init__(
@@ -275,6 +280,15 @@ class VarlenManager:
             return cute.domain_offset((None, offset_atom_k, None), mSFB_chunks[None, None, None, 0])
         else:
             return mSFB_chunks[None, None, None, batch_idx]
+
+    def offset_block_SFB(
+        self, mSFB_chunks: cute.Tensor, batch_idx: Int32, pid_n: Int32, atoms_per_block: int
+    ) -> cute.Tensor:
+        """varlen_n: the (chunk, RK, RN) SFB chunk view at block pid_n's atoms. Every even-split block owns
+        atoms_per_block 128-row SF atoms (the MMA's SF window) at block slot cu_tiles_n[batch] + pid_n, so a
+        tile's window always starts at an atom boundary whatever the block's row offset."""
+        slot = self.params.cu_tiles_n[batch_idx] + pid_n
+        return cute.domain_offset((None, None, slot * atoms_per_block), mSFB_chunks[None, None, None, 0])
 
     def offset_batch_B(self, mB_nkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
         params = self.params

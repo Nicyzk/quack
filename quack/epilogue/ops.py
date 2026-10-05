@@ -951,8 +951,8 @@ class TileStore(EpiOp):
                 gemm.arch in (100, 120) and tensor.element_type.width in (4, 8)
             ), "gated aux output must be 16-bit (or fp8/fp4 on SM100/SM120)"
             if self.pair_dim == "m":
-                assert gemm.arch == 100 and tensor.element_type.width == 16, (
-                    "M-paired gated aux: SM100, 16-bit"
+                assert gemm.arch == 100 and tensor.element_type.width in (8, 16), (
+                    "M-paired gated aux: SM100, 16-bit or fp8 (quantized)"
                 )
                 assert layout.is_m_major_c(), "M-paired gated aux must be m-major"
             else:
