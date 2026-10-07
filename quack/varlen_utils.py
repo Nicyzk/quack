@@ -32,7 +32,7 @@ class VarlenArguments(NamedTuple):
     mCuTilesN: Optional[cute.Tensor] = None
 
 
-VARLEN_N_GRANULE = 64  # the varlen_n MMA-N variants' row granule (gemm_sm100.varlen_n_granule)
+VARLEN_N_GRANULE = 16  # the varlen_n even-split row granule (gemm_sm100.varlen_n_granule); runtime N is 16-granular
 
 
 @cute.jit

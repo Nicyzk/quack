@@ -446,7 +446,7 @@ class GemmSm100(GemmTmaBase):
         )
         # varlen_n: MMA-N variants selected per tile from the block's valid rows (the
         # instruction N is static, so one tiled_mma per size; 64-granular).
-        self.varlen_n_granule = 64
+        self.varlen_n_granule = 16
         self.mma_n_variants = ()
         if const_expr(varlen_args.mCuSeqlensN is not None):
             assert self.mma_tiler[1] <= 256 and self.cluster_shape_mnk[1] == 1, (
@@ -540,10 +540,13 @@ class GemmSm100(GemmTmaBase):
             # tmem datapath (both the tcgen05.cp write and the MMA read) is
             # 2-column / 64-N granular, so odd multiples of 32 (96, 160, 224)
             # are hardware-unreachable without rotating the SF content by 32 N.
+            # varlen_n: every block's SFB window starts on an atom and the MMA N is dynamic
+            # (16-granular), so the tile only bounds the window: any multiple of 16.
+            n_granule = 16 if varlen_args.mCuSeqlensN is not None else 64
             assert (
-                self.cta_tile_shape_mnk[1] % 64 == 0 and 64 <= self.cta_tile_shape_mnk[1] <= 256
+                self.cta_tile_shape_mnk[1] % n_granule == 0 and 64 <= self.cta_tile_shape_mnk[1] <= 256
             ), (
-                f"blockscaled tile_n must be a multiple of 64 in [64, 256], "
+                f"blockscaled tile_n must be a multiple of {n_granule} in [64, 256], "
                 f"got {self.cta_tile_shape_mnk[1]}"
             )
             self.sfb_n_atom_misaligned = (self.cta_tile_shape_mnk[1] // 64) % 2 == 1

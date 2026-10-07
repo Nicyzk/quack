@@ -1,10 +1,12 @@
 # Copyright (c) 2025, Tri Dao.
-"""Runtime-N UMMA for SM100: issue tcgen05.mma.cta_group::2 (kind::f16, or kind::mxf8f6f4.block_scale for MXFP8)
-with hand-built descriptors so a varlen_n tile runs its block's valid rows (16-granular) without per-size compiled
-atoms (megamoe's update_instr_desc_with_umma_n). Operands K-major, 128 B swizzle, f32 accumulator: bf16 / f16 (one
-64-wide k-block is 4 MMAs of K = 16) or e4m3 with ue8m0 scales per 32 (one 128-wide k-block is 4 MMAs of K = 32).
-The smem descriptor encoding was checked against the DSL's make_umma_smem_desc (SBO 1024 B, LBO 16 B, version 1,
-SWIZZLE_128B); the instruction descriptors follow cute/arch/mma_sm100_desc.hpp."""
+"""Runtime-N UMMA for SM100: issue tcgen05.mma.cta_group::2 (kind::f16, kind::mxf8f6f4.block_scale for MXFP8, or
+kind::mxf4nvf4.block_scale.scale_vec::4X for NVFP4) with hand-built descriptors so a varlen_n tile runs its block's
+valid rows (16-granular) without per-size compiled atoms (megamoe's update_instr_desc_with_umma_n). Operands
+K-major, 128 B swizzle, f32 accumulator: bf16 / f16 (one 64-wide k-block is 4 MMAs of K = 16), e4m3 with ue8m0 scales
+per 32 (one 128-wide k-block is 4 MMAs of K = 32) or e2m1 with ue4m3 scales per 16 (one 256-wide k-block is 4 MMAs
+of K = 64; every MMA's K is 32 B of the swizzle row in all three). The smem descriptor encoding was checked against
+the DSL's make_umma_smem_desc (SBO 1024 B, LBO 16 B, version 1, SWIZZLE_128B); the instruction descriptors follow
+cute/arch/mma_sm100_desc.hpp."""
 
 from cutlass import Int32, Int64
 import cutlass.cute as cute
@@ -83,6 +85,46 @@ def _umma_mxf8f6f4_2sm(
          accumulate.ir_value(loc=loc, ip=ip)],
         "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $6, 0;\n\t"
         "tcgen05.mma.cta_group::2.kind::mxf8f6f4.block_scale [$0], $1, $2, $3, [$4], [$5], p;\n}",
+        "r,l,l,r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@cute.jit
+def instr_desc_mxf4nvf4(n: Int32, m: int) -> Int32:
+    """kind::mxf4nvf4 instruction descriptor: e2m1 A and B (format 1), ue4m3 scales (scale format 0), K = 64
+    (k_size 0), K-major, f32 accumulate, M x N; the SF ids are filled per k-block by umma_mxf4nvf4_2sm."""
+    desc = Int32((1 << 7) | (1 << 10))
+    return desc | ((n >> 3) << 17) | Int32((m >> 4) << 24)
+
+
+@cute.jit
+def umma_mxf4nvf4_2sm(
+    tmem_addr: Int32, a_desc: Int64, b_desc: Int64, idesc: Int32, sfa_addr: Int32, sfb_addr: Int32, accumulate: Int32
+):
+    """One tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.scale_vec::4X from the leader CTA's elected thread:
+    the MMA's K = 64 reads four ue4m3 scales per row, one tmem word, addressed as umma_mxf8f6f4_2sm's (the word's
+    byte index in the address's bits 30-31 becomes the descriptor's SF ids); accumulate != 0 adds to D."""
+    idesc = idesc | (((sfa_addr >> 30) & 3) << 29) | (((sfb_addr >> 30) & 3) << 4)
+    _umma_mxf4nvf4_2sm(tmem_addr, a_desc, b_desc, idesc, sfa_addr & 0x3FFFFFFF, sfb_addr & 0x3FFFFFFF, accumulate)
+
+
+@dsl_user_op
+def _umma_mxf4nvf4_2sm(
+    tmem_addr: Int32, a_desc: Int64, b_desc: Int64, idesc: Int32, sfa_addr: Int32, sfb_addr: Int32,
+    accumulate: Int32, *, loc=None, ip=None,
+):
+    llvm.inline_asm(
+        None,
+        [tmem_addr.ir_value(loc=loc, ip=ip), a_desc.ir_value(loc=loc, ip=ip), b_desc.ir_value(loc=loc, ip=ip),
+         idesc.ir_value(loc=loc, ip=ip), sfa_addr.ir_value(loc=loc, ip=ip), sfb_addr.ir_value(loc=loc, ip=ip),
+         accumulate.ir_value(loc=loc, ip=ip)],
+        "{\n\t.reg .pred p;\n\tsetp.ne.b32 p, $6, 0;\n\t"
+        "tcgen05.mma.cta_group::2.kind::mxf4nvf4.block_scale.scale_vec::4X [$0], $1, $2, $3, [$4], [$5], p;\n}",
         "r,l,l,r,r,r,r",
         has_side_effects=True,
         is_align_stack=False,

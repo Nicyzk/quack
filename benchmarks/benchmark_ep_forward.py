@@ -45,6 +45,7 @@ os.environ.setdefault("TRITON_CACHE_AUTOTUNING", "1")  # sonic's triton autotune
 os.environ.setdefault("QUACK_COMPILE_WORKERS", "1")  # >1 workers hit a broken pipe (per the PR's test)
 
 import argparse
+import math
 from types import SimpleNamespace
 import sys
 
@@ -175,17 +176,23 @@ def interleave_gate_up(w1_cat):
 
 
 # the swap-AB kernels: 256 weights (2-CTA) x tile_n tokens (<= 256, varlen_n's one-instruction limit). tile_n = the
-# token box (tile_n / 2 rows per CTA per stage) and the even-split block: megamoe's block_m rule, the fewest blocks
-# covering the expected rows + their sqrt (192 at W=4 1024: 128 + 11 rows per expert), and the MMA-N sizes a tile may
-# run at (quack varlen_n_variants; None = every 64), 16-granular around the expected rows as megamoe's runtime UMMA N.
-# Set per shape: W=2 1024 (64 +- 8 rows) wants (256, 128) with (64, 80, 96, 112),
-# 69 us faster stripped (1944 -> 1875); a wrong pair costs that much, the kernels recompile.
-SWAP_TILE = (256, 192)
+# token box (tile_n / 2 rows per CTA per stage) and the even-split block (the gate / flag / scale-slot unit), picked
+# per launch by swap_tile_n (megamoe's block_m rule); the MMA-N sizes a tile may run at (quack varlen_n_variants;
+# None = every 64) matter only without SWAP_DYNAMIC_N. The kernels recompile per tile_n.
 SWAP_N_VARIANTS = (64, 112, 128, 144, 160)
 SWAP_DYNAMIC_N = True  # quack varlen_n_dynamic_n: runtime UMMA N (16-granular) instead of the compiled variants
 
 
-def compile_gemm1_gated_swap(dtype, intra_pull=0, gather_B=True):
+def swap_tile_n(model, W, T_local):
+    """The swap kernels' token block: the fewest 256-row blocks covering the expected rows per expert (T_local * W *
+    top-k / E), each sized to the expected rows plus their square root, rounded up to 32 (full blocks stay in the
+    efficient MMA-N class; 16-odd N runs 5-8 % slower per row), in [64, 256]. W=4: 160 at 1024 tokens, 256 from 2048."""
+    expected = T_local * W * model.topk / model.E
+    blocks = math.ceil(expected / 256)
+    return int(min(256, max(64, math.ceil((expected + expected**0.5) / blocks / 32) * 32)))
+
+
+def compile_gemm1_gated_swap(dtype, model, W, T_local, intra_pull=0, gather_B=True):
     """(fn, Cls, block_rows): the gated epilogue on the swap-AB kernel — weights on M (interleave_gate_up's rows,
     pairs over M), tokens on N (varlen_n even split), the dispatch scheduler, dynamic persistence (resident grid +
     atomic tile counter: CLC's arrival order without CLC's oversized grid, which would cancel transfer warps; static
@@ -196,7 +203,9 @@ def compile_gemm1_gated_swap(dtype, intra_pull=0, gather_B=True):
     semaphore in the scheduler arguments. block_rows = tile N, the unit the even-split blocks and their flags are cut
     from. intra_pull = the hidden size: the same on the intra-SM dispatch kernel (transfer warps pulling the walk;
     six walk tensors after the varlen argument, as compile_gemm1_gated)."""
-    key = ("swap", dtype, intra_pull, gather_B, SWAP_TILE, SWAP_N_VARIANTS, SWAP_DYNAMIC_N)
+    tile_n = swap_tile_n(model, W, T_local)  # the token block is derived from the shape, never caller-chosen
+    tile = (256, tile_n)
+    key = ("swap", dtype, intra_pull, gather_B, tile_n, SWAP_N_VARIANTS, SWAP_DYNAMIC_N)
     if key not in _compiled:
         assert SM100, "the swap-AB gated kernel is SM100 only"
         mod = linear_act_mod("swiglu", gated=True, has_c=False, has_rowvec=False, has_colvec=False)
@@ -206,7 +215,7 @@ def compile_gemm1_gated_swap(dtype, intra_pull=0, gather_B=True):
             attrs = {k: v for k, v in vars(Cls).items() if k not in ("__dict__", "__weakref__")}
             Cls = type(Cls.__name__ + "_intra", (Cls.__bases__[0], GemmSm100IntraDispatch), attrs)
             kw.update({"intra_dispatch_pull": intra_pull, "intra_dispatch_scatter": not gather_B})
-        gemm = Cls(cutlass.Float32, dtype, SWAP_TILE, (*CLUSTER, 1), use_clc_persistence=False, gather_B=gather_B,
+        gemm = Cls(cutlass.Float32, dtype, tile, (*CLUSTER, 1), use_clc_persistence=False, gather_B=gather_B,
                    varlen_n_variants=SWAP_N_VARIANTS, **kw)
         gemm.b_transposed = gemm.a_transposed = gemm.cd_transposed = False
         gemm.cd_packed = None
@@ -222,11 +231,11 @@ def compile_gemm1_gated_swap(dtype, intra_pull=0, gather_B=True):
         if intra_pull:  # the 17 routed placeholders (15 tensors, T, rank), then the per-CTA tensormap slots (L2 promotion 256B)
             walk_fakes += (None,) * 15 + (Int32(0), Int32(0), i64())
         fn = cute.compile(gemm, mA, mB, mD, mC, epi, sched, varlen, stream, None, None, *walk_fakes, options="--enable-tvm-ffi")
-        _compiled[key] = (fn, Cls, SWAP_TILE[1])
+        _compiled[key] = (fn, Cls, tile_n)
     return _compiled[key]
 
 
-def compile_gemm2_swap(dtype, intra_push=0):
+def compile_gemm2_swap(dtype, model, W, T_local, intra_push=0):
     """(fn, block_rows, cluster_tile_m): the plain swap-AB kernel for GEMM2 — weights (H, I) on M, tokens on N
     (varlen_n even split), D = y.T (m-major), the combine scheduler (+1 per stored CTA tile, so a block's flag target
     is CLUSTER CTAs x ceil(H / cluster_tile_m)), dynamic persistence (zeroed semaphore in sched, as
@@ -234,19 +243,21 @@ def compile_gemm2_swap(dtype, intra_push=0):
     intra_push = the hidden size: the intra-SM combine kernel whose epilogue stores each token's slice of a subtile
     straight into the origins' slots (no y, no flags, no transfer warps); after the varlen argument five None
     placeholders, the slot base table (world,) int64, the slots per rank and the per-row slot addresses."""
-    key = ("swap2", dtype, intra_push, SWAP_TILE, SWAP_N_VARIANTS, SWAP_DYNAMIC_N)
+    tile_n = swap_tile_n(model, W, T_local)  # the same block as GEMM1's (asserted at the call sites)
+    tile = (256, tile_n)
+    key = ("swap2", dtype, intra_push, tile_n, SWAP_N_VARIANTS, SWAP_DYNAMIC_N)
     if key not in _compiled:
         assert SM100, "the swap-AB kernel is SM100 only"
         dyn = {"varlen_n_dynamic_n": True} if SWAP_DYNAMIC_N else {}
         if intra_push:
             gemm = GemmDefaultSm100IntraCombine(
-                cutlass.Float32, dtype, SWAP_TILE, (*CLUSTER, 1), use_clc_persistence=False, intra_combine_push=intra_push,
+                cutlass.Float32, dtype, tile, (*CLUSTER, 1), use_clc_persistence=False, intra_combine_push=intra_push,
                 varlen_n_variants=SWAP_N_VARIANTS, combine_epilogue_store=True, **dyn,
             )
             i64 = lambda: make_fake_tensor(Int64, (cute.sym_int(),), leading_dim=0, divisibility=1)
             walk_fakes = (None,) * 5 + (i64(), Int32(0), i64(), i64())  # ..., slot addresses, tensormap slots
         else:
-            gemm = GemmDefaultSm100(cutlass.Float32, dtype, SWAP_TILE, (*CLUSTER, 1), use_clc_persistence=False,
+            gemm = GemmDefaultSm100(cutlass.Float32, dtype, tile, (*CLUSTER, 1), use_clc_persistence=False,
                                     varlen_n_variants=SWAP_N_VARIANTS, **dyn)
             walk_fakes = ()
         gemm.b_transposed = gemm.a_transposed = gemm.cd_transposed = False
@@ -257,7 +268,7 @@ def compile_gemm2_swap(dtype, intra_push=0):
         varlen = make_fake_varlen_args(False, False, False, None, varlen_n=True)
         stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         fn = cute.compile(gemm, mA, mB, mD, mC, epi, sched, varlen, stream, None, None, *walk_fakes, options="--enable-tvm-ffi")
-        _compiled[key] = (fn, SWAP_TILE[1], gemm.cta_tile_shape_mnk[0] * CLUSTER[0])
+        _compiled[key] = (fn, tile_n, gemm.cta_tile_shape_mnk[0] * CLUSTER[0])
     return _compiled[key]
 
 
@@ -509,7 +520,7 @@ def _quack_inter_swap(model, x, topk_idx, scores, w1_cat, w1_il, w2, ws, rank, W
     topk_g, meta, prologue = _quack_metadata(x, topk_idx, ws, rank, W, K, E_local, args.sonic_metadata)
     cu, s_scatter, recv_pos, a_idx = meta.cu, meta.s_scatter, meta.s_reverse, meta.a_idx
     w1_il8 = interleave_gate_up(w1_cat)
-    fn1, Cls1, block_rows = compile_gemm1_gated_swap(dtype)
+    fn1, Cls1, block_rows = compile_gemm1_gated_swap(dtype, model, W, T_local)
     build1, walk1 = make_dispatch_walk(
         topk_g, s_scatter, recv_pos, meta.first_src_row, rank, a_idx, cu, ws.x_peer_bufs, block_rows, even_split=True
     )
@@ -522,7 +533,7 @@ def _quack_inter_swap(model, x, topk_idx, scores, w1_cat, w1_il, w2, ws, rank, W
     rt1 = (Cls1.EpilogueArguments(mAuxOut=a.T), sched1, make_varlen_args(None, None, None, cu_seqlens_n=cu, B_idx=a_idx))
     gemm1 = lambda: fn1(w1_il8, pool, None, None, *rt1, None, None)
     # GEMM2 + combine: y (rows, H) = a @ w2 as D = y.T, pushed per N block into the origins' slots
-    fn2, block_rows2, cluster_tile_m = compile_gemm2_swap(dtype)
+    fn2, block_rows2, cluster_tile_m = compile_gemm2_swap(dtype, model, W, T_local)
     assert block_rows2 == block_rows
     y = torch.empty(max_rows, H, dtype=torch.bfloat16, device=dev)
     flags2 = torch.zeros(E_local, -(-W * T_local // block_rows), dtype=torch.int32, device=dev)
@@ -589,8 +600,8 @@ def _quack_intra_swap(model, x, topk_idx, scores, w1_cat, w1_il, w2, ws, rank, W
     TK, max_rows = W * T_local * K, W * T_local * min(K, E_local)
     clusters = get_max_active_clusters(CLUSTER[0] * CLUSTER[1], get_device_capacity(dev))
     w1_il8 = interleave_gate_up(w1_cat)
-    fn1, Cls1, block_rows = compile_gemm1_gated_swap(dtype, intra_pull=H, gather_B=False)
-    fn2, block_rows2, cluster_tile_m = compile_gemm2_swap(dtype, intra_push=H)
+    fn1, Cls1, block_rows = compile_gemm1_gated_swap(dtype, model, W, T_local, intra_pull=H, gather_B=False)
+    fn2, block_rows2, cluster_tile_m = compile_gemm2_swap(dtype, model, W, T_local, intra_push=H)
     assert block_rows2 == block_rows
     buffers = make_combine_buffers(T_local, K, H, torch.bfloat16, ws.ep_group)
     prologue, meta, walk1 = make_prologue(

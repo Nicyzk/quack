@@ -13,10 +13,12 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from quack.umma_dynamic import (
     instr_desc_f16,
+    instr_desc_mxf4nvf4,
     instr_desc_mxf8f6f4,
     smem_desc_sw128_k,
     tcgen05_fence_after_thread_sync,
     umma_f16_2sm,
+    umma_mxf4nvf4_2sm,
     umma_mxf8f6f4_2sm,
 )
 import cutlass.pipeline as pipeline
@@ -410,7 +412,7 @@ class GemmSm100(GemmTmaBase):
         )
         # varlen_n: MMA-N variants selected per tile from the block's valid rows (the
         # instruction N is static, so one tiled_mma per size; 64-granular).
-        self.varlen_n_granule = 64
+        self.varlen_n_granule = 16
         self.mma_n_variants = ()
         if const_expr(varlen_args.mCuSeqlensN is not None):
             assert self.mma_tiler[1] <= 256 and self.cluster_shape_mnk[1] == 1, (
@@ -437,9 +439,17 @@ class GemmSm100(GemmTmaBase):
                     and self.sf_dtype == cutlass.Float8E8M0FNU
                     and self.sf_vec_size == 32
                 )
+                nvfp4 = (
+                    self.blockscaled
+                    and self.a_dtype is cutlass.Float4E2M1FN
+                    and self.b_dtype is cutlass.Float4E2M1FN
+                    and self.sf_dtype == cutlass.Float8E4M3FN
+                    and self.sf_vec_size == 16
+                )
                 assert (
                     (
                         mxfp8
+                        or nvfp4
                         or (
                             self.a_dtype in (cutlass.BFloat16, cutlass.Float16)
                             and self.b_dtype in (cutlass.BFloat16, cutlass.Float16)
@@ -449,7 +459,10 @@ class GemmSm100(GemmTmaBase):
                     and self.use_2cta_instrs
                     and self.a_major_mode == tcgen05.OperandMajorMode.K
                     and self.b_major_mode == tcgen05.OperandMajorMode.K
-                ), "varlen_n_dynamic_n: bf16/f16 or mxfp8 (e4m3, ue8m0 per 32) K-major operands, f32 accumulator, 2-CTA MMA"
+                ), (
+                    "varlen_n_dynamic_n: bf16/f16, mxfp8 (e4m3, ue8m0 per 32) or nvfp4 (e2m1, ue4m3 per 16) "
+                    "K-major operands, f32 accumulator, 2-CTA MMA"
+                )
             assert all(
                 n % 16 == 0 and 0 < n < self.mma_tiler[1] for n in self.mma_n_variants
             ) and list(self.mma_n_variants) == sorted(set(self.mma_n_variants)), (
@@ -530,10 +543,13 @@ class GemmSm100(GemmTmaBase):
             # tmem datapath (both the tcgen05.cp write and the MMA read) is
             # 2-column / 64-N granular, so odd multiples of 32 (96, 160, 224)
             # are hardware-unreachable without rotating the SF content by 32 N.
+            # varlen_n: every block's SFB window starts on an atom and the MMA N is dynamic
+            # (16-granular), so the tile only bounds the window: any multiple of 16.
+            n_granule = 16 if varlen_args.mCuSeqlensN is not None else 64
             assert (
-                self.cta_tile_shape_mnk[1] % 64 == 0 and 64 <= self.cta_tile_shape_mnk[1] <= 256
+                self.cta_tile_shape_mnk[1] % n_granule == 0 and 64 <= self.cta_tile_shape_mnk[1] <= 256
             ), (
-                f"blockscaled tile_n must be a multiple of 64 in [64, 256], "
+                f"blockscaled tile_n must be a multiple of {n_granule} in [64, 256], "
                 f"got {self.cta_tile_shape_mnk[1]}"
             )
             self.sfb_n_atom_misaligned = (self.cta_tile_shape_mnk[1] // 64) % 2 == 1
@@ -875,9 +891,10 @@ class GemmSm100(GemmTmaBase):
             assert not any(
                 getattr(epilogue_args, op.name, None) is not None
                 and not op.is_tile_store()
+                and getattr(op, "fn_port", None) != "scalar"  # a scalar reads no row / block coordinate
                 and getattr(op, "quant_output", "D") == "D"  # an aux's quantize codec offsets by block itself
                 for op in getattr(type(self), "_epi_ops", ())
-            ), "varlen_n supports only tile-store epilogue ops (and their quantize codecs)"
+            ), "varlen_n supports only tile-store epilogue ops, scalars and their quantize codecs"
         if const_expr(self.gather_B):
             assert varlen_n, "gather_B needs varlen_n"
 
@@ -2634,17 +2651,23 @@ class GemmSm100(GemmTmaBase):
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         """mma() for a varlen_n tile under varlen_n_dynamic_n: the same waits, release and
         accumulator handoff, the MMAs issued as tcgen05.mma.cta_group::2 (kind::f16, or
-        kind::mxf8f6f4.block_scale with the k-block's SF tmem addresses when blockscaled) with a
-        runtime instruction descriptor of N = n_inst on hand-built SW128 K-major descriptors
-        over this CTA's stage (the pair's MMA reads each CTA's first n_inst / 2 B rows)."""
+        kind::mxf8f6f4 / kind::mxf4nvf4 .block_scale with the k-block's SF tmem addresses when
+        blockscaled) with a runtime instruction descriptor of N = n_inst on hand-built SW128
+        K-major descriptors over this CTA's stage (the pair's MMA reads each CTA's first
+        n_inst / 2 B rows)."""
         a_stage0, b_stage0 = sA[None, None, None, 0], sB[None, None, None, 0]
         a_base, b_base = a_stage0.iterator.toint(), b_stage0.iterator.toint()
         a_stage_bytes = cute.size_in_bytes(self.a_dtype, a_stage0.layout)
         b_stage_bytes = cute.size_in_bytes(self.b_dtype, b_stage0.layout)
         k_blk_bytes = self.mma_inst_shape_mnk[2] * self.a_dtype.width // 8  # one MMA's K inside the swizzle row
         num_k_blocks = self.cta_tile_shape_mnk[2] // self.mma_inst_shape_mnk[2]
+        fp4 = const_expr(self.a_dtype is cutlass.Float4E2M1FN)
+        umma_blockscaled = umma_mxf4nvf4_2sm if fp4 else umma_mxf8f6f4_2sm
         if const_expr(self.blockscaled):
-            idesc = instr_desc_mxf8f6f4(n_inst, self.mma_tiler[0])
+            if const_expr(fp4):
+                idesc = instr_desc_mxf4nvf4(n_inst, self.mma_tiler[0])
+            else:
+                idesc = instr_desc_mxf8f6f4(n_inst, self.mma_tiler[0])
         else:
             idesc = instr_desc_f16(
                 n_inst, self.mma_tiler[0], self.a_dtype == cutlass.BFloat16, self.b_dtype == cutlass.BFloat16
@@ -2669,7 +2692,7 @@ class GemmSm100(GemmTmaBase):
                         accumulate = cutlass.min(k_tile, Int32(1))  # the tile's first MMA overwrites
                     with cute.arch.elect_one():
                         if const_expr(self.blockscaled):
-                            umma_mxf8f6f4_2sm(
+                            umma_blockscaled(
                                 tmem_addr,
                                 smem_desc_sw128_k(a_addr + Int32(k_blk * k_blk_bytes)),
                                 smem_desc_sw128_k(b_addr + Int32(k_blk * k_blk_bytes)),
