@@ -7,12 +7,17 @@ contract for calling GemmSm100(epi_reduce_mode=...), not benchmarking helpers.
 
 import math
 import os
+from typing import Optional, Tuple
 
 import torch
 import torch.distributed as dist
 
 import cutlass
 import cutlass.utils as utils
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import llvm
+from cutlass.cute.typing import Int32, Pointer
+from cutlass.cutlass_dsl import T, dsl_user_op
 
 
 def multimem_ld_reduce_128b(dtype):
@@ -28,6 +33,54 @@ def multimem_ld_reduce_128b(dtype):
     if dtype == cutlass.Float8E5M2:
         return utils.distributed.multimem_ld_reduce_16xe5m2
     raise NotImplementedError(f"multimem_ld_reduce_128b: unsupported dtype {dtype}")
+
+
+# Lamport (data-as-flag) primitives: the relaxed gpu-scope 16 B load that polls a
+# mirror, and the plain 16 B store that re-arms a slot with the sentinel.
+
+
+@dsl_user_op
+def ld_relaxed_gpu_global_4xu32(
+    ptr: Pointer, *, loc: Optional[ir.Location] = None, ip: Optional[ir.InsertionPoint] = None
+) -> Tuple[Int32, Int32, Int32, Int32]:
+    ptr_int = ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
+    regs = llvm.inline_asm(
+        ir.Type.parse("!llvm.struct<(i32,i32,i32,i32)>"),
+        [ptr_int],
+        "ld.relaxed.gpu.global.v4.u32 {$0, $1, $2, $3}, [$4];",
+        "=r,=r,=r,=r,l",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+    x, y, z, w = [llvm.extractvalue(T.i32(), regs, [i]) for i in range(4)]
+    return x, y, z, w
+
+
+@dsl_user_op
+def st_weak_global_4xu32(
+    ptr: Pointer,
+    x: Int32,
+    y: Int32,
+    z: Int32,
+    w: Int32,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    ptr_int = ptr.toint(loc=loc, ip=ip).ir_value(loc=loc, ip=ip)
+    vals = [Int32(v).ir_value(loc=loc, ip=ip) for v in (x, y, z, w)]
+    llvm.inline_asm(
+        None,
+        [ptr_int, *vals],
+        "st.weak.global.v4.u32 [$0], {$1, $2, $3, $4};",
+        "l,r,r,r,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
 
 
 def init_distributed():

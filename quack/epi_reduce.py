@@ -1,6 +1,7 @@
 """Fused-communication (epi_reduce_mode) GEMM epilogue pieces; nothing here runs on
 its own — gemm_sm100's kernel binds each piece into the shared GemmBase machinery.
-Sections below: host contract / cross-launch exit barrier / flag map.
+Sections below: host contract / cross-launch exit barrier / flag map / multimem reduce +
+store / lamport one-shot all_reduce.
 
 Dataflow (cutlass-aligned, no separate reducer schedule): the producer warp group
 runs epilogue_split_rank — split_rank_partial_commit stores register-direct
@@ -22,9 +23,14 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
 from cutlass import Int32, const_expr
+from cutlass.cutlass_dsl import any_, while_generate, yield_out
 
 from quack.cute_dsl_utils import mlir_namedtuple
-from quack.dist_utils import multimem_ld_reduce_128b
+from quack.dist_utils import (
+    ld_relaxed_gpu_global_4xu32,
+    multimem_ld_reduce_128b,
+    st_weak_global_4xu32,
+)
 
 
 # ---- host contract ----
@@ -49,6 +55,11 @@ class EpiReduceArguments(NamedTuple):
     tile_flags: Optional[cute.Tensor] = None
     tile_flags_mc: Optional[cute.Tensor] = None
     tile_flags_per_peer: Optional[tuple] = None
+    # all_reduce_lamport: (1,) int32 launch counter the host bumps before every
+    # launch (slot % 3 = ping, +1 = pong). The workspace then holds 3 * world * L
+    # (m, n) mirrors: workspace_mc is the TMA multicast store target, workspace the
+    # local mirrors the comm warps poll. No tile flags.
+    slot: Optional[cute.Tensor] = None
 
 
 def epi_reduce_workspace_shape(m, n, cta_m, cta_n):
@@ -60,6 +71,19 @@ def epi_reduce_workspace_shape(m, n, cta_m, cta_n):
     m_pad = ((m + cta_m - 1) // cta_m + 1) * cta_m
     n_pad = (n + cta_n - 1) // cta_n * cta_n
     return m_pad, n_pad
+
+
+def pick_num_comm_warps(cta_m: int, tile_N: int, ws_width: int, tile_split: int) -> Optional[int]:
+    """cutlass's _pick_num_comm_warp_for_128b: the largest W in 4..1 whose 32*W threads
+    split the (cta_m / tile_split, tile_N) slice evenly into whole 128 b atoms (one or
+    more per thread); tile_split = world under the flag protocols, 1 under lamport.
+    None when no count does."""
+    slab = (cta_m // tile_split) * tile_N
+    atom = 128 // ws_width
+    for w in (4, 3, 2, 1):
+        if slab % (32 * w) == 0 and (slab // (32 * w)) % atom == 0:
+            return w
+    return None
 
 
 def validate_epi_reduce_args(
@@ -103,7 +127,8 @@ def validate_epi_reduce_args(
             f"epi_reduce_mode={mode}: D rows x cols ({d_rows}, {n}) expected, "
             f"got ({D.shape[-2]}, {D.shape[-1]})"
         )
-    ws_mnl = (*epi_reduce_workspace_shape(m, n, cta_m, tile_N), l)
+    lamport = mode == "all_reduce_lamport"
+    ws_mnl = (*epi_reduce_workspace_shape(m, n, cta_m, tile_N), 3 * num_ranks * l if lamport else l)
     for name, t in (("workspace", era.workspace), ("workspace_mc", era.workspace_mc)):
         if t is None or tuple(t.shape) != ws_mnl:
             raise ValueError(
@@ -123,24 +148,26 @@ def validate_epi_reduce_args(
         raise ValueError(
             f"epi_reduce_mode: n ({n}) must be divisible by {ws_vec} (workspace vectors)"
         )
-    # Fixed 4 comm warps (128 threads), 128 b atoms along n: the (cta_m/world,
-    # tile_N) slice's thread rows must divide its row count (kernel assert
-    # mirrored here). Future: vary warps per cutlass _pick_num_comm_warp_for_128b.
-    atom_thr_n = math.gcd(tile_N // ws_vec, 128)
-    atom_thr_m = 128 // atom_thr_n
-    if (cta_m // num_ranks) % atom_thr_m:
+    # The comm warps cover the (cta_m/world, tile_N) slice (whole tile under lamport) in
+    # 128 b atoms; the kernel is built with the same pick.
+    tile_split = 1 if lamport else num_ranks
+    if pick_num_comm_warps(cta_m, tile_N, era.workspace.element_size() * 8, tile_split) is None:
         raise ValueError(
-            f"comm warps (128 threads) can't cover the ({cta_m // num_ranks} x {tile_N} "
-            f"{era.workspace.dtype}) slice in 128 b atoms"
+            f"no comm-warp count (4..1) covers the ({cta_m // tile_split} x {tile_N} "
+            f"{era.workspace.dtype}) slice in whole 128 b atoms"
         )
-    if mode == "reduce_scatter":
+    if mode in ("reduce_scatter", "all_reduce_lamport"):
         if era.mD_mc is not None:
-            raise ValueError("reduce_scatter commits to plain local D: mD_mc must be None")
+            raise ValueError(f"{mode} commits to plain local D: mD_mc must be None")
     elif era.mD_mc is None or tuple(era.mD_mc.shape) != (m, n, l):
         raise ValueError(
             f"all_reduce broadcast needs mD_mc, kernel-order (m, n, l) {(m, n, l)}, got "
             f"{None if era.mD_mc is None else tuple(era.mD_mc.shape)}"
         )
+    if lamport:
+        if era.slot is None or era.slot.numel() != 1 or era.slot.dtype != torch.int32:
+            raise ValueError("all_reduce_lamport needs epi_reduce_args.slot: a (1,) int32 counter")
+        return
     n_tiles = (n + tile_N - 1) // tile_N
     ntiles = ((m + cta_m - 1) // cta_m) * n_tiles * l
     num_sms = torch.cuda.get_device_properties(D.device).multi_processor_count
@@ -311,3 +338,110 @@ def commit_subtile_broadcast(
                 out_i32[2, ii, jj].ir_value(),
                 out_i32[3, ii, jj].ir_value(),
             )
+
+
+# ---- lamport one-shot all_reduce (cutlass Lamport) ----
+# Every rank TMA-multicasts its -0.0-scrubbed partial into slot[ping][rank] of every
+# rank's 3-slot workspace; the comm warps poll their local slot[ping][0..world) per
+# 16 B — the data is the flag — sum in f32 and store into plain local D. No tile
+# flags, no exit barrier. The producer re-arms slot[pong] per tile before that tile's
+# store: peers write pong next call, and only after receiving every tile of this one.
+
+# 16 B atoms in flight per sentinel wait in the lamport consumer (1 = serial spin).
+LAMPORT_BATCH = 8
+
+
+def sentinel_word(dtype) -> int:
+    """-0.0 in every lane of one 32-bit word, as a signed int32: lamport's
+    "not arrived" sentinel (16-bit dtypes pack two lanes)."""
+    word = 0x80008000 if dtype.width == 16 else 0x80000000
+    return word - (1 << 32)
+
+
+def lamport_mirror_batches(slot, num_ranks: int, l, batch, phase: int):
+    """Workspace batch indices of the (m, n) mirrors in slot (slot + phase) % 3, one
+    per source rank: phase 0 = ping (this call's stores / polls), 1 = pong (re-arm)."""
+    s = (slot + phase) % 3
+    return tuple((s * num_ranks + r) * l + batch for r in range(num_ranks))
+
+
+@cute.jit
+def lamport_store_subtile(
+    tiled_copy_r2s: cute.TiledCopy, tRS_rD: cute.Tensor, tRS_sWs_stage: cute.Tensor
+) -> None:
+    """Scrub the sentinel from the converted partial: x + 0.0 is bit-exact for
+    every value except -0.0 -> +0.0 under round-to-nearest."""
+    src = tRS_rD.to(tRS_sWs_stage.element_type)
+    vec = src.load()
+    src.store(vec + cute.full_like(vec, 0.0))
+    cute.copy(tiled_copy_r2s, src, tRS_sWs_stage)
+
+
+@cute.jit
+def lamport_rearm_tile(frg_clear: tuple) -> None:
+    """Store the sentinel over this tile in every local mirror of slot[pong]."""
+    neg_zero = sentinel_word(frg_clear[0].element_type)
+    _atom, loop_m, loop_n = frg_clear[0].shape
+    for r in cutlass.range_constexpr(len(frg_clear)):
+        for i in cutlass.range(loop_m, unroll=1):
+            for j in cutlass.range(loop_n, unroll=1):
+                st_weak_global_4xu32(
+                    frg_clear[r][None, i, j].iterator, neg_zero, neg_zero, neg_zero, neg_zero
+                )
+
+
+@cute.jit
+def lamport_reduce_subtile(
+    frg_in: tuple,
+    tRS_rD: cute.Tensor,
+    epi_coord: cute.Coord,
+    no_release: cutlass.Constexpr[bool] = False,
+) -> None:
+    """Batched poll over the (atom, source mirror) lattice, atom-major: issue
+    LAMPORT_BATCH 16 B loads back to back, spin reloading them until no last word
+    is the sentinel (the multicast TMA store lands atomically per 16 B, so the
+    probe that sees data carries the whole atom), then sum the landed atoms in
+    tRS_rD's dtype. A batch may cross mirrors; the lattice is unrolled at trace
+    time, so 4 * LAMPORT_BATCH u32 of loads are live besides the accumulator."""
+    _atom, chunk, sub_loop_n = tRS_rD.shape
+    ws_dtype = frg_in[0].element_type
+    neg_zero = sentinel_word(ws_dtype)
+    num_peers = len(frg_in)
+    tmp = cute.make_rmem_tensor((4, chunk, sub_loop_n), cutlass.Int32)
+    tmp_ws = cute.recast_tensor(tmp, ws_dtype)
+    # Flat accumulator in tmp_ws's profile: tRS_rD's atom mode is hierarchical, so
+    # only the final store crosses profiles (as the ld_reduce path's store does).
+    acc = cute.make_rmem_tensor(tmp_ws.shape, tRS_rD.element_type)
+    L = chunk * sub_loop_n * num_peers
+    W = LAMPORT_BATCH
+    for g in cutlass.range_constexpr((L + W - 1) // W):
+        q0, q1 = g * W, min(L, (g + 1) * W)
+        n = q1 - q0
+        ptrs = []
+        state = []
+        for q in cutlass.range_constexpr(q0, q1):
+            c, r = q // num_peers, q % num_peers
+            ii, jj = c // sub_loop_n, c % sub_loop_n
+            ptr = frg_in[r][None, epi_coord[0] * chunk + ii, epi_coord[1] * sub_loop_n + jj].iterator
+            ptrs.append(ptr)
+            state.extend(ld_relaxed_gpu_global_4xu32(ptr))
+        spin = while_generate(state, lambda *rg: any_(rg[4 * k + 3] == neg_zero for k in range(n)))
+        with spin:
+            nxt = []
+            for k in cutlass.range_constexpr(n):
+                nxt.extend(ld_relaxed_gpu_global_4xu32(ptrs[k]))
+            yield_out(nxt)
+        res = spin.results
+        for k in cutlass.range_constexpr(n):
+            c, r = (q0 + k) // num_peers, (q0 + k) % num_peers
+            ii, jj = c // sub_loop_n, c % sub_loop_n
+            tmp[0, ii, jj] = res[4 * k]
+            tmp[1, ii, jj] = res[4 * k + 1]
+            tmp[2, ii, jj] = res[4 * k + 2]
+            tmp[3, ii, jj] = res[4 * k + 3]
+            vals = tmp_ws[None, ii, jj].load().to(tRS_rD.element_type)
+            if const_expr(r == 0):
+                acc[None, ii, jj].store(vals)
+            else:
+                acc[None, ii, jj].store(acc[None, ii, jj].load() + vals)
+    tRS_rD.store(acc.load())

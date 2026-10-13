@@ -487,7 +487,7 @@ def gemm(
     # C/colvec_bias follow D: slab-local under reduce_scatter (consumed on the
     # owner's slab), full replicated tensors under all_reduce (each rank reduces a
     # stripe of every tile at global coordinates).
-    epi_reduce_mode: Optional[str] = None,  # "reduce_scatter" | "all_reduce"
+    epi_reduce_mode: Optional[str] = None,  # "reduce_scatter" | "all_reduce" | "all_reduce_lamport"
     epi_reduce_args: Optional[EpiReduceArguments] = None,
 ) -> _GemmPlan:
     alpha_mode = scalar_mode(alpha)

@@ -295,6 +295,13 @@ def make_fake_epi_reduce_args(d_dtype, mode, num_ranks, ws_dtype, d_major="n"):
         divisibility=128 // dtype.width,  # 16 B
     )
     flags = lambda: fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=4)
+    if mode == "all_reduce_lamport":
+        # No tile flags; a (1,) launch counter drives the 3-slot rotation.
+        return EpiReduceArguments(
+            workspace=mnl_fake(ws_dtype),
+            workspace_mc=mnl_fake(ws_dtype),
+            slot=fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1),
+        )
     return EpiReduceArguments(
         mD_mc=mnl_fake(d_dtype) if mode == "all_reduce" else None,
         workspace=mnl_fake(ws_dtype),
@@ -496,9 +503,12 @@ def validate_ag_geometry(A, ag_args, tile_M, cluster_M):
         f"AG+GEMM: M ({m_rows}) must divide into num_shards ({ag_args.num_shards})"
     )
     shard_rows = m_rows // ag_args.num_shards
-    assert shard_rows % (tile_M * cluster_M * ag_args.num_chunks) == 0, (
-        f"AG+GEMM: shard rows ({shard_rows}) must be a multiple of tile_M * cluster_M * "
-        f"arrival_chunks ({tile_M} * {cluster_M} * {ag_args.num_chunks}) so shard/chunk "
+    # 2-CTA MMA (cluster_M even, tile_M 128/256) splits the MMA tile across the pair:
+    # a scheduler cluster covers cta_tile_M * cluster_M rows, not tile_M * cluster_M.
+    cta_tile_M = tile_M // 2 if cluster_M % 2 == 0 and tile_M in (128, 256) else tile_M
+    assert shard_rows % (cta_tile_M * cluster_M * ag_args.num_chunks) == 0, (
+        f"AG+GEMM: shard rows ({shard_rows}) must be a multiple of cta_tile_M * cluster_M * "
+        f"arrival_chunks ({cta_tile_M} * {cluster_M} * {ag_args.num_chunks}) so shard/chunk "
         f"boundaries land on whole scheduler clusters"
     )
 

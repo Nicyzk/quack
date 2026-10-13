@@ -28,6 +28,7 @@ from quack.epi_reduce import (
     EpiReduceArguments,
     epi_reduce_flag_slot,
     epi_reduce_slab,
+    lamport_store_subtile,
     signal_tile_broadcast,
     signal_tile_owner,
 )
@@ -622,6 +623,7 @@ class GemmBase:
         epilogue_barrier: cutlass.pipeline.NamedBarrier,
         signal_tile: Callable,
         is_tma_warp: cutlass.Boolean,
+        rearm_tile: Optional[Callable] = None,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         """Split-rank sibling of split_k_partial_commit: commit this rank's partial
         into the symmetric workspace, run no epi ops (EVT/C/aux belong to the
@@ -635,7 +637,8 @@ class GemmBase:
 
         ``signal_tile`` is the sibling of split-K's sem release, called once this
         tile's TMA stores drain; the caller binds it to the tile's consumer set, so
-        nothing here knows about ranks or multicast.
+        nothing here knows about ranks or multicast. ``rearm_tile`` (lamport) runs
+        once before the tile's stores.
 
         Runs where epi_fn would (once per tile, on the local finalizing entity —
         under local split-K the load_acc_subtile it receives is the
@@ -651,6 +654,8 @@ class GemmBase:
         epi_tile_layout = cute.make_ordered_layout(
             epi_tile_shape, order=(0, 1) if const_expr(self.epi_m_major) else (1, 0)
         )
+        if const_expr(rearm_tile is not None):
+            rearm_tile()
         for epi_idx in cutlass.range_constexpr(cute.size(epi_tile_shape)):
             epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
             load_acc_subtile(tRS_rD, epi_coord)
@@ -658,7 +663,10 @@ class GemmBase:
                 epi_store_pipeline.producer_acquire()
             epilogue_barrier.arrive_and_wait()
             epi_buffer = epi_idx % self.epi_stage
-            copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sWs[None, None, None, epi_buffer])
+            if const_expr(self.epi_reduce_mode == "all_reduce_lamport"):
+                lamport_store_subtile(tiled_copy_r2s, tRS_rD, tRS_sWs[None, None, None, epi_buffer])
+            else:
+                copy_utils.cvt_copy(tiled_copy_r2s, tRS_rD, tRS_sWs[None, None, None, epi_buffer])
             cute.arch.fence_view_async_shared()
             epilogue_barrier.arrive_and_wait()
             if is_tma_warp:
@@ -887,6 +895,7 @@ class GemmBase:
         copy_ws: Optional[Callable] = None,
         epi_reduce_args: Optional[EpiReduceArguments] = None,
         flag_ntile_mn: Optional[Tuple[Int32, Int32]] = None,
+        rearm_tile: Optional[Callable] = None,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         """Split-rank protocol wrapper — the cross-rank sibling of epilogue_split_k.
         Ranks are one more split of the reduction dim, with SPATIAL roles (warp
@@ -936,7 +945,10 @@ class GemmBase:
                 tile_coord_mnkl[0], tile_coord_mnkl[1], tile_coord_mnkl[3], flag_ntile_mn
             )
         )
-        flag = epi_reduce_args.tile_flags.iterator + tile_id
+        lamport = const_expr(self.epi_reduce_mode == "all_reduce_lamport")
+        flag = None
+        if const_expr(not lamport):
+            flag = epi_reduce_args.tile_flags.iterator + tile_id
         if const_expr(is_producer):
             assert tiled_copy_r2s is not None and tRS_sWs is not None and copy_ws is not None, (
                 "producer needs the ws commit pair and tiled_copy_r2s"
@@ -946,7 +958,9 @@ class GemmBase:
             # from aliasing the next column's flag.
             in_bounds = tile_coord_mnkl[0] < flag_ntile_mn[0]
 
-            if const_expr(self.epi_reduce_mode == "all_reduce"):
+            if const_expr(lamport):
+                signal_tile = lambda: None  # the data is the flag
+            elif const_expr(self.epi_reduce_mode == "all_reduce"):
                 signal_tile = partial(
                     signal_tile_broadcast, epi_reduce_args.tile_flags_mc, tile_id, in_bounds
                 )
@@ -977,6 +991,7 @@ class GemmBase:
                 epilogue_barrier=epilogue_barrier,
                 signal_tile=signal_tile,
                 is_tma_warp=is_tma_warp,
+                rearm_tile=rearm_tile,
             )
             # Nesting through epilogue_split_k composes local split-K: the
             # committed partial is the rank's completed local sum.
@@ -1001,23 +1016,25 @@ class GemmBase:
             # an atomic CAS observes world and clears it in one step. reduce_scatter
             # gives the owner a single copy that its world CTAs share, so each waits for
             # world and adds one, and the last of them (2 * world - 1) clears it.
-            if tidx == 0:
-                if const_expr(self.epi_reduce_mode == "all_reduce"):
-                    spin_lock_atom_cas_acquire_wait(
-                        lock_ptr=flag,
-                        expected_val=Int32(self.num_ranks),
-                        reset_val=Int32(0),
-                        scope="gpu",
-                    )
-                else:
-                    spin_lock_ld_lt_relaxed_wait(
-                        lock_ptr=flag, expected_val=self.num_ranks, scope="gpu"
-                    )
-                    seen = cute.arch.atomic_add(
-                        flag.llvm_ptr, Int32(1), sem="relaxed", scope="gpu"
-                    )
-                    if seen == 2 * self.num_ranks - 1:
-                        cute.arch.store(flag.llvm_ptr, Int32(0), sem="relaxed", scope="gpu")
+            # all_reduce_lamport has no flag: the comm warps poll the data itself.
+            if const_expr(not lamport):
+                if tidx == 0:
+                    if const_expr(self.epi_reduce_mode == "all_reduce"):
+                        spin_lock_atom_cas_acquire_wait(
+                            lock_ptr=flag,
+                            expected_val=Int32(self.num_ranks),
+                            reset_val=Int32(0),
+                            scope="gpu",
+                        )
+                    else:
+                        spin_lock_ld_lt_relaxed_wait(
+                            lock_ptr=flag, expected_val=self.num_ranks, scope="gpu"
+                        )
+                        seen = cute.arch.atomic_add(
+                            flag.llvm_ptr, Int32(1), sem="relaxed", scope="gpu"
+                        )
+                        if seen == 2 * self.num_ranks - 1:
+                            cute.arch.store(flag.llvm_ptr, Int32(0), sem="relaxed", scope="gpu")
             epilogue_barrier.arrive_and_wait()
             return epi_fn(load_acc_subtile)
 
