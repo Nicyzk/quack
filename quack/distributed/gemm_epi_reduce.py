@@ -2,7 +2,7 @@ import torch
 import torch.distributed as dist
 
 from quack.dist_utils import make_symm_mem_flags, make_symm_mem_tensor
-from quack.epi_reduce import EpiReduceArguments, epi_reduce_workspace_shape
+from quack.epi_reduce import EpiReduceArguments, epi_reduce_cta_m, epi_reduce_workspace_shape
 
 
 def make_epi_reduce_args(
@@ -42,8 +42,7 @@ def make_epi_reduce_args(
     assert mode != "all_reduce" or ws_dtype == d_dtype, (
         "all_reduce requires workspace dtype == D dtype"
     )
-    use_2cta = cluster_M % 2 == 0 and tile_M in (128, 256)
-    cta_m = tile_M // (2 if use_2cta else 1)
+    cta_m = epi_reduce_cta_m(tile_M, cluster_M)
     m_pad, n_pad = epi_reduce_workspace_shape(m, n, cta_m, tile_N)
     if mode == "all_reduce_lamport":
         # 3 rotating slots x world source mirrors, every (m, n) mirror armed with the

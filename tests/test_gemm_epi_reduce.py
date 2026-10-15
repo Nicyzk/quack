@@ -74,7 +74,7 @@ def _run_gemm_epi_reduce(
     rank, world_size = dist.get_rank(), dist.get_world_size()
     assert world_size > 1, "launch with torchrun --nproc_per_node > 1"
     sm_major = get_device_capacity(torch.device("cuda"))[0]
-    assert sm_major in (10, 11), f"GEMM+RS requires SM100/SM110; got SM{sm_major}x"
+    assert sm_major in (9, 10, 11), f"GEMM+RS requires SM90/SM100/SM110; got SM{sm_major}x"
     slab_dim = "m" if d_major == "n" else "n"  # slab = D's strided axis
     slab_len = m if slab_dim == "m" else n
     assert slab_len % world_size == 0, f"{slab_dim} must be divisible by world_size ({world_size})"

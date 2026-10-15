@@ -773,6 +773,8 @@ class GemmSm120(GemmSm90):
         mD_mnl: Optional[cute.Tensor],
         tma_atom_c: Optional[cute.CopyAtom],
         mC_mnl: Optional[cute.Tensor],
+        tma_atom_ws: Optional[cute.CopyAtom],  # epi_reduce (SM90 only): unused here
+        mWs_mnl: Optional[cute.Tensor],
         epilogue_params,
         varlen_params: VarlenManager.Params,
         cluster_layout_mnk: cute.Layout,
@@ -790,6 +792,7 @@ class GemmSm120(GemmSm90):
         aux_a_smem_layout: Optional[cute.Layout],
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
+        epi_reduce_args: Optional[tuple],
     ):
         from cutlass.cute.experimental import iket
 

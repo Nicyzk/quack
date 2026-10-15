@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Tri Dao.
 # Shared utilities for TVM-FFI GEMM compilation.
 
-from functools import partial
+from functools import lru_cache, partial
 
 import torch
 
@@ -554,21 +554,27 @@ def launch_gemm(
 ):
     """Invoke the compiled kernel. Kernel signatures uniformly take trailing
     (SFA, SFB) — None unless blockscaled — and the compiled TVM-FFI arg spec
-    bakes the full declared arity, so they are always passed; SM100/110
-    signatures take a further trailing epi_reduce_args. A layout-owning
-    transform's A is a TransformAOperand bundle — one slot, the host never
-    unpacks it."""
+    bakes the full declared arity, so they are always passed; the SM90-family
+    (SM90/SM120) and SM100/110 signatures take a further trailing
+    epi_reduce_args. A layout-owning transform's A is a TransformAOperand
+    bundle — one slot, the host never unpacks it."""
     if SFA is not None:
         _validate_tma_unpack_operands(A, B)
     # getattr: gemm.py / gemm_symmetric.py pass their own plan NamedTuples.
     if getattr(plan, "epi_reduce_mode", None) is not None:
         assert epi_reduce_args is not None, "epi_reduce_mode plan launched without epi_reduce_args"
-    if plan.is_sm100_family:
+    if plan.is_sm100_family or _sm90_family():
         plan.compiled_fn(
             A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB, epi_reduce_args
         )
     else:
         plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)
+
+
+@lru_cache(maxsize=None)
+def _sm90_family() -> bool:
+    """GemmSm90 and its SM120 subclass share one __call__ (with the epi_reduce_args slot)."""
+    return torch.cuda.get_device_capability()[0] in (9, 12)
 
 
 def make_fake_gemm_tensors(
@@ -769,7 +775,12 @@ def compile_gemm_kernel(
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
     if epi_reduce is not None:
-        assert device_capacity[0] in [10, 11], "epi_reduce_mode requires SM100/SM110"
+        assert device_capacity[0] in [9, 10, 11], "epi_reduce_mode requires SM90/SM100/SM110"
+    er_kwargs = (
+        dict(epi_reduce_mode=epi_reduce[0], num_ranks=epi_reduce[1], rank_id=epi_reduce[2])
+        if epi_reduce is not None
+        else {}
+    )
     split_k_kwargs = {}
     if split_k != 1:
         assert device_capacity[0] in [9, 10, 11, 12], "split_k requires SM90/SM100/SM120"
@@ -803,13 +814,10 @@ def compile_gemm_kernel(
             split_k_kwargs["use_clc_persistence"] = (
                 is_dynamic_persistent and persistent and get_compile_target_capacity()[0] >= 10
             )
-        GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent, **split_k_kwargs)
-    elif device_capacity[0] in [10, 11]:
-        er_kwargs = (
-            dict(epi_reduce_mode=epi_reduce[0], num_ranks=epi_reduce[1], rank_id=epi_reduce[2])
-            if epi_reduce is not None
-            else {}
+        GemmCls = partial(
+            GemmCls, pingpong=pingpong, is_persistent=persistent, **er_kwargs, **split_k_kwargs
         )
+    elif device_capacity[0] in [10, 11]:
         GemmCls = partial(
             GemmCls,
             use_clc_persistence=is_dynamic_persistent,

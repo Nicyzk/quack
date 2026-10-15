@@ -878,7 +878,7 @@ def _build_gemm_plan(
         # load warp in the cp.async kernel); every TMA arch supports AG.
         assert device_capacity[0] >= 9, "AllGather+GEMM requires SM90+"
     if epi_reduce is not None:
-        assert device_capacity[0] in [10, 11], "epi_reduce_mode requires SM100/SM110"
+        assert device_capacity[0] in [9, 10, 11], "epi_reduce_mode requires SM90/SM100/SM110"
     sf_dtype, sf_vec_size = None, None
     a_mma_dtype, b_mma_dtype = None, None
     if blockscaled:

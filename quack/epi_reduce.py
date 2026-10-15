@@ -14,7 +14,6 @@ plain local store into the slab-shaped D (reduce_scatter: cutlass's owner remap 
 the CTA at (m, n) reduces stripe m // tiles_per_rank of the owned tile
 m % tiles_per_rank + rank * tiles_per_rank)."""
 
-import math
 from typing import NamedTuple, Optional
 
 import torch
@@ -73,14 +72,32 @@ def epi_reduce_workspace_shape(m, n, cta_m, cta_n):
     return m_pad, n_pad
 
 
-def pick_num_comm_warps(cta_m: int, tile_N: int, ws_width: int, tile_split: int) -> Optional[int]:
-    """cutlass's _pick_num_comm_warp_for_128b: the largest W in 4..1 whose 32*W threads
-    split the (cta_m / tile_split, tile_N) slice evenly into whole 128 b atoms (one or
-    more per thread); tile_split = world under the flag protocols, 1 under lamport.
-    None when no count does."""
+def epi_reduce_is_sm100(device=None) -> bool:
+    return torch.cuda.get_device_capability(device)[0] in (10, 11)
+
+
+def epi_reduce_cta_m(tile_M: int, cluster_M: int, device=None) -> int:
+    """Per-CTA M rows of a tile: SM100 pairs CTAs along M (2-CTA MMA) for even cluster_M
+    at tile_M 128/256; SM90 CTAs always own the whole tile_M."""
+    two_cta = epi_reduce_is_sm100(device) and cluster_M % 2 == 0 and tile_M in (128, 256)
+    return tile_M // (2 if two_cta else 1)
+
+
+def epi_reduce_max_comm_warps(device=None) -> int:
+    """SM100 adds 4 comm warps to the CTA; SM90 lends 2 spare warps of its producer warp group."""
+    return 4 if epi_reduce_is_sm100(device) else 2
+
+
+def pick_num_comm_warps(
+    cta_m: int, tile_N: int, ws_width: int, tile_split: int, max_warps: int = 4
+) -> Optional[int]:
+    """cutlass's _pick_num_comm_warp_for_128b: the largest W in max_warps..1 whose 32*W
+    threads split the (cta_m / tile_split, tile_N) slice evenly into whole 128 b atoms
+    (one or more per thread); tile_split = world under the flag protocols, 1 under
+    lamport. None when no count does."""
     slab = (cta_m // tile_split) * tile_N
     atom = 128 // ws_width
-    for w in (4, 3, 2, 1):
+    for w in range(max_warps, 0, -1):
         if slab % (32 * w) == 0 and (slab // (32 * w)) % atom == 0:
             return w
     return None
@@ -103,8 +120,7 @@ def validate_epi_reduce_args(
         # Pending the aligned-mode mirror: m-major D (swap_ab) ran on the
         # removed slab walk and is temporarily rejected.
         raise ValueError("epi_reduce_mode: D must be n-major")
-    use_2cta = cluster_M % 2 == 0 and tile_M in (128, 256)
-    cta_m = tile_M // (2 if use_2cta else 1)
+    cta_m = epi_reduce_cta_m(tile_M, cluster_M, D.device)
     # Cutlass-aligned comm contract: full tiles (comm reads/stores are
     # unpredicated whole slices), whole-row slice quantum, and (RS) slabs of
     # whole CTA tiles so the owner remap is exact.
@@ -151,9 +167,13 @@ def validate_epi_reduce_args(
     # The comm warps cover the (cta_m/world, tile_N) slice (whole tile under lamport) in
     # 128 b atoms; the kernel is built with the same pick.
     tile_split = 1 if lamport else num_ranks
-    if pick_num_comm_warps(cta_m, tile_N, era.workspace.element_size() * 8, tile_split) is None:
+    max_warps = epi_reduce_max_comm_warps(D.device)
+    if (
+        pick_num_comm_warps(cta_m, tile_N, era.workspace.element_size() * 8, tile_split, max_warps)
+        is None
+    ):
         raise ValueError(
-            f"no comm-warp count (4..1) covers the ({cta_m // tile_split} x {tile_N} "
+            f"no comm-warp count ({max_warps}..1) covers the ({cta_m // tile_split} x {tile_N} "
             f"{era.workspace.dtype}) slice in whole 128 b atoms"
         )
     if mode in ("reduce_scatter", "all_reduce_lamport"):
@@ -396,13 +416,14 @@ def lamport_reduce_subtile(
     tRS_rD: cute.Tensor,
     epi_coord: cute.Coord,
     no_release: cutlass.Constexpr[bool] = False,
+    batch: cutlass.Constexpr[int] = LAMPORT_BATCH,
 ) -> None:
     """Batched poll over the (atom, source mirror) lattice, atom-major: issue
-    LAMPORT_BATCH 16 B loads back to back, spin reloading them until no last word
+    ``batch`` 16 B loads back to back, spin reloading them until no last word
     is the sentinel (the multicast TMA store lands atomically per 16 B, so the
     probe that sees data carries the whole atom), then sum the landed atoms in
     tRS_rD's dtype. A batch may cross mirrors; the lattice is unrolled at trace
-    time, so 4 * LAMPORT_BATCH u32 of loads are live besides the accumulator."""
+    time, so 4 * batch u32 of loads are live besides the accumulator."""
     _atom, chunk, sub_loop_n = tRS_rD.shape
     ws_dtype = frg_in[0].element_type
     neg_zero = sentinel_word(ws_dtype)
@@ -413,7 +434,7 @@ def lamport_reduce_subtile(
     # only the final store crosses profiles (as the ld_reduce path's store does).
     acc = cute.make_rmem_tensor(tmp_ws.shape, tRS_rD.element_type)
     L = chunk * sub_loop_n * num_peers
-    W = LAMPORT_BATCH
+    W = batch
     for g in cutlass.range_constexpr((L + W - 1) // W):
         q0, q1 = g * W, min(L, (g + 1) * W)
         n = q1 - q0
