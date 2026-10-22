@@ -438,7 +438,7 @@ class GemmSm120(GemmSm90):
         self.shared_storage = None
         self.buffer_align_bytes = 1024
 
-    def epi_smem_warp_shape_mnk(self):
+    def epi_warp_shape_mnk(self):
         return self.atom_layout_mnk
 
     def _sf_smem_bytes_per_stage(self) -> int:
@@ -790,6 +790,7 @@ class GemmSm120(GemmSm90):
         aux_a_smem_layout: Optional[cute.Layout],
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
+        comm_args,  # the SM90-family __call__ passes it; no comm operator on SM120
     ):
         from cutlass.cute.experimental import iket
 

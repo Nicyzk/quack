@@ -494,15 +494,17 @@ def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None, ag_a
     )
 
 
-def launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA=None, SFB=None):
+def launch_gemm(
+    plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA=None, SFB=None, comm_args=None
+):
     """Invoke the compiled kernel. Kernel signatures uniformly take trailing
     (SFA, SFB) — None unless blockscaled — and the compiled TVM-FFI arg spec
     bakes the full declared arity, so they are always passed. A layout-owning
     transform's A is a TransformAOperand bundle — one slot, the host never
-    unpacks it."""
+    unpacks it. Every kernel also declares a trailing comm_args (None without a comm)."""
     if SFA is not None:
         _validate_tma_unpack_operands(A, B)
-    plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)
+    plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB, comm_args)
 
 
 def make_fake_gemm_tensors(
@@ -699,8 +701,10 @@ def compile_gemm_kernel(
     cd_packed=None,
     a_mma_dtype=None,
     b_mma_dtype=None,
+    comm=None,  # the distributed operator (quack.gemm_base.Comm): ctor kwarg + its comm_args fakes
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
+    assert comm is None or device_capacity[0] in [9, 10, 11], "comm operators are SM90/SM100 only"
     split_k_kwargs = {}
     if split_k != 1:
         assert device_capacity[0] in [9, 10, 11, 12], "split_k requires SM90/SM100/SM120"
@@ -734,6 +738,8 @@ def compile_gemm_kernel(
             split_k_kwargs["use_clc_persistence"] = (
                 is_dynamic_persistent and persistent and get_compile_target_capacity()[0] >= 10
             )
+        if comm is not None:
+            split_k_kwargs["comm"] = comm
         GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent, **split_k_kwargs)
     elif device_capacity[0] in [10, 11]:
         GemmCls = partial(
@@ -744,6 +750,7 @@ def compile_gemm_kernel(
             a_mma_dtype=a_mma_dtype,
             b_mma_dtype=b_mma_dtype,
             **split_k_kwargs,
+            **({"comm": comm} if comm is not None else {}),
         )
     gemm_obj = GemmCls(
         Float32,
@@ -768,6 +775,9 @@ def compile_gemm_kernel(
     # natively. The compiled TVM-FFI arg spec bakes the full declared arity
     # (defaults included), so they are always passed here and at launch.
     sf_args = (mSFA, mSFB)
+    # every kernel declares a trailing comm_args (defaults are baked into the arity): its fakes, or None
+    d_dtype = mD.element_type if mD is not None else None  # sink-only epilogues have no D
+    comm_args = (comm.fake_args(d_dtype) if comm is not None else None,)
     return cute.compile(
         gemm_obj,
         mA,
@@ -779,5 +789,6 @@ def compile_gemm_kernel(
         varlen_args,
         stream,
         *sf_args,
+        *comm_args,
         options="--enable-tvm-ffi",
     )

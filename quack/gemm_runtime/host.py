@@ -30,6 +30,8 @@ from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import get_max_active_clusters, torch2cute_dtype_map
 from quack.gemm_config import SplitKMode, cta_tile_shape_m
 from quack.epilogue.ops import EpiOp
+from quack.compile_utils import div_for_dtype, fake_batched
+from quack.gemm_base import AllGather
 from quack.gemm_runtime.identity import (
     resolve_gemm_class,
     resolve_transform_a,
@@ -126,6 +128,7 @@ def _compile_gemm_epi(
     # arg, kernel-N (the activation M) is the only symbolic dim.
     transform_a_ref=None,
     transform_dims=None,
+    comm=None,  # SM100 Comm object (picklable; its state is in the key)
 ):
     """Compile one epilogue-GEMM variant against fake symbolic tensors.
 
@@ -180,6 +183,17 @@ def _compile_gemm_epi(
             a_mma_dtype=a_mma_dtype,
             b_mma_dtype=b_mma_dtype,
         )
+        if comm is not None:
+            # the comm's D is its wire with its own M extent (a split-rank wire may stack mirrors
+            # along M): untie it from A's M in the compiled signature
+            mD = fake_batched(
+                d_dtype,
+                cute.sym_int(),
+                n,
+                l if batched else None,
+                1 if d_major == "n" else 0,
+                div_for_dtype(d_dtype),
+            )
         if transform_mod is not None and transform_mod.needs_operands:
             # value transform with runtime operands: A crosses as a (plain A,
             # operand view) bundle in the one mA slot (same-arity trick as W4)
@@ -261,6 +275,7 @@ def _compile_gemm_epi(
         cd_packed=packed_cd,
         split_k=split_k,
         split_k_mode=split_k_mode,
+        comm=AllGather() if has_ag else comm,  # the ag bundle's gate is the AllGather operator
     )
 
 
@@ -352,6 +367,7 @@ def build_gemm_epi_plan(
     # operand_transform.host.w4_operand_views (blob view + optional strip);
     # the ctor a_dtype comes from the format's mma_dtype.
     transform_a=None,
+    comm=None,  # SM100 Comm object (see quack/distributed/): dense static persistent only
 ) -> GemmEpiPlan:
     """Derive majors/dtypes/epi keys from tensor metadata and compile (or hit
     the jit cache). Variant wrappers call this after their validation asserts."""
@@ -456,6 +472,7 @@ def build_gemm_epi_plan(
         split_k_mode=split_k_mode,
         transform_a_ref=transform_ref,
         transform_dims=transform_dims,
+        comm=comm,
     )
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
@@ -523,6 +540,7 @@ def run_gemm_epi_plan(
     SFB=None,
     split_k_buffers=None,  # (sem, ws) raw from _split_k_buffers: reuse across
     # calls when the kernel leaves them reusable (serial self-resets)
+    comm_args=None,  # the comm object's per-call bundle (plans compiled with comm=)
 ) -> None:
     """Launch a resolved plan: only per-call pointers and scalar values here.
 
@@ -566,4 +584,6 @@ def run_gemm_epi_plan(
         else None
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=cu_tiles_m)
-    launch_gemm(plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB)
+    launch_gemm(
+        plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB, comm_args=comm_args
+    )

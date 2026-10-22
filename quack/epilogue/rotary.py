@@ -228,7 +228,11 @@ class RotaryCosSinTMALoad(TileLoad):
         tile_coord_mnkl,
         varlen_manager,
         epi_pipeline,
+        tile_shape_mn=None,
     ):
+        assert tile_shape_mn is None or tuple(tile_shape_mn) == tuple(
+            gemm.cta_tile_shape_mnk[:2]
+        ), "RotaryCosSinTMALoad is framed on the CTA tile"
         assert not varlen_manager.varlen_m, (
             "RotaryCosSinTMALoad does not support varlen_m; use "
             "rotary_cos_sin_load(name, tma=False) (rope_table_ldg_epi / qk_rope_ldg_epi)"

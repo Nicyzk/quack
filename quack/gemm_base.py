@@ -20,6 +20,7 @@ from quack.cute_dsl_utils import ParamsBase
 from quack.epilogue.ops import DStore, EpiSmemBytes, TileLoad, TileStore, VecReduce
 from quack.gemm_config import SplitKMode
 from quack.pipeline import PipelineTmaAsync, PipelineTmaCpAsync
+from quack.rounding import RoundingMode
 from quack.sync import Semaphore
 from quack.tile_scheduler import (
     PersistenceMode,
@@ -27,6 +28,7 @@ from quack.tile_scheduler import (
     TileSchedulerArguments,
     VarlenMTileScheduler,
     VarlenMTileSchedulerArguments,
+    ag_wait_m_tile,
 )
 from quack.varlen_utils import VarlenManager
 
@@ -44,6 +46,157 @@ class NamedBarrierGemm(enum.IntEnum):
     # CLC-multicast throttle: CTA0 load warp arrives once per tile started,
     # CTA0 scheduler warp syncs once per CLC query (2 warps, 64 threads).
     ClcThrottle = enum.auto()
+
+
+# the comm warp group's named barrier, after quack's ids
+COMM_BARRIER_ID = max(NamedBarrierGemm) + 1
+
+
+class CommCtx:
+    """What a kernel hands the operator's hooks: built once per kernel after setup, the same object at
+    every call point. Operators unpack the fields they use into locals before any dynamic loop (the DSL
+    cannot read a Python object inside a staged region)."""
+
+    def __init__(
+        self,
+        args=None,  # the operator's per-call bundle (comm_args)
+        smem=None,  # its SharedStorage field (storage.comm)
+        sched_params=None,  # the tile scheduler params (gates read their bundles here)
+        TileSchedulerCls=None,  # the scheduler factory, for warps that replay the static schedule
+        epi_params=None,  # the epilogue's params, smem tensors and C pipeline: a split-rank reducer
+        epi_smem_tensors=None,  # re-enters gemm.epilogue with them
+        varlen=None,  # the VarlenManager
+        epi_pipeline=None,
+        sC=None,
+    ):
+        self.args, self.smem, self.sched_params = args, smem, sched_params
+        self.TileSchedulerCls, self.varlen = TileSchedulerCls, varlen
+        self.epi_params, self.epi_smem_tensors = epi_params, epi_smem_tensors
+        self.epi_pipeline, self.sC = epi_pipeline, sC
+
+
+class EpiFrame:
+    """The rectangle a split-rank operator's comm warps run the GEMM's epilogue on: tile_mn (a stripe of
+    the CTA tile, or all of it), the subtile they visit it in (C is staged per subtile at the operator's
+    epi_load_coord) and their warp arrangement (what the epilogue ops' smem is laid out for)."""
+
+    def __init__(self, tile_mn, subtile, warp_shape_mnk):
+        self.tile_mn, self.subtile, self.warp_shape_mnk = tile_mn, subtile, warp_shape_mnk
+
+
+class Comm:
+    """A distributed operator fused into the GEMM (GemmSmXX(..., comm=Comm subclass)). It owns the
+    per-tile gate (wait_tile) and publish (signal_tile), its comm warps (num_warps, regs = (epilogue,
+    other, comm) or None, smem via smem_bytes / smem_struct as storage.comm) and the destination of the
+    GEMM's staged subtile (store_coord / store_drain / store_fixup, epi_frame for a split-rank reducer).
+    The GEMM owns the mainloop, the epilogue and the staging of the store; every hook sees the kernel
+    through one CommCtx. This base is the no-comm default."""
+
+    num_warps = 0
+    regs = None
+    # split-rank: the epilogue warps commit this rank's raw partial into D (split_rank_partial_commit)
+    # instead of running the epilogue; the comm warps reduce and run it (epilogue_split_rank)
+    split_rank = False
+
+    def smem_bytes(self, gemm) -> int:
+        """Bytes off the A/B/epilogue stage budget (smem_struct's size)."""
+        return 0
+
+    def smem_struct(self, gemm):
+        """The SharedStorage field; zero bytes by default."""
+        return cute.struct.MemRange[Int32, 0]
+
+    def plan_key(self):
+        """Hashable identity for plan / jit caches: the class and its constructor state."""
+        return (type(self).__module__, type(self).__qualname__, tuple(sorted(vars(self).items())))
+
+    def fake_args(self, d_dtype):
+        """The comm_args bundle of fake tensors for cute.compile (None: the kernel takes none)."""
+        return None
+
+    def epi_frame(self, gemm):
+        """split-rank: the EpiFrame the comm warps' epilogue runs on; C is staged per its subtile."""
+        return None
+
+    def wire_shape(self, shape):
+        """Host: the shape of D (the operator's wire) for a problem whose output is `shape`; the runner
+        allocates it and the frontend validates it from this one place."""
+        return shape
+
+    @cute.jit
+    def epi_load_coord(self, gemm, tile_coord_mnkl, varlen_manager):
+        """split-rank: the frame coordinate C is loaded at for the schedule tile the comm warps reduce."""
+        return tile_coord_mnkl
+
+    @cute.jit
+    def store_coord(self, gemm, ctx, tile_coord_mnkl):
+        """The tile coordinate in D the epilogue stores this schedule tile at (D is the operator's wire)."""
+        return tile_coord_mnkl
+
+    @cute.jit
+    def store_fixup(self, frg):
+        """split-rank: in-place fixup of the converted (wire-dtype) fragment before it is staged for the
+        store; the store itself stays the GEMM's."""
+        return
+
+    def store_drain(self, gemm, ctx, sD, epi_tile, tidx):
+        """Trace-time, in the epilogue warps: the operator's own drain of the staged D subtile when the
+        destination is not a tile of D (combine: each row's slice into its origin rank's slot). None (the
+        GEMM's TMA store), or a jit callable (varlen_manager, tile_coord_mnkl, batch_idx, src_idx, dst_idx)
+        every epilogue thread runs on smem stage src_idx; the GEMM then builds no TMA store pipeline. The
+        staging (accumulator -> registers -> epi ops -> smem) stays the GEMM's."""
+        return None
+
+    @cute.jit
+    def wait_tile(self, gemm, ctx, tile_coord_mnkl, gate: Int32) -> Int32:
+        """Load warp, before the tile's first TMA. gate is an Int32 the GEMM threads across tiles
+        (init -1): a satisfied-gate cache or whatever state the operator returns."""
+        return gate
+
+    @cute.jit
+    def signal_tile(
+        self, gemm, ctx, tile_coord_mnkl, epi_store_pipeline, is_tma_warp: Boolean, tidx: Int32
+    ):
+        """Epilogue warps, after the tile's epilogue is issued. Publishing stored bytes means draining
+        epi_store_pipeline (the TMA warp's) first."""
+        return
+
+    @cute.jit
+    def comm_warps(self, gemm, ctx, warp_idx: Int32, tidx: Int32):
+        """The comm warps' whole body: its own tile iteration (ctx.TileSchedulerCls stepped locally, or a
+        walk), gemm.comm_barrier for its syncs, teardown included. Never a consumer of the scheduler
+        pipeline. ctx's epilogue materials are for a split-rank reducer re-entering gemm.epilogue;
+        ctx.epi_pipeline / ctx.sC carry C, staged by the epi-load warp per its subtile."""
+        return
+
+
+class AllGather(Comm):
+    """AllGather + GEMM: the transport is the copy engine (quack/distributed/all_gather_gemm.py), so
+    the operator is only the load-warp gate on the shard / chunk arrival flags the scheduler's `ag`
+    bundle carries. Implied by ag_args at the frontends; no comm warps, no comm_args."""
+
+    @cute.jit
+    def wait_tile(self, gemm, ctx, tile_coord_mnkl, gate: Int32) -> Int32:
+        return ag_wait_m_tile(ctx.sched_params, tile_coord_mnkl[0], gemm.cluster_shape_mnk[0], gate)
+
+
+class CommRunner:
+    """The host half of a distributed operator, what a caller passes as comm=: it owns the wire the GEMM
+    stores through (D), the result, the per-launch state and any coordination between launches, and
+    carries the kernel-side operator. The frontend takes D = wire and comm_args = args() from it and
+    calls before_launch() once per launch; the caller never sees the wire."""
+
+    comm: Comm
+    wire = None  # the tensor the GEMM stores through
+    out = None  # the result
+
+    def args(self):
+        """This launch's comm_args bundle."""
+        return self._args
+
+    def before_launch(self):
+        """Per-launch state (slot / epoch bumps, resets); runs once, before the kernel is enqueued."""
+        return
 
 
 def reinterpret_packed_fp6(mT, dtype):
@@ -229,6 +382,14 @@ class GemmBase:
     EpilogueParams = ParamsBase
 
     def epi_smem_warp_shape_mnk(self):
+        """The warps the epilogue and its ops' smem are laid out for: the comm frame's when the comm
+        warps run the epilogue (split-rank), else this arch's epilogue warps."""
+        if self.comm_frame is not None:
+            return self.comm_frame.warp_shape_mnk
+        return self.epi_warp_shape_mnk()
+
+    def epi_warp_shape_mnk(self):
+        """This arch's epilogue warps as (m, n, k)."""
         return (self.num_epi_warps, 1, 1)
 
     def epi_r2s_pair_xor(self) -> bool:
@@ -274,12 +435,25 @@ class GemmBase:
         tile_scheduler,
         tidx: Int32,
         is_tma_warp: cutlass.Boolean,
+        # Register-direct D store per subtile, replacing the smem+TMA copy_D path
+        # (split-rank reducer warps).
+        commit_D: Optional[Callable] = None,
+        # The tile the epilogue is framed on: the CTA tile unless the caller runs it on a
+        # sub-tile (split-rank reducer: a (cta_m / world, cta_n) stripe). Constexpr: a
+        # plain tuple kwarg would be staged to runtime Int32s.
+        tile_shape_mn: cutlass.Constexpr = None,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
         from cutlass.cute.experimental import iket
 
+        frame_mn = const_expr(
+            tile_shape_mn if tile_shape_mn is not None else self.cta_tile_shape_mnk[:2]
+        )
         has_C = const_expr(tRS_rC is not None)
         has_epi_load = const_expr(self.epi_c_stage > 0)
         has_D = const_expr(copy_D is not None)
+        assert not (copy_D is not None and commit_D is not None), (
+            "copy_D (smem+TMA) and commit_D (register-direct) are alternative D store paths"
+        )
         use_tma_epi = const_expr(epi_store_pipeline is not None)
         use_tma_c = const_expr(epi_pipeline is not None)
         inline_epi_load = const_expr(copy_C is not None)
@@ -301,15 +475,14 @@ class GemmBase:
             tile_coord_mnkl,
             varlen_manager,
             tidx,
+            tile_shape_mn=frame_mn,
         )
         if const_expr(has_D):
             store_ctxs = (
                 (DStore(), self._epi_store_quant("D"), tiled_copy_r2s, tRS_sD, copy_D, None),
             ) + store_ctxs
 
-        epi_tile_shape = cute.zipped_divide(
-            cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
-        ).shape[1]
+        epi_tile_shape = cute.zipped_divide(cute.make_layout(frame_mn), epi_tile).shape[1]
         epi_tile_layout = cute.make_ordered_layout(
             epi_tile_shape, order=(0, 1) if const_expr(self.epi_m_major) else (1, 0)
         )
@@ -327,6 +500,7 @@ class GemmBase:
             epilogue_barrier,
             tidx,
             tRS_rD.layout,
+            tile_shape_mn=frame_mn,
         )
 
         if const_expr(self.epi_needs_acc_prepass):
@@ -350,7 +524,7 @@ class GemmBase:
                 epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
                 load_acc_subtile(tRS_rD, epi_coord, no_release=True)
                 self.epi_prepass_subtile(params, epi_tensors, tRS_rD, epi_coord, epi_idx)
-            self.epi_prepass_end(params, epi_tensors)
+            self.epi_prepass_end(params, epi_tensors, epilogue_barrier)
 
         if const_expr(inline_epi_load):
             for epi_idx in cutlass.range(min(epi_tile_num, self.epi_c_stage), unroll=1):
@@ -427,6 +601,8 @@ class GemmBase:
                 tile_coord_mnkl,
                 varlen_manager,
                 tidx,
+                tile_shape_mn=frame_mn,
+                epilogue_barrier=epilogue_barrier,
             )
             # Quantize (optional per-output codec) + convert each stored
             # output to its storage dtype. The quantize rescales the final
@@ -499,6 +675,8 @@ class GemmBase:
                         if store_pred:
                             copy_out(src_idx=epi_buffer, dst_idx=epi_coord)
                 epilogue_barrier.arrive_and_wait()
+            if const_expr(commit_D is not None):
+                commit_D(tRS_rD, epi_coord)
 
         self.epi_end(
             params,
@@ -509,6 +687,7 @@ class GemmBase:
             tile_coord_mnkl,
             varlen_manager,
             tidx,
+            tile_shape_mn=frame_mn,
         )
 
         return epi_read_state, epi_producer_state
@@ -756,6 +935,124 @@ class GemmBase:
                         epi_store_pipeline.producer_tail()
         return epi_read_state, epi_producer_state
 
+    def comm_setup(self, comm, comm_warp_ids, static_schedule: bool = True):
+        """Host, in a kernel's constructor: bind the operator and the warps this arch gives it
+        (comm_warp_ids: the kernel's choice, up to comm.num_warps; a new group on SM100, the producer
+        group's spare warps on SM90). Derives the comm barrier; comm warps need a static schedule to replay."""
+        self.comm = comm if comm is not None else Comm()
+        self.comm_frame = None  # the operator's EpiFrame, set in _setup_attributes
+        self.comm_warp_ids = tuple(comm_warp_ids)
+        self.num_comm_warps = len(self.comm_warp_ids)
+        assert self.num_comm_warps <= self.comm.num_warps and (
+            (self.num_comm_warps > 0) == (self.comm.num_warps > 0)
+        ), "comm_warp_ids: some of the comm's warps, up to comm.num_warps"
+        assert static_schedule or not self.num_comm_warps, (
+            "comm warps mirror the static schedule; a dynamic scheduler steals per CTA"
+        )
+        self.comm_barrier = (
+            pipeline.NamedBarrier(
+                barrier_id=COMM_BARRIER_ID, num_threads=self.num_comm_warps * cute.arch.WARP_SIZE
+            )
+            if self.num_comm_warps
+            else None
+        )
+
+    @cute.jit
+    def epilogue_split_rank(
+        self,
+        params: EpilogueParams,
+        epi_fn: Callable,
+        load_acc_subtile: Callable,
+        tRS_rD: cute.Tensor,
+        epi_tile: cute.Tile,
+        epi_read_state: Optional[cutlass.pipeline.PipelineState],
+        epi_producer_state: Optional[cutlass.pipeline.PipelineState],
+        epi_store_pipeline: Optional[cutlass.pipeline.PipelineAsync],
+        tile_coord_mnkl: cute.Coord,
+        epilogue_barrier: cutlass.pipeline.NamedBarrier,
+        tidx: Int32,
+        is_tma_warp: cutlass.Boolean,
+        partial_commit: Optional[Callable] = None,
+    ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
+        """Split-rank protocol around epilogue_split_k: ranks are one more split of the
+        reduction dim, with SPATIAL roles where split-K's are temporal.
+
+          epilogue_split_k                   epilogue_split_rank
+          non-finalizer: partial_commit      epilogue warps (every rank): partial_commit
+            + sem release                      -> this rank's partial, then the caller signals
+          finalizer: sem.wait, epi_fn        reducer warps: wait the tile, epilogue(reduce)
+
+        Only the epilogue warps call this. ``partial_commit`` (load_acc_subtile left unbound,
+        see split_rank_partial_commit) replaces epi_fn as the finalize action; nesting through
+        epilogue_split_k makes local split-K compose. None = passthrough (a world of 1)."""
+        finalize = epi_fn
+        if const_expr(partial_commit is not None):
+            finalize = partial_commit
+        return self.epilogue_split_k(
+            params,
+            finalize,
+            load_acc_subtile,
+            tRS_rD,
+            epi_tile,
+            epi_read_state,
+            epi_producer_state,
+            epi_store_pipeline,
+            tile_coord_mnkl,
+            epilogue_barrier,
+            tidx,
+            is_tma_warp,
+        )
+
+    @cute.jit
+    def split_rank_partial_commit(
+        self,
+        load_acc_subtile: Callable,
+        tRS_rD: cute.Tensor,
+        epi_tile: cute.Tile,
+        tiled_copy_r2s: cute.TiledCopy,
+        tRS_sD: cute.Tensor,
+        copy_D: Callable,
+        epi_store_pipeline: cutlass.pipeline.PipelineAsync,
+        epi_read_state: Optional[cutlass.pipeline.PipelineState],
+        epi_producer_state: Optional[cutlass.pipeline.PipelineState],
+        epilogue_barrier: cutlass.pipeline.NamedBarrier,
+        is_tma_warp: cutlass.Boolean,
+    ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
+        """Split-rank sibling of split_k_partial_commit: store this rank's raw partial in
+        d_dtype at real (m, n) through the epilogue's TMA store idiom (D is the partials
+        buffer), run no epi ops: they run once on the reducer. Stage cycling restarts at 0
+        each tile and the per-tile producer_tail empties the ring, so the tile's bytes are in
+        gmem when this returns and the caller may publish it."""
+        assert self.rounding_mode != RoundingMode.RS, (
+            "split_rank_partial_commit converts partials with round-to-nearest only"
+        )
+        epi_tile_shape = cute.zipped_divide(
+            cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
+        ).shape[1]
+        epi_tile_layout = cute.make_ordered_layout(
+            epi_tile_shape, order=(0, 1) if const_expr(self.epi_m_major) else (1, 0)
+        )
+        for epi_idx in cutlass.range_constexpr(cute.size(epi_tile_shape)):
+            epi_coord = epi_tile_layout.get_hier_coord(epi_idx)
+            load_acc_subtile(tRS_rD, epi_coord)
+            if is_tma_warp:
+                epi_store_pipeline.producer_acquire()
+            epilogue_barrier.arrive_and_wait()
+            epi_buffer = epi_idx % self.epi_stage
+            wire = tRS_rD
+            if const_expr(tRS_rD.element_type != tRS_sD.element_type):
+                wire = tRS_rD.to(tRS_sD.element_type)
+            self.comm.store_fixup(wire)
+            cute.copy(tiled_copy_r2s, wire, tRS_sD[None, None, None, epi_buffer])
+            cute.arch.fence_view_async_shared()
+            epilogue_barrier.arrive_and_wait()
+            if is_tma_warp:
+                copy_D(src_idx=epi_buffer, dst_idx=epi_coord)
+                epi_store_pipeline.producer_commit()
+        if is_tma_warp:
+            epi_store_pipeline.producer_tail()
+        return epi_read_state, epi_producer_state
+
     def get_scheduler_class(self, varlen_m: bool = False):
         """Return the scheduler class to use. Override in subclasses for custom schedulers."""
         return TileScheduler if not varlen_m else VarlenMTileScheduler
@@ -881,6 +1178,7 @@ class GemmBase:
         epilogue_barrier: cutlass.pipeline.NamedBarrier,
         tidx: Int32,
         tRS_rD_layout=None,
+        tile_shape_mn: cutlass.Constexpr = None,
     ) -> Tuple[cute.Tensor, ...]:
         return ()
 
@@ -921,6 +1219,8 @@ class GemmBase:
         tile_coord_mnkl: cute.Coord,
         varlen_manager,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
+        epilogue_barrier=None,
     ) -> None:
         pass
 
@@ -935,6 +1235,7 @@ class GemmBase:
         tile_coord_mnkl: cute.Coord,
         varlen_manager,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
     ) -> None:
         pass
 
@@ -987,6 +1288,7 @@ class GemmBase:
         tile_coord_mnkl,
         varlen_manager,
         tidx,
+        tile_shape_mn=None,
     ):
         """Return a tuple of ``(op, quant, tiled_copy, tRS_sAuxOut,
         copy_aux_out, store_pred)`` store contexts — one per aux output (see
@@ -1125,6 +1427,7 @@ class GemmTmaBase(GemmBase):
         mC: Optional[cute.Tensor],
         epilogue_args,
         varlen_m: bool,
+        epi_tile_c: Optional[cute.Tile] = None,  # C staging tile (None: self.epi_tile)
     ):
         add_to_output = const_expr(
             hasattr(epilogue_args, "add_to_output") and epilogue_args.add_to_output
@@ -1151,7 +1454,7 @@ class GemmTmaBase(GemmBase):
                 if varlen_m and self.epilogue_zero_fill_varlen_m(epilogue_args)
                 else mC,
                 self.epi_c_smem_layout_staged,
-                self.epi_tile,
+                epi_tile_c if epi_tile_c is not None else self.epi_tile,
                 op_type="load",
             )
         return (
@@ -1249,18 +1552,21 @@ class GemmTmaBase(GemmBase):
     def make_epi_pipeline(
         self,
         tx_count: int,
+        num_consumer_warps: Optional[int] = None,  # the epilogue warps unless C goes elsewhere
     ):
         epi_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+        if num_consumer_warps is None:
+            num_consumer_warps = self.num_epi_warps
         # Each warp will contribute 1 to the arrive count
-        consumer_arrive_cnt = self.num_epi_warps
-        # One arrive per epilogue warp (elected lane), CTA-local barrier; per_warp bound
+        consumer_arrive_cnt = num_consumer_warps
+        # One arrive per consumer warp (elected lane), CTA-local barrier; per_warp bound
         # to the elect_one_release flag passed to create below.
         elect_one_release = True
         pipeline_checks.check_arrive_count(
             "epi_pipeline.consumer",
             consumer_arrive_cnt,
-            pipeline_checks.async_thread_arrives(self.num_epi_warps, per_warp=elect_one_release),
-            num_epi_warps=self.num_epi_warps,
+            pipeline_checks.async_thread_arrives(num_consumer_warps, per_warp=elect_one_release),
+            num_epi_warps=num_consumer_warps,
         )
         epi_pipeline_consumer_group = pipeline.CooperativeGroup(
             pipeline.Agent.Thread, consumer_arrive_cnt

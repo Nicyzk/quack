@@ -15,6 +15,7 @@ from quack.split_k_reduce import split_k_reduce
 from quack.gemm_config import SplitKMode
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
+from quack.gemm_base import AllGather
 from quack.gemm_default_epi import (
     GemmDefaultEpiMixin,
     GemmDefaultSm80,
@@ -219,6 +220,7 @@ def _compile_gemm(
         b_transposed=b_kn,
         a_mma_dtype=a_mma_dtype,
         b_mma_dtype=b_mma_dtype,
+        comm=AllGather() if has_ag else None,  # the ag bundle's gate is the AllGather operator
     )
 
 

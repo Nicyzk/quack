@@ -35,6 +35,7 @@ manually.
 
 from dataclasses import make_dataclass, MISSING
 
+import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
@@ -193,6 +194,7 @@ class ComposableEpiMixin:
         tile_coord_mnkl,
         varlen_manager,
         tidx,
+        tile_shape_mn=None,
     ):
         """One store context per active TileStore op: ``(op, quant) +
         op.store_setup(...)`` — see gemm_base.epilogue for the full context
@@ -209,6 +211,7 @@ class ComposableEpiMixin:
                 tile_coord_mnkl,
                 varlen_manager,
                 tidx,
+                tile_shape_mn,
             )
             for op in self._epi_store_ops()
         )
@@ -247,6 +250,7 @@ class ComposableEpiMixin:
         epilogue_barrier,
         tidx,
         tRS_rD_layout=None,
+        tile_shape_mn: cutlass.Constexpr = None,
     ):
         ctx = EpiContext(
             self,
@@ -258,6 +262,7 @@ class ComposableEpiMixin:
             epilogue_barrier,
             tidx,
             tRS_rD_layout,
+            tile_shape_mn=tile_shape_mn,
         )
         results = {
             op.name: op.begin(
@@ -321,6 +326,8 @@ class ComposableEpiMixin:
         tile_coord_mnkl,
         varlen_manager,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
+        epilogue_barrier=None,
     ):
         # Two-phase flush: every op stages its stripe first (intra-warp
         # reduce + write to its own disjoint staging smem), then ONE shared
@@ -340,12 +347,13 @@ class ComposableEpiMixin:
                 tiled_copy_t2r,
                 tiled_copy_r2s,
                 tidx,
+                tile_shape_mn,
             )
             if const_expr(staged is not None):
                 pending.append((op, staged))
                 needs_barrier = needs_barrier or staged[0]
         if const_expr(needs_barrier):
-            self.epilogue_barrier.arrive_and_wait()
+            epilogue_barrier.arrive_and_wait()  # the driver's: the running warp group's barrier
         for entry in pending:
             entry[0].end_loop_finish(
                 self,
@@ -353,6 +361,7 @@ class ComposableEpiMixin:
                 entry[1][1],
                 tile_coord_mnkl,
                 varlen_manager,
+                tile_shape_mn,
             )
 
     @cute.jit
@@ -366,6 +375,7 @@ class ComposableEpiMixin:
         tile_coord_mnkl,
         varlen_manager,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
     ):
         for op in self._epi_ops:
             op.end(
@@ -378,4 +388,5 @@ class ComposableEpiMixin:
                 tile_coord_mnkl,
                 varlen_manager,
                 tidx,
+                tile_shape_mn,
             )

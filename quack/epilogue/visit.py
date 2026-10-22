@@ -112,7 +112,7 @@ class _EpiModMixinBase(ComposableEpiMixin):
             ops_by_name[name].fn_sink_flush(self, sink_states[name], tmps[name])
 
     @cute.jit
-    def epi_prepass_end(self, params, epi_tensors):
+    def epi_prepass_end(self, params, epi_tensors, epilogue_barrier):
         # Flush register-accumulated statistics to smem (ops that batch the
         # prepass sweep in registers expose fn_prepass_end), then order every
         # thread's raw partial-plane stores before register resolution and any
@@ -122,7 +122,7 @@ class _EpiModMixinBase(ComposableEpiMixin):
             op = ops_by_name[name]
             if const_expr(hasattr(op, "fn_prepass_end")):
                 op.fn_prepass_end(self, epi_tensors[name])
-        self.epilogue_barrier.arrive_and_wait()
+        epilogue_barrier.arrive_and_wait()
         # Resolve pass (grouped stats under a split-N warp layout): after the
         # barrier publishes every raw partial plane, each consumer warp folds
         # the planes into its own finalized register values. There are no

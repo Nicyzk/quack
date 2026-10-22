@@ -100,6 +100,7 @@ class _SfdRowState(NamedTuple):
     warp_member: Int32  # this warp's index within its exchange group
     sExch: Optional[cute.Tensor]  # (sf slots of the subtile, warp_span, 2) f32 smem
     tDcD: Optional[cute.Tensor]  # partitioned (m, n) coords for smem slot indexing
+    epilogue_barrier: object  # the running warp group's barrier (ctx), for the exchange
 
 
 class _SfdColState(NamedTuple):
@@ -592,6 +593,7 @@ class BlockScaleFactorStore(EpiOp):
             warp_member,
             sExch,
             tDcD,
+            ctx.epilogue_barrier,
         )
 
     @cute.jit
@@ -666,7 +668,7 @@ class BlockScaleFactorStore(EpiOp):
                 slot_div,
                 state.warp_member,
                 state.warp_span,
-                gemm.epilogue_barrier,
+                state.epilogue_barrier,
             )
         return _SfdRowLoopState(
             state.tDrAmax,
@@ -791,6 +793,7 @@ class BlockScaleFactorStore(EpiOp):
         tile_coord_mnkl,
         varlen_manager,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
     ):
         if const_expr(self._col_redux_path(gemm.arch)):
             # Column-direction SF bytes are stored inline per subtile in

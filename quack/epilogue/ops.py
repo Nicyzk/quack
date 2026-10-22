@@ -153,6 +153,9 @@ class EpiContext:
         epilogue_barrier,
         tidx,
         tRS_rD_layout=None,
+        # The tile the epilogue is framed on (None: the CTA tile); callers may run the
+        # epilogue on a sub-tile (split-rank reducer: a (cta_m / world, cta_n) stripe).
+        tile_shape_mn=None,
     ):
         self.epi_tile = epi_tile
         self.tiled_copy_t2r = tiled_copy_t2r
@@ -162,8 +165,10 @@ class EpiContext:
         self.epilogue_barrier = epilogue_barrier
         self.tidx = tidx
         self.tRS_rD_layout = tRS_rD_layout
-        self.tile_M = gemm.cta_tile_shape_mnk[0]
-        self.tile_N = gemm.cta_tile_shape_mnk[1]
+        if tile_shape_mn is None:
+            tile_shape_mn = gemm.cta_tile_shape_mnk[:2]
+        self.tile_M = tile_shape_mn[0]
+        self.tile_N = tile_shape_mn[1]
         self.batch_idx = tile_coord_mnkl[3]
         self.num_epi_threads = gemm.num_epi_warps * cute.arch.WARP_SIZE
         self.partition_for_epilogue_fn = partial(
@@ -296,7 +301,13 @@ class EpiSmemBytes(NamedTuple):
 
 
 class EpiOp:
-    """Base class for composable epilogue operations."""
+    """Base class for composable epilogue operations.
+
+    Tile frame rule: per-tile device hooks take the tile the epilogue is framed on from
+    ``ctx.tile_M/tile_N`` (begin) or ``tile_shape_mn`` (end_loop/end/store_setup/
+    load_g2s_copy_fn), never from ``gemm.cta_tile_shape_mnk``: callers may run the
+    epilogue on a sub-tile. Host-side sizing (smem_bytes) stays on the CTA tile.
+    """
 
     # --- Value-port protocol (quack.epilogue.frontend fn frontend). fn_port is
     # THE declaration of how an op joins the fn's per-element dataflow (the
@@ -450,6 +461,7 @@ class EpiOp:
         tile_coord_mnkl,
         varlen_manager,
         epi_pipeline,
+        tile_shape_mn=None,
     ):
         """Return a per-subtile gmem->smem copy function, or None."""
         return None
@@ -479,6 +491,7 @@ class EpiOp:
         tiled_copy_t2r,
         tiled_copy_r2s,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
     ):
         """Per-subtile flush, phase 1: intra-warp reduce + smem staging.
 
@@ -487,10 +500,19 @@ class EpiOp:
         issues ONE shared epilogue barrier per subtile covering every op
         that staged — a multi-sink epilogue syncs once per flush, not once
         per sink (each sink stages into its own disjoint smem) — then calls
-        ``end_loop_finish(finish_state)``."""
+        ``end_loop_finish(finish_state)``. ``tile_shape_mn`` is the epilogue's
+        frame (None: the CTA tile)."""
         return None
 
-    def end_loop_finish(self, gemm, param, staged, tile_coord_mnkl, varlen_manager):
+    def end_loop_finish(
+        self,
+        gemm,
+        param,
+        staged,
+        tile_coord_mnkl,
+        varlen_manager,
+        tile_shape_mn: cutlass.Constexpr = None,
+    ):
         """Per-subtile flush, phase 2 (after the driver's shared barrier):
         merge the smem-staged partials + write gmem."""
         pass
@@ -510,6 +532,7 @@ class EpiOp:
         tile_coord_mnkl,
         varlen_manager,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
     ):
         """Cleanup after all subtiles (reductions, direct writes)."""
         pass
@@ -1073,18 +1096,20 @@ class TileStore(EpiOp):
         tile_coord_mnkl,
         varlen_manager,
         tidx,
+        tile_shape_mn=None,
     ):
-        """Per-CTA-tile setup. Returns the tail of the driver's store context
+        """Per-tile setup. Returns the tail of the driver's store context
         ``(tiled_copy_r2s, tRS_sAux, copy_fn, store_pred)`` where store_pred
         is None (always store) or a per-tile Boolean (the mixin prepends the
-        op itself and its quantize codec — see gemm_base.epilogue)."""
+        op itself and its quantize codec — see gemm_base.epilogue).
+        ``tile_shape_mn`` is the epilogue's frame (None: the CTA tile)."""
         tiled_copy_aux_r2s = self._make_tiled_copy_r2s(gemm, params, tiled_copy_r2s, tiled_copy_t2r)
         tRS_sAux = tiled_copy_aux_r2s.get_slice(tidx).partition_D(smem_tensor)
         batch_idx = tile_coord_mnkl[3]
-        if self.gated:
-            tile_shape_mn = (gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[1] // 2)
-        else:
+        if tile_shape_mn is None:
             tile_shape_mn = gemm.cta_tile_shape_mnk[:2]
+        if self.gated:
+            tile_shape_mn = (tile_shape_mn[0], tile_shape_mn[1] // 2)
         copy_aux, _, _ = gemm.epilog_gmem_copy_and_partition(
             getattr(params, self._tma_atom_key()),
             varlen_manager.offset_batch_epi(getattr(params, self.name), batch_idx),
@@ -1311,13 +1336,14 @@ class TileLoad(EpiOp):
         tile_coord_mnkl,
         varlen_manager,
         epi_pipeline,
+        tile_shape_mn=None,
     ):
         tensor = getattr(params, self.name)
         batch_idx = tile_coord_mnkl[3]
         copy_tile_fn, _, _ = gemm.epilog_gmem_copy_and_partition(
             getattr(params, self._tma_atom_key()),
             varlen_manager.offset_batch_epi(tensor, batch_idx),
-            gemm.cta_tile_shape_mnk[:2],
+            tile_shape_mn if tile_shape_mn is not None else gemm.cta_tile_shape_mnk[:2],
             getattr(params, self._epi_tile_key()),
             smem_tensor,
             tile_coord_mnkl,
@@ -1711,14 +1737,16 @@ class ColVecReduce(VecReduce):
         tiled_copy_t2r,
         tiled_copy_r2s,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
     ):
         """Stage the current M stripe (intra-warp reduce + smem write) when
         its last N subtile has accumulated; merge/gmem-write run in
         end_loop_finish after the driver's shared barrier."""
         staged = None
-        epi_tile_shape = cute.zipped_divide(
-            cute.make_layout(gemm.cta_tile_shape_mnk[:2]), epi_tile
-        ).shape[1]
+        frame_mn = const_expr(
+            tile_shape_mn if tile_shape_mn is not None else gemm.cta_tile_shape_mnk[:2]
+        )
+        epi_tile_shape = cute.zipped_divide(cute.make_layout(frame_mn), epi_tile).shape[1]
         if const_expr(epi_coord[1] == epi_tile_shape[1] - 1):
             vals_cur = self._end_loop_values(state, epi_coord)
             sExch = self._end_loop_smem(state)
@@ -1736,7 +1764,7 @@ class ColVecReduce(VecReduce):
                 tidx=tidx,
                 reference_src=reference_src,
             )
-            tile_M, tile_N = gemm.cta_tile_shape_mnk[:2]
+            tile_M, tile_N = frame_mn
             tDcD = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
             tDcD_cur = tDcD[None, None, None, epi_coord[0], epi_coord[1]]
             ref_layout = vals_cur[0].layout
@@ -1815,7 +1843,15 @@ class ColVecReduce(VecReduce):
         return staged
 
     @cute.jit
-    def end_loop_finish(self, gemm, param, staged, tile_coord_mnkl, varlen_manager):
+    def end_loop_finish(
+        self,
+        gemm,
+        param,
+        staged,
+        tile_coord_mnkl,
+        varlen_manager,
+        tile_shape_mn: cutlass.Constexpr = None,
+    ):
         """Inter-warp merge from smem + gmem write for a stripe staged by
         end_loop_stage (runs after the driver's shared barrier). Under swap
         shuffle each lane merges/writes only its OWNED slice."""
@@ -1848,8 +1884,10 @@ class ColVecReduce(VecReduce):
                             for k in cutlass.range_constexpr(num_vals):
                                 vals_m[k][m] = merged[k]
 
-        # Write to gmem
-        tile_M = gemm.cta_tile_shape_mnk[0]
+        # Write to gmem (limits in the epilogue frame)
+        tile_M = const_expr(
+            tile_shape_mn if tile_shape_mn is not None else gemm.cta_tile_shape_mnk[:2]
+        )[0]
         batch_idx = tile_coord_mnkl[3]
         limit_m = min(varlen_manager.len_m(batch_idx) - tile_coord_mnkl[0] * tile_M, tile_M)
         limit_n_tiles = param.shape[2] if not varlen_manager.varlen_m else param.shape[1]
@@ -1924,14 +1962,16 @@ class RowVecReduce(VecReduce):
         tiled_copy_t2r,
         tiled_copy_r2s,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
     ):
         """Stage the current N stripe (intra-warp reduce + smem write) when
         its last M subtile has accumulated; merge/gmem-write run in
         end_loop_finish after the driver's shared barrier."""
         staged = None
-        epi_tile_shape = cute.zipped_divide(
-            cute.make_layout(gemm.cta_tile_shape_mnk[:2]), epi_tile
-        ).shape[1]
+        frame_mn = const_expr(
+            tile_shape_mn if tile_shape_mn is not None else gemm.cta_tile_shape_mnk[:2]
+        )
+        epi_tile_shape = cute.zipped_divide(cute.make_layout(frame_mn), epi_tile).shape[1]
         if const_expr(epi_coord[0] == epi_tile_shape[0] - 1):
             tDrReduce, sDrReduce = state[0], state[1]
             tDrReduce_cur = tDrReduce[None, None, None, epi_coord[0], epi_coord[1]]
@@ -1965,7 +2005,7 @@ class RowVecReduce(VecReduce):
                 tidx=tidx,
                 reference_src=tiled_copy_t2r is None,
             )
-            tile_M, tile_N = gemm.cta_tile_shape_mnk[:2]
+            tile_M, tile_N = frame_mn
             tDcD = partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))
             tDcD_cur = tDcD[None, None, None, epi_coord[0], epi_coord[1]]
             tDcD_n = layout_utils.convert_layout_zero_stride(tDcD_cur, tDrReduce_cur.layout)[
@@ -2048,7 +2088,15 @@ class RowVecReduce(VecReduce):
         return staged
 
     @cute.jit
-    def end_loop_finish(self, gemm, param, staged, tile_coord_mnkl, varlen_manager):
+    def end_loop_finish(
+        self,
+        gemm,
+        param,
+        staged,
+        tile_coord_mnkl,
+        varlen_manager,
+        tile_shape_mn: cutlass.Constexpr = None,
+    ):
         """Inter-warp merge from smem + gmem write for a stripe staged by
         end_loop_stage (runs after the driver's shared barrier)."""
         tDrReduce_n, tDcD_n, sDrReduce = staged[0], staged[1], staged[2]
@@ -2081,8 +2129,10 @@ class RowVecReduce(VecReduce):
                                 self.combine,
                             )
 
-        # Write to gmem
-        tile_N = gemm.cta_tile_shape_mnk[1]
+        # Write to gmem (limits in the epilogue frame)
+        tile_N = const_expr(
+            tile_shape_mn if tile_shape_mn is not None else gemm.cta_tile_shape_mnk[:2]
+        )[1]
         batch_idx = tile_coord_mnkl[3]
         if const_expr(not varlen_manager.varlen_m):
             limit_m_tiles = param.shape[1]
@@ -2567,6 +2617,7 @@ class GroupedColStatsOut(EpiOp):
         tiled_copy_t2r,
         tiled_copy_r2s,
         tidx,
+        tile_shape_mn: cutlass.Constexpr = None,
     ):
         """First main-phase subtile: stage this op for the finish phase. No
         barrier request — the sibling's prepass barrier already ordered the
@@ -2576,7 +2627,15 @@ class GroupedColStatsOut(EpiOp):
         return None
 
     @cute.jit
-    def end_loop_finish(self, gemm, param, staged, tile_coord_mnkl, varlen_manager):
+    def end_loop_finish(
+        self,
+        gemm,
+        param,
+        staged,
+        tile_coord_mnkl,
+        varlen_manager,
+        tile_shape_mn: cutlass.Constexpr = None,
+    ):
         """Elect one writer per (row, group), fold the sibling's raw warp_n
         planes, finalize, and write directly to gmem. The value port uses
         rStats and never reads stats smem in the main pass."""
