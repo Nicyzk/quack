@@ -724,9 +724,9 @@ class GemmSm100(GemmTmaBase):
                 mSFA = layout_utils.expand(mSFA, 0, 1)
             if const_expr(cute.rank(mSFB) == 5):
                 mSFB = layout_utils.expand(mSFB, 0, 1)
-        # split-rank: C is the comm warps' (read per subtile from gmem); the GEMM stages no C
+        # the comm warps run the epilogue and read C themselves (per subtile, from gmem): the GEMM stages no C
         mC_comm = None
-        if const_expr(self.comm.split_rank):
+        if const_expr(self.comm.finalizes_epilogue):
             mC_comm, mC = mC, None
         # Tensors arrive batch-first: rotate (l, x, y) -> (x, y, l) at trace time.
         # Dense rank-2 operands get a trivial batch mode appended instead.
@@ -991,9 +991,9 @@ class GemmSm100(GemmTmaBase):
             tma_atom_c,
             tma_tensor_c,
         ) = self.make_tma_epilogue_atoms_and_tensors(mD, mC, epilogue_args, varlen_m)
-        if const_expr(self.comm.split_rank):
+        if const_expr(self.comm.finalizes_epilogue):
             assert not any(op.is_tile_load() for op in getattr(self, "_epi_ops", ())), (
-                "split-rank comm: TileLoad epilogue inputs are not staged for the comm warps"
+                "finalizes_epilogue: TileLoad epilogue inputs are not staged for the comm warps"
             )
 
         epilogue_params = self.epi_to_underlying_arguments(epilogue_args)
@@ -2050,23 +2050,7 @@ class GemmSm100(GemmTmaBase):
                     tidx=epi_tidx,
                     is_tma_warp=is_tma_warp,
                 )
-                # split-rank comm: the finalize action is this rank's raw partial into D, the comm warps reduce
-                partial_commit = None
-                if const_expr(self.comm.split_rank):
-                    partial_commit = partial(
-                        self.split_rank_partial_commit,
-                        tRS_rD=tRS_rD,
-                        epi_tile=epi_tile,
-                        tiled_copy_r2s=tiled_copy_r2s,
-                        tRS_sD=tRS_sD,
-                        copy_D=copy_D,
-                        epi_store_pipeline=epi_store_pipeline,
-                        epi_read_state=epi_read_state,
-                        epi_producer_state=None,
-                        epilogue_barrier=self.epilogue_barrier,
-                        is_tma_warp=is_tma_warp,
-                    )
-                epi_read_state, _ = self.epilogue_split_rank(
+                epi_read_state, _ = self.epilogue_split_k(
                     epilogue_params,
                     epi_fn,
                     load_acc_subtile,
@@ -2079,7 +2063,6 @@ class GemmSm100(GemmTmaBase):
                     self.epilogue_barrier,
                     epi_tidx,
                     is_tma_warp,
-                    partial_commit=partial_commit,
                 )
                 # acc_pipeline.consumer_release was already called in self.epi_load_acc_subtile
                 acc_consumer_state.advance()

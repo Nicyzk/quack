@@ -588,9 +588,9 @@ class GemmSm90(GemmTmaBase):
             assert mAuxA is not None, "the transform's aux operand needs mA.sf"
         elif const_expr(self.transform_a is not None and self.transform_a.aux_raw):
             assert mAuxA is not None, "the transform's raw aux operand (e.g. seed) needs mA.sf"
-        # split-rank: C is the comm warps' (read per subtile from gmem); the GEMM stages no C
+        # the comm warps run the epilogue and read C themselves (per subtile, from gmem): the GEMM stages no C
         mC_comm = None
-        if const_expr(self.comm.split_rank):
+        if const_expr(self.comm.finalizes_epilogue):
             mC_comm, mC = mC, None
         if const_expr(not a_owned):
             # Tensors arrive batch-first: rotate (l, x, y) -> (x, y, l) at trace time.
@@ -777,9 +777,9 @@ class GemmSm90(GemmTmaBase):
             tma_atom_c,
             tma_tensor_c,
         ) = self.make_tma_epilogue_atoms_and_tensors(mD, mC, epilogue_args, varlen_m)
-        if const_expr(self.comm.split_rank):
+        if const_expr(self.comm.finalizes_epilogue):
             assert not any(op.is_tile_load() for op in getattr(self, "_epi_ops", ())), (
-                "split-rank comm: TileLoad epilogue inputs are not staged for the comm warps"
+                "finalizes_epilogue: TileLoad epilogue inputs are not staged for the comm warps"
             )
 
         epilogue_params = self.epi_to_underlying_arguments(epilogue_args)
@@ -1468,23 +1468,7 @@ class GemmSm90(GemmTmaBase):
                     tidx=tidx,
                     is_tma_warp=is_tma_warp,
                 )
-                # split-rank comm: the finalize action is this rank's raw partial into D, the comm warps reduce
-                partial_commit = None
-                if const_expr(self.comm.split_rank):
-                    partial_commit = partial(
-                        self.split_rank_partial_commit,
-                        tRS_rD=tRS_rD,
-                        epi_tile=self.epi_tile,
-                        tiled_copy_r2s=tiled_copy_r2s,
-                        tRS_sD=tRS_sD,
-                        copy_D=copy_D,
-                        epi_store_pipeline=epi_store_pipeline,
-                        epi_read_state=epi_read_state,
-                        epi_producer_state=epi_producer_state,
-                        epilogue_barrier=self.epilogue_barrier,
-                        is_tma_warp=is_tma_warp,
-                    )
-                epi_read_state, epi_producer_state = self.epilogue_split_rank(
+                epi_read_state, epi_producer_state = self.epilogue_split_k(
                     epilogue_params,
                     epi_fn,
                     load_acc_subtile,
@@ -1497,7 +1481,6 @@ class GemmSm90(GemmTmaBase):
                     self.epilogue_barrier,
                     tidx,
                     is_tma_warp,
-                    partial_commit=partial_commit,
                 )
                 # the tile's epilogue is issued: the comm publishes it
                 self.comm.signal_tile(

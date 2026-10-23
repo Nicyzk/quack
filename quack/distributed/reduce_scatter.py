@@ -1,6 +1,6 @@
-# GEMM + reduce-scatter as the GEMM's comm object, through gemm_base's split-rank protocol: ranks are
-# one more split of K with spatial roles. Every rank's epilogue warps store their raw K-partial of each
-# tile into their symmetric D (the d_dtype wire, gemm_base.split_rank_partial_commit) and release-add
+# GEMM + reduce-scatter as the GEMM's comm object (finalizes_epilogue: the GEMM's epilogue warps store raw
+# partials, this operator's comm warps reduce them and run the epilogue). Every rank's epilogue warps store
+# their raw K-partial of each tile into their symmetric D (the d_dtype wire, epilogue(partial_only)) and release-add
 # the flag of the rank whose M slab owns the tile. The comm warps step this CTA's static schedule: at
 # tile row pid_m = (stripe, pos) they reduce stripe `stripe` of owned tile `pos` (the cutlass RS remap:
 # the world's CTAs at one position share one owned tile, equal work, no slab walk), wait for the tile's
@@ -167,7 +167,7 @@ class ReduceScatter(Comm):
 
     num_warps = COMM_WARPS
     regs = None  # 12 warps at 168 each, as intra-sm ran it; a split must fit the released pool
-    split_rank = True
+    finalizes_epilogue = True
     broadcast = False  # AllReduce: commit by multimem st into every rank's (m, n) out
 
     def __init__(self, rank: int, world: int):
@@ -204,10 +204,11 @@ class ReduceScatter(Comm):
 
     @cute.jit
     def signal_tile(self, gemm, ctx, tile_coord_mnkl, epi_store_pipeline, is_tma_warp, tidx: Int32):
-        """The partial's TMA stores drained in split_rank_partial_commit: one release add on the tile's
-        flag, in every rank's copy (AR: every rank reduces a stripe of it) or the owner's (RS)."""
+        """Drain the partial's TMA stores, then one release add on the tile's flag, in every rank's copy
+        (AR: every rank reduces a stripe of it) or the owner's (RS)."""
         comm_args = ctx.args
         if is_tma_warp:
+            epi_store_pipeline.producer_tail()
             flags = comm_args.flags
             idx = cute.crd2idx((tile_coord_mnkl[0], tile_coord_mnkl[1]), flags.layout)
             with cute.arch.elect_one():

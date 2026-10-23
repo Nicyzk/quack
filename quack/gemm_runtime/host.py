@@ -184,7 +184,7 @@ def _compile_gemm_epi(
             b_mma_dtype=b_mma_dtype,
         )
         if comm is not None:
-            # the comm's D is its wire with its own M extent (a split-rank wire may stack mirrors
+            # the comm's D is its wire with its own M extent (a Lamport wire stacks mirrors
             # along M): untie it from A's M in the compiled signature
             mD = fake_batched(
                 d_dtype,

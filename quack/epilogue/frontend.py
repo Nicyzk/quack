@@ -207,10 +207,12 @@ def _resolve_comm(comm, comm_args, D):
     """comm= is the host runner (CommRunner: it supplies the wire as D, its per-launch bundle and the
     kernel-side operator, and runs before_launch once) or the kernel-side Comm with explicit D / comm_args."""
     if isinstance(comm, CommRunner):
-        if comm_args is not None or D is not None:
-            raise ValueError("a CommRunner supplies D (its wire) and comm_args itself")
+        if comm_args is not None or (D is not None and comm.wire is not None):
+            raise ValueError(
+                "a CommRunner supplies comm_args (and D, when it owns the wire) itself"
+            )
         comm.before_launch()
-        return comm.comm, comm.args(), comm.wire
+        return comm.comm, comm.args(), comm.wire if comm.wire is not None else D
     return comm, comm_args, D
 
 
@@ -1427,10 +1429,11 @@ class EpiMod:
                 raise ValueError('add_to_output requires the accumulator as out={"D": buf}')
         runner = comm if isinstance(comm, CommRunner) else None
         if runner is not None:
-            if out is not None and out.get("D") is not None:
+            if out is not None and out.get("D") is not None and runner.wire is not None:
                 raise ValueError("a CommRunner's D is its wire: do not pass out={'D': ...}")
             comm, comm_args, wire = _resolve_comm(comm, comm_args, None)
-            out = {**(out or {}), "D": wire}
+            if wire is not None:
+                out = {**(out or {}), "D": wire}
 
         if torch.compiler.is_compiling():
             if dynamic_scheduler or epi_key_overrides is not None or comm is not None:
@@ -1542,7 +1545,7 @@ class EpiMod:
                 result = dict(outs) if store_d else {kk: v for kk, v in outs.items() if kk != "D"}
                 for name, buf in sink_bufs.items():
                     result[name] = self._finalize_sink(name, buf, cu_seqlens_m, plan)
-                if runner is not None:
+                if runner is not None and runner.out is not None:
                     result["D"] = runner.out  # the operator's result, not its wire
                 return result
 
@@ -1677,7 +1680,7 @@ class EpiMod:
         result = dict(out) if store_d else {k: v for k, v in out.items() if k != "D"}
         for name, buf in sink_bufs.items():
             result[name] = self._finalize_sink(name, buf, cu_seqlens_m, plan_used)
-        if runner is not None:
+        if runner is not None and runner.out is not None:
             result["D"] = runner.out  # the operator's result, not its wire
         return result
 

@@ -1,7 +1,7 @@
 # GEMM + all-reduce, one-shot (cutlass Lamport), as the GEMM's comm object: no flags, the data is the flag.
 # D is the multicast view of 3 slots x world mirrors of (m, n), stacked along M; slot k = launch counter % 3.
 # Every rank's epilogue warps store their -0.0-scrubbed raw partial of each tile into slot k's mirror `rank`
-# (one TMA multicast store lands on every rank, gemm_base.split_rank_partial_commit through this operator's
+# (one TMA multicast store lands on every rank, the GEMM's partial-only epilogue through this operator's
 # store_coord / store_fixup), then re-arm last call's slot (k - 1) over that tile in every local mirror:
 # peers write that slot again only in call i + 2, after this rank's call i + 1 data, so nothing orders the
 # re-arm. The comm warps poll their local slot-k mirrors per 16 B atom until no word is the sentinel, sum in
@@ -159,7 +159,7 @@ class AllReduceLamport(Comm):
 
     num_warps = COMM_WARPS
     regs = None
-    split_rank = True
+    finalizes_epilogue = True
 
     def __init__(self, rank: int, world: int):
         self.rank, self.world = rank, world
