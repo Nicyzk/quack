@@ -560,10 +560,6 @@ class GemmSm100(GemmTmaBase):
             ):
                 self.epi_tile = (self.epi_tile[0], cute.make_layout(sfd_min_n))
 
-        # split-rank: C is staged per the comm warps' epilogue subtile, not per epi_tile
-        self.comm_frame = self.comm.epi_frame(self) if self.comm.split_rank else None
-        self.epi_tile_c = self.epi_tile if self.comm_frame is None else self.comm_frame.subtile
-
         # Setup A/B/C stage count in shared memory and ACC stage count in tensor memory
         prefetch_A_idx = (
             None
@@ -633,12 +629,8 @@ class GemmSm100(GemmTmaBase):
             )
         self.epi_c_smem_layout_staged = None
         if const_expr(self.c_dtype is not None):
-            tile_elems = lambda tile: math.prod(cute.size(mode) for mode in tile)
-            assert tile_elems(self.epi_tile_c) <= tile_elems(self.epi_tile), (
-                "C stages are budgeted at epi_tile"
-            )
             self.epi_c_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-                self.c_dtype, self.c_layout, self.epi_tile_c, self.epi_c_stage
+                self.c_dtype, self.c_layout, self.epi_tile, self.epi_c_stage
             )
         if const_expr(self.blockscaled):
             self.sfa_smem_layout_staged = blockscaled_utils.make_smem_layout_sfa(
@@ -732,6 +724,10 @@ class GemmSm100(GemmTmaBase):
                 mSFA = layout_utils.expand(mSFA, 0, 1)
             if const_expr(cute.rank(mSFB) == 5):
                 mSFB = layout_utils.expand(mSFB, 0, 1)
+        # split-rank: C is the comm warps' (read per subtile from gmem); the GEMM stages no C
+        mC_comm = None
+        if const_expr(self.comm.split_rank):
+            mC_comm, mC = mC, None
         # Tensors arrive batch-first: rotate (l, x, y) -> (x, y, l) at trace time.
         # Dense rank-2 operands get a trivial batch mode appended instead.
         mA, mB, mD, mC, epilogue_args = self.rotate_batch_last(
@@ -994,9 +990,7 @@ class GemmSm100(GemmTmaBase):
             tma_tensor_d,
             tma_atom_c,
             tma_tensor_c,
-        ) = self.make_tma_epilogue_atoms_and_tensors(
-            mD, mC, epilogue_args, varlen_m, epi_tile_c=self.epi_tile_c
-        )
+        ) = self.make_tma_epilogue_atoms_and_tensors(mD, mC, epilogue_args, varlen_m)
         if const_expr(self.comm.split_rank):
             assert not any(op.is_tile_load() for op in getattr(self, "_epi_ops", ())), (
                 "split-rank comm: TileLoad epilogue inputs are not staged for the comm warps"
@@ -1130,6 +1124,7 @@ class GemmSm100(GemmTmaBase):
             tile_sched_params,
             TileSchedulerCls,
             comm_args,
+            mC_comm,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1171,6 +1166,7 @@ class GemmSm100(GemmTmaBase):
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
         comm_args,
+        mC_comm: Optional[cute.Tensor],
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -1223,19 +1219,12 @@ class GemmSm100(GemmTmaBase):
         )
         epi_pipeline = None
         if const_expr(has_epi_load):
-            # split-rank: the comm warps consume C
-            epi_pipeline = self.make_epi_pipeline(
-                tx_count=self.epi_load_bytes_per_stage,
-                num_consumer_warps=self.num_comm_warps if self.comm.split_rank else None,
-            )
+            epi_pipeline = self.make_epi_pipeline(tx_count=self.epi_load_bytes_per_stage)
         acc_pipeline = self.make_acc_pipeline(cluster_layout_vmnk=cluster_layout_vmnk)
         sched_pipeline = None
         sched_data = None
         if const_expr(self.is_persistent):
-            # split-rank: the epi-load warp steps locally with the comm warps, not a sched consumer
-            sched_pipeline = self.make_sched_pipeline(
-                self.cluster_shape_mnk, has_C=has_epi_load and not self.comm.split_rank
-            )
+            sched_pipeline = self.make_sched_pipeline(self.cluster_shape_mnk, has_C=has_epi_load)
             sched_data = storage.sched_data.get_tensor(cute.make_layout((4, self.sched_stage)))
         a_prefetch_pipeline = None
         if const_expr(self.gather_A):
@@ -1335,8 +1324,7 @@ class GemmSm100(GemmTmaBase):
             epilogue_params,
             epi_smem_tensors,
             varlen_manager,
-            epi_pipeline,
-            sC,
+            mC_comm,
         )
 
         # Cluster wait before tensor memory alloc
@@ -1686,11 +1674,6 @@ class GemmSm100(GemmTmaBase):
                     pipeline.PipelineUserType.Producer, self.epi_c_stage
                 )
                 do_epi_load_barrier_wait = Boolean(True)
-                # split-rank: C goes to the comm warps' epilogue, per its subtile, at the frame
-                # coordinate of the tile they reduce; this warp steps the schedule locally like them
-                epi_load_frame, epi_load_tile = self.cta_tile_shape_mnk[:2], epi_tile
-                if const_expr(self.comm.split_rank):
-                    epi_load_frame, epi_load_tile = self.comm_frame.tile_mn, self.comm_frame.subtile
                 # Persistent tile scheduling loop
                 tile_scheduler = TileSchedulerCls()
                 work_tile = tile_scheduler.initial_work_tile_info()
@@ -1699,20 +1682,15 @@ class GemmSm100(GemmTmaBase):
                     # (pid_m, pid_n, split_idx | None, batch_idx), decoded by the scheduler
                     tile_coord_mnkl = work_tile.tile_idx
                     batch_idx, split_idx = tile_coord_mnkl[3], tile_coord_mnkl[2]
-                    epi_load_coord = tile_coord_mnkl
-                    if const_expr(self.comm.split_rank):
-                        epi_load_coord = self.comm.epi_load_coord(
-                            self, tile_coord_mnkl, varlen_manager
-                        )
                     copy_C = None
                     if const_expr(has_C):
                         copy_C_fn, _, _ = self.epilog_gmem_copy_and_partition(
                             tma_atom_c,
                             varlen_manager.offset_batch_epi(mC_mnl, batch_idx),
-                            epi_load_frame,
-                            epi_load_tile,
+                            self.cta_tile_shape_mnk[:2],
+                            epi_tile,
                             sC,
-                            epi_load_coord,
+                            tile_coord_mnkl,
                         )
                         copy_C = copy_utils.tma_producer_copy_fn(copy_C_fn, epi_pipeline)
                     tile_load_copy_fns = self.epi_tile_load_g2s_copy_fns(
@@ -1729,7 +1707,7 @@ class GemmSm100(GemmTmaBase):
                         epi_load_barrier.arrive_and_wait()
                         do_epi_load_barrier_wait = Boolean(False)
                     epi_tile_shape = cute.zipped_divide(
-                        cute.make_layout(epi_load_frame), epi_load_tile
+                        cute.make_layout(self.cta_tile_shape_mnk[:2]), epi_tile
                     ).shape[1]
                     epi_tile_num = const_expr(cute.size(epi_tile_shape))
                     # Hier subtile coords, ordered exactly as the epilogue store
@@ -1759,14 +1737,8 @@ class GemmSm100(GemmTmaBase):
                             epi_pipeline.producer_commit(epi_producer_state)
                             epi_producer_state.advance()
                     # Advance to next tile
-                    if const_expr(self.comm.split_rank):
-                        tile_scheduler._current_work_idx = tile_scheduler._fetch_next_work_idx()
-                        work_tile = tile_scheduler._delinearize_work_idx(
-                            tile_scheduler._current_work_idx
-                        )
-                    else:
-                        tile_scheduler.advance_to_next_work()
-                        work_tile = tile_scheduler.get_current_work()
+                    tile_scheduler.advance_to_next_work()
+                    work_tile = tile_scheduler.get_current_work()
                     # End of persistent scheduler loop
                 epi_pipeline.producer_tail(epi_producer_state)
 
@@ -1955,8 +1927,7 @@ class GemmSm100(GemmTmaBase):
             )
             tRS_rC, tSR_rC, tSR_sC = None, None, None
             tiled_copy_s2r = None
-            # split-rank: C belongs to the comm warps, applied after the reduce
-            if const_expr(mC_mnl is not None and not self.comm.split_rank):
+            if const_expr(mC_mnl is not None):
                 tiled_copy_s2r, tRS_rC, tSR_rC, tSR_sC = self.epilog_smem_load_and_partition(
                     tiled_copy_t2r, self.c_layout, self.c_dtype, sC, tRS_rD.layout, epi_tidx
                 )

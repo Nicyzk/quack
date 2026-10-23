@@ -15,13 +15,18 @@ from typing import NamedTuple
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.pipeline as pipeline
 from cutlass import Int32, const_expr
 from cutlass.cutlass_dsl import any_, while_generate, yield_out
 from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import mlir_namedtuple
 from quack.distributed.ptx import ld_relaxed_gpu_global_4xu32, st_weak_global_4xu32
-from quack.distributed.reduce_scatter import COMM_WARPS, SUBTILE_ATOMS, _symm, commit_subtile_local
+from quack.distributed.reduce_scatter import (
+    COMM_WARPS,
+    SUBTILE_ATOMS,
+    _symm,
+    commit_subtile_local,
+    load_subtile,
+)
 from quack.gemm_base import Comm, CommRunner, EpiFrame
 
 SLOTS = 3
@@ -214,8 +219,7 @@ class AllReduceLamport(Comm):
         # bound methods and ctx fields cross into the loop as locals; the objects cannot
         epilogue, comm_barrier = gemm.epilogue, gemm.comm_barrier
         comm_args, TileSchedulerCls, varlen_manager = ctx.args, ctx.TileSchedulerCls, ctx.varlen
-        epilogue_params, epi_smem_tensors = ctx.epi_params, ctx.epi_smem_tensors
-        epi_pipeline, sC = ctx.epi_pipeline, ctx.sC
+        epilogue_params, epi_smem_tensors, mC = ctx.epi_params, ctx.epi_smem_tensors, ctx.mC
         cta_m, cta_n = gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[1]
         slots, out = comm_args.slots, comm_args.out
         thr_shape, val_shape, chunk = _frame(
@@ -229,15 +233,11 @@ class AllReduceLamport(Comm):
         _atom, _, loop_n = thr_copy.partition_S(cute.make_identity_tensor((cta_m, cta_n))).shape
         epi_tile = (chunk * thr_shape[0], cta_n)  # the epilogue's subtile on the tile
         tRS_rD = cute.make_rmem_tensor((_atom, chunk, loop_n), gemm.acc_dtype)
-        # C: staged by the epi-load warp per subtile through the GEMM's C pipeline, same thread copy
-        tRS_rC, tSR_rC, tSR_sC = None, None, None
-        if const_expr(sC is not None):
-            tRS_rC = cute.make_rmem_tensor((_atom, chunk, loop_n), gemm.c_dtype)
-            tSR_rC = tiled_copy.retile(tRS_rC)
-            tSR_sC = thr_copy.partition_S(sC)
-        epi_read_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Consumer, gemm.epi_c_stage
-        )
+        # C: read per subtile straight from gmem, the same thread copy as the mirrors
+        tRS_rC, gC = None, None
+        if const_expr(mC is not None):
+            tRS_rC = cute.make_rmem_tensor((_atom, chunk, loop_n), mC.element_type)
+            gC = cute.local_tile(mC, (cta_m, cta_n), (None, None))
         is_tma_warp = warp_idx == gemm.comm_warp_ids[0]
         tiles_m = out.shape[0] // cta_m
         k = _slot(comm_args.slot)
@@ -251,12 +251,15 @@ class AllReduceLamport(Comm):
                 thr_copy.partition_S(gSlots[None, None, (k * world + r) * tiles_m + pid_m, pid_n])
                 for r in range(world)
             )
-            epi_read_state, _ = epilogue(
+            load_C = None
+            if const_expr(mC is not None):
+                load_C = partial(load_subtile, thr_copy.partition_S(gC[None, None, pid_m, pid_n]))
+            epilogue(
                 epilogue_params,
                 epi_smem_tensors,
-                epi_pipeline,
+                None,  # epi_pipeline: C is read directly
                 None,  # epi_store_pipeline
-                epi_read_state,
+                None,  # epi_read_state
                 None,  # epi_producer_state
                 epi_tile,
                 partial(lamport_reduce_subtile, mirrors),
@@ -265,9 +268,9 @@ class AllReduceLamport(Comm):
                 tiled_copy_t2r=None,
                 tiled_copy_r2s=tiled_copy,
                 tRS_sD=None,
-                tiled_copy_s2r=tiled_copy,
-                tSR_rC=tSR_rC,
-                tSR_sC=tSR_sC,
+                tiled_copy_s2r=None,
+                tSR_rC=None,
+                tSR_sC=None,
                 copy_D=None,
                 copy_C=None,
                 tile_coord_mnkl=(pid_m, pid_n, Int32(0), Int32(0)),
@@ -279,6 +282,7 @@ class AllReduceLamport(Comm):
                 commit_D=partial(
                     commit_subtile_local, thr_copy.partition_S(gOut[None, None, pid_m, pid_n])
                 ),
+                load_C=load_C,
                 tile_shape_mn=(cta_m, cta_n),
             )
             tile_sched._current_work_idx = tile_sched._fetch_next_work_idx()
