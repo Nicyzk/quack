@@ -12,7 +12,10 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.utils import TensorMapManager, TensorMapUpdateMode
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from quack.umma_dynamic import instr_desc_f16, smem_desc_sw128_k, tcgen05_fence_after_thread_sync, umma_f16_2sm
+from quack.umma_dynamic import (
+    instr_desc_f16, instr_desc_mxf4nvf4, instr_desc_mxf8f6f4, smem_desc_sw128_k, tcgen05_fence_after_thread_sync,
+    umma_f16_2sm, umma_mxf4nvf4_2sm, umma_mxf8f6f4_2sm,
+)
 import cutlass.pipeline as pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -24,8 +27,6 @@ from cutlass.cute.nvgpu.warp import (
     StMatrix16x8x8bOp,
 )
 from cutlass import Int32, Int64, Float32, Boolean, const_expr
-from cutlass.cutlass_dsl import dsl_user_op
-from cutlass._mlir.dialects import llvm
 from cutlass.utils import LayoutEnum
 from cutlass.cute.experimental import iket
 
@@ -46,19 +47,9 @@ from quack.tile_scheduler import (
     combine_signal_m_cluster,
     dispatch_wait_m_cluster,
 )
-from quack.gemm_sm100_ep_inter import CombinePush, push_rows, stage_bytes
-
-
-@dsl_user_op
-def st_global_v4(dst, v0, v1, v2, v3, *, loc=None, ip=None):
-    """One lane stores four b32 registers (16 B) to a (peer) gmem address, nothing waited on."""
-    llvm.inline_asm(
-        None,
-        [Int64(dst).ir_value(), Int32(v0).ir_value(), Int32(v1).ir_value(), Int32(v2).ir_value(), Int32(v3).ir_value()],
-        "st.global.v4.b32 [$0], {$1, $2, $3, $4};",
-        "l,r,r,r,r", has_side_effects=True, is_align_stack=False, asm_dialect=llvm.AsmDialect.AD_ATT, loc=loc, ip=ip,
-    )
-from quack.varlen_utils import VarlenArguments, VarlenManager, varlen_n_block_rows
+from dispatch.pull import pull_chunk_bytes, pull_rows, stage_bytes
+from dispatch.walk import WalkArguments
+from quack.varlen_utils import VarlenArguments, VarlenManager
 from quack.gemm_base import GemmTmaBase, NamedBarrierGemm
 from quack.gemm_config import SplitKMode
 from quack import layout_utils
@@ -69,13 +60,12 @@ from quack.epilogue.quantize_out import active_row_sfd_reqs
 from quack.layout_utils import tile_atom_to_shape_SF_strided
 
 
-# --- intra-SM fused GEMM2 + combine = gemm_sm100.py (combine scheduler argument, the
-# epilogue's +1 on flags[expert, cid_m] per stored N tile) plus `intra_combine_push`: a warp group of 4 transfer
-# warps per CTA runs gemm_sm100_ep_inter.push_rows over the walk (one 14 KB y row per warp staged in smem
-# carved from the pipeline budget, sent in 2 KB chunks), each row once its M cluster's flag reads the target, into
-# the origins' slots.
-# The mirror of gemm_sm100_ep_intra_dispatch.py. Static persistence only (grid <= resident
-# CTAs: the transfer warps of a CTA that never becomes resident would leave the walk unpushed). --------------
+# --- duckpond: intra-SM fused dispatch = quack gemm_sm100.py (branch ep, c8ec317: in-kernel dispatch order and
+# flags[expert, cid_m] gate) plus `intra_dispatch_pull`: a warp group of 4 transfer warps per CTA runs
+# pull.pull_rows over the device walk (one 14 KB row per warp staged in smem carved from the pipeline
+# budget), landing rows in A and bumping the flags the AB-load warp polls, so the GEMM trails its own transfer by
+# one cluster. Static persistence only (grid <= resident CTAs: the transfer warps of a CTA that never becomes
+# resident would leave the walk unpulled). ------------------------------------------------------------------
 # TOMBSTONE — AllGather+GEMM arrival-gate placement experiment (2026-07-15,
 # MEASURED NEGATIVE, code removed; do not retry). Tried: the SCHEDULER warp
 # spins on the shard flag after decoding each CLC work tile (before its next
@@ -255,8 +245,8 @@ class GemmSm100(GemmTmaBase):
         # the tensor dtype.
         a_mma_dtype: Optional[Type[cutlass.Numeric]] = None,
         b_mma_dtype: Optional[Type[cutlass.Numeric]] = None,
-        intra_combine_push: int = 0,  # intra-SM combine: 4 transfer warps push D rows of this width (0 = off)
-        combine_epilogue_store: bool = False,  # instead: the epilogue stores each subtile from smem into the slots (D never written)
+        intra_dispatch_pull: int = 0,  # intra-SM dispatch: 4 transfer warps pull rows of this width into A (0 = off)
+        intra_dispatch_scatter: bool = False,  # no-gather layout: a pulled row lands in every reader's expert-major row
     ):
         """Initializes the configuration for a Blackwell dense GEMM kernel.
 
@@ -302,11 +292,18 @@ class GemmSm100(GemmTmaBase):
         self.concat_layout = concat_layout or ()
         self.use_tma_gather = use_tma_gather
         self.use_pdl = use_pdl
-        self.intra_combine_push = intra_combine_push
-        self.combine_epilogue_store = combine_epilogue_store
-        self.transfer_warp_count = 4 if intra_combine_push and not combine_epilogue_store else 0
-        self.flag_batch = CombinePush.flag_batch
-        self.push_chunk_bytes = 2048  # one chunk outstanding per warp (combine_push.py header)
+        self.intra_dispatch_pull = intra_dispatch_pull
+        self.intra_dispatch_scatter = intra_dispatch_scatter
+        self.transfer_warp_count = 4 if intra_dispatch_pull else 0
+        # publish each row as it lands: 592 warps own ~6 rows each, so batching (the 16-SM pull's flag_batch 8, which
+        # amortizes release fences over ~60 rows per warp) only delays every block's readiness to its warps' last row
+        self.flag_batch = 1
+        # each transfer warp's stage: a chunk of the row (megamoe's num_bytes_per_pull) so the GEMM keeps its A/B stages
+        self.pull_chunk_bytes = pull_chunk_bytes(intra_dispatch_pull, a_dtype)
+        # block-scaled rows: the transfer warps also scatter each token's scale words (4 scales each) into B's SF atoms
+        self.pull_sf_words = (
+            intra_dispatch_pull // (4 * sf_vec_size) if (intra_dispatch_pull and sf_vec_size is not None) else 0
+        )
         if gather_A:
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
         if use_tma_gather:
@@ -345,7 +342,7 @@ class GemmSm100(GemmTmaBase):
         self.scheduler_warp_id = self.epi_load_warp_id + 1
         # For gather_A: separate A-index prefetch warp (was the empty warp)
         self.a_prefetch_warp_id = self.scheduler_warp_id + 1 if self.has_idx_prefetch else None
-        # Intra-SM combine: one warp group of transfer warps after every other role (they join no pipeline).
+        # Intra-SM dispatch: one warp group of transfer warps after every other role (they join no pipeline).
         first_transfer = (self.a_prefetch_warp_id if self.has_idx_prefetch else self.scheduler_warp_id) + 1
         self.transfer_warp_id = tuple(range(first_transfer, first_transfer + self.transfer_warp_count))
         self.num_epi_warps = len(self.epilog_warp_id)
@@ -375,10 +372,12 @@ class GemmSm100(GemmTmaBase):
         # Without gather_A there are only 2 WGs (512 total, 256 per WG = max), no reallocation needed.
         self.num_regs_other = 120
         self.num_regs_epi = 256
-        if self.intra_combine_push:
-            # 3 warp groups share 512 regs per thread slot: 256 + 120 + 40 (the push loop holds addresses, a
-            # phase and one parked gate per lane).
-            self.num_regs_push = 40
+        if self.intra_dispatch_pull:
+            # 4 warp groups share 512 regs per thread slot: 232 + 120 + 120 + 40 (quack's 256 + 120 + 120 has no
+            # room for a fourth group; 96 + 96 + 64 with the epilogue at 256 measured the same on a shared node).
+            # The transfer loop holds addresses, a phase and one parked gate per lane.
+            self.num_regs_epi = 232
+            self.num_regs_pull = 40
         extra_warp_ids = (self.a_prefetch_warp_id,) if self.has_idx_prefetch else ()
         self.threads_per_cta = cute.arch.WARP_SIZE * (
             self.num_ab_load_warps
@@ -396,104 +395,17 @@ class GemmSm100(GemmTmaBase):
         # Multiple of 4 warps to increase/decrease number of registers
         assert self.threads_per_cta % 128 == 0
 
-    def combine_store_lanes(self, epi_tile):
-        """Lanes per token's slice of a subtile for combine_epilogue_store, 16 B per lane: the subtile row under
-        varlen_m (epi tile N x d_dtype = 64 B -> 4), the subtile column under the swap-AB varlen_n GEMM (D = y.T,
-        m-major: epi tile M x d_dtype = 256 B -> 16, megamoe's store shape)."""
-        extent = cute.size(epi_tile[0]) if self.varlen_n else cute.size(epi_tile[1])
-        lanes = extent * self.d_dtype.width // 128
-        assert lanes * 128 == extent * self.d_dtype.width, "a token's slice is whole 16 B lanes"
-        return lanes
-
-    def combine_smem_partition(self, sD, epi_tile, tidx):
-        """The epilogue warps' view of the D smem stages for combine_epilogue_store: lanes x 16 B along the token's
-        contiguous dim, num_epi_warps x 32 / lanes tokens per step. (tiled copy, the stages partitioned
-        ((8, 1), steps_m, steps_n, STAGE), the register fragment of one stage)."""
-        lanes = self.combine_store_lanes(epi_tile)
-        elems = 128 // self.d_dtype.width
-        tokens_per_step = self.num_epi_warps * cute.arch.WARP_SIZE // lanes
-        atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), self.d_dtype, num_bits_per_copy=128)
-        if self.varlen_n:  # thread -> (lane along M, token along N); 8 contiguous elements along M
-            thr = cute.make_layout((lanes, tokens_per_step), stride=(1, lanes))
-            val = cute.make_layout((elems, 1), stride=(1, elems))
-        else:  # thread -> (token row along M, lane along N); 8 contiguous elements along N
-            thr = cute.make_layout((tokens_per_step, lanes), stride=(lanes, 1))
-            val = cute.make_layout((1, elems), stride=(elems, 1))
-        tiled_copy = cute.make_tiled_copy_tv(atom, thr, val)
-        tSR_s = tiled_copy.get_slice(tidx).partition_S(sD)
-        tSR_r = cute.make_rmem_tensor(tSR_s[None, None, None, 0].shape, self.d_dtype)
-        return tiled_copy, tSR_s, tSR_r
-
-    @cute.jit
-    def combine_store_subtile(
-        self, tiled_copy, tSR_s, tSR_r, epi_tile, row_key, slot_base, slots_per_rank: Int32, slot_addr, varlen_manager,
-        tile_coord_mnkl, batch_idx, tidx, src_idx, dst_idx,
-    ):
-        """combine_epilogue_store's D store (the epilogue's copy_D): the subtile in smem stage src_idx at subtile
-        coordinate dst_idx goes into the origins' slots, each token's slice at the same hidden offset in its slot
-        row. varlen_m: token g's slot is row_key[g] (global slot id = rank * slots_per_rank + local). varlen_n
-        (swap-AB, tokens along N): slot_addr[g] is the slot's address. Tokens past the block (varlen_n: the
-        even-split block's valid rows; varlen_m: the batch) are skipped, nothing waited on (visibility: the
-        barrier before the reduce)."""
-        lanes = self.combine_store_lanes(epi_tile)
-        tokens_per_step = self.num_epi_warps * cute.arch.WARP_SIZE // lanes
-        epi_m, epi_n = cute.size(epi_tile[0]), cute.size(epi_tile[1])
-        elem_bytes = self.d_dtype.width // 8
-        row_bytes = self.intra_combine_push * elem_bytes
-        elems = 128 // self.d_dtype.width
-        iket.range_push("epi_slot_store")
-        if const_expr(self.varlen_n):
-            # The block's extent once, then every step's slot address (clamped so the loads are unconditional), all
-            # issued before the smem copy so their latency overlaps it: a store step is then one landed address + the
-            # store (an address chain per step was ~45 % of the kernel's stalls).
-            STEPS = epi_n // tokens_per_step
-            seq_start = varlen_manager.params.cu_seqlens_n[batch_idx]
-            seq_end = varlen_manager.params.cu_seqlens_n[batch_idx + 1]
-            b = varlen_n_block_rows(seq_end - seq_start, self.cta_tile_shape_mnk[1], self.varlen_n_granule)
-            base_row = seq_start + tile_coord_mnkl[1] * b
-            n_valid = cutlass.min(b, seq_end - base_row)
-            col0 = dst_idx[1] * epi_n + tidx // lanes
-            addr = cute.make_rmem_tensor(cute.make_layout(STEPS), Int64)
-            for step in cutlass.range_constexpr(STEPS):
-                n = cutlass.min(col0 + step * tokens_per_step, n_valid - Int32(1))
-                addr[step] = slot_addr[base_row + n]
-            h_off = Int64(
-                (tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0] + dst_idx[0] * epi_m + (tidx % lanes) * elems) * elem_bytes
-            )
-            cute.copy(tiled_copy, tSR_s[None, None, None, src_idx], tSR_r)
-            words = cute.recast_tensor(tSR_r, Int32)  # ((4, 1), 1, steps): the lane's 16 B per step
-            for step in cutlass.range_constexpr(STEPS):
-                if col0 + step * tokens_per_step < n_valid:
-                    st_global_v4(
-                        addr[step] + h_off,
-                        words[(0, 0), 0, step], words[(1, 0), 0, step], words[(2, 0), 0, step], words[(3, 0), 0, step],
-                    )
-        else:
-            cute.copy(tiled_copy, tSR_s[None, None, None, src_idx], tSR_r)
-            words = cute.recast_tensor(tSR_r, Int32)  # ((4, 1), steps, 1): the lane's 16 B of the step's row
-            row0 = tile_coord_mnkl[0] * self.cta_tile_shape_mnk[0] + dst_idx[0] * epi_m
-            col_off = Int64((tile_coord_mnkl[1] * self.cta_tile_shape_mnk[1] + dst_idx[1] * epi_n) * elem_bytes)
-            len_m = varlen_manager.len_m(batch_idx)
-            base_row = varlen_manager.params.cu_seqlens_m[batch_idx]
-            lane_off = Int64((tidx % lanes) * 16)
-            for step in cutlass.range_constexpr(epi_m // tokens_per_step):
-                r = row0 + step * tokens_per_step + tidx // lanes
-                if r < len_m:
-                    slot = row_key[base_row + r]
-                    dst = slot_base[slot // slots_per_rank] + Int64(slot % slots_per_rank) * Int64(row_bytes) + col_off
-                    st_global_v4(
-                        dst + lane_off,
-                        words[(0, 0), step, 0], words[(1, 0), step, 0], words[(2, 0), step, 0], words[(3, 0), step, 0],
-                    )
-        iket.range_pop()
-
-    def push_smem_bytes(self):
+    def pull_smem_bytes(self):
         """Smem the transfer warps take from the A/B/epilogue budget (one row per warp + mbarriers)."""
-        return stage_bytes(self.intra_combine_push, self.d_dtype, self.transfer_warp_count, self.push_chunk_bytes) if self.transfer_warp_count else 0
+        if not self.intra_dispatch_pull:
+            return 0
+        return stage_bytes(self.intra_dispatch_pull, self.a_dtype, self.transfer_warp_count, self.pull_chunk_bytes)
 
-    def push_stage_elems(self):
-        """Elements of one transfer warp's smem stage: a chunk of the row."""
-        return self.push_chunk_bytes * 8 // self.d_dtype.width
+    def pull_stage_elems(self):
+        """Elements of one transfer warp's smem stage: a chunk of the row, or the row."""
+        if self.pull_chunk_bytes:
+            return self.pull_chunk_bytes * 8 // self.a_dtype.width
+        return self.intra_dispatch_pull
 
     def epi_smem_warp_shape_mnk(self):
         # Mirrors cutlass.utils.blackwell_helpers.compute_epilogue_tile_shape:
@@ -541,7 +453,25 @@ class GemmSm100(GemmTmaBase):
             assert self.mma_tiler[1] <= 256 and self.cluster_shape_mnk[1] == 1, (
                 "varlen_n needs tile_n <= 256 (one MMA instruction) and cluster_n == 1"
             )
-            assert not self.blockscaled
+            if self.blockscaled:
+                # B's scale factors live in per-block atoms (VarlenManager.offset_block_SFB): every
+                # tile's SF window starts at an atom boundary, so no misaligned-start correction,
+                # and the MMAs run at the block's rows through the runtime-N descriptor.
+                assert self.varlen_n_dynamic, "varlen_n blockscaled needs varlen_n_dynamic_n"
+                assert varlen_args.mCuTilesN is not None, "varlen_n blockscaled needs mCuTilesN"
+                mxfp8 = (
+                    self.a_dtype == self.b_dtype == cutlass.Float8E4M3FN
+                    and self.sf_dtype == cutlass.Float8E8M0FNU
+                    and self.sf_vec_size == 32
+                )
+                nvfp4 = (
+                    self.a_dtype is cutlass.Float4E2M1FN
+                    and self.b_dtype is cutlass.Float4E2M1FN
+                    and self.sf_dtype == cutlass.Float8E4M3FN
+                    and self.sf_vec_size == 16
+                )
+                assert mxfp8 or nvfp4, "varlen_n blockscaled: mxfp8 (e4m3, ue8m0 per 32) or nvfp4 (e2m1, ue4m3 per 16)"
+                self.sfb_n_atom_misaligned = False
             self.mma_n_variants = (
                 ()
                 if self.varlen_n_dynamic
@@ -745,7 +675,7 @@ class GemmSm100(GemmTmaBase):
             self.c_layout,
             epilogue_args,
             prefetch_A_idx,
-            cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}") - self.push_smem_bytes(),  # smem_capacity
+            cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}") - self.pull_smem_bytes(),  # smem_capacity
             self.occupancy,
             self.epi_smem_warp_shape_mnk(),
         )
@@ -863,16 +793,9 @@ class GemmSm100(GemmTmaBase):
         stream: cuda.CUstream,
         mSFA: Optional[cute.Tensor] = None,
         mSFB: Optional[cute.Tensor] = None,
-        # push: combine_push.make_combine_walk's walk (absolute peer / flag addresses, no metadata in-kernel)
-        mWalkRow: Optional[cute.Tensor] = None,  # (n_rows,) int32 D row of each entry, in push order
-        mWalkDstAddress: Optional[cute.Tensor] = None,  # (n_rows,) int64 the entry's slot in its origin's buffer
-        mWalkGateAddress: Optional[cute.Tensor] = None,  # (n_rows,) int64 the origin's counter for the row's token
-        mWalkFlagAddress: Optional[cute.Tensor] = None,  # (n_rows,) int64 the row's M cluster flag
-        mWalkNumRows: Optional[cute.Tensor] = None,  # (1,) int32 walk length
-        # combine_epilogue_store: every rank's slot buffer base address and the slots per rank (T_local * K)
-        mSlotBase: Optional[cute.Tensor] = None,  # (world,) int64
-        slots_per_rank: Int32 = Int32(0),
-        mSlotAddr: Optional[cute.Tensor] = None,  # (rows,) int64 each D row's slot address (varlen_n: one load per token)
+        # pull: walk.make_dispatch_walk's walk (intra_dispatch_pull); its gates are flat offsets into the scheduler's
+        # flags, its SF rows index B's per-block atoms (mSFB)
+        walk: Optional[WalkArguments] = None,
         mTmaDescA: Optional[cute.Tensor] = None,  # (num_ctas * 16,) int64: per-CTA copies of A's tensormap with L2 promotion 256B
     ):
         """Execute the GEMM operation in steps:
@@ -973,7 +896,7 @@ class GemmSm100(GemmTmaBase):
 
         if const_expr(varlen_args is None):
             varlen_args = VarlenArguments()
-        assert (varlen_args.mAIdx is not None) == self.gather_A
+        assert varlen_args.mAIdx is not None or not self.gather_A, "gather_A needs mAIdx"  # the dispatch scheduler reads mAIdx without gather_A
         assert (varlen_args.mBIdx is not None) == self.gather_B
         varlen_m = varlen_args.mCuSeqlensM is not None
         varlen_k = varlen_args.mCuSeqlensK is not None
@@ -984,12 +907,14 @@ class GemmSm100(GemmTmaBase):
         self.varlen_k = varlen_k
         self.varlen_n = varlen_n
         if const_expr(varlen_n):
-            assert not self.blockscaled, "varlen_n does not support blockscaled"
             assert not self.gather_A, "varlen_n does not support gather_A"
             assert not any(
-                getattr(epilogue_args, op.name, None) is not None and not op.is_tile_store()
+                getattr(epilogue_args, op.name, None) is not None
+                and not op.is_tile_store()
+                and getattr(op, "fn_port", None) != "scalar"  # a scalar reads no row / block coordinate
+                and getattr(op, "quant_output", "D") == "D"  # an aux's quantize codec offsets by block itself
                 for op in getattr(type(self), "_epi_ops", ())
-            ), "varlen_n supports only tile-store epilogue ops"
+            ), "varlen_n supports only tile-store epilogue ops, scalars and their quantize codecs"
         if const_expr(self.gather_B):
             assert varlen_n, "gather_B needs varlen_n"
 
@@ -1248,15 +1173,15 @@ class GemmSm100(GemmTmaBase):
         # slot (16 B) + mbarrier (8 B); see TileScheduler.cancel_pending_tail.
         sched_smem_size = 4 * self.sched_stage + 6 if self.is_persistent else 0
 
-        push_elems = self.transfer_warp_count * (self.push_stage_elems() if self.transfer_warp_count else 0)  # one chunk stage per transfer warp
+        pull_elems = self.transfer_warp_count * self.pull_stage_elems()  # one stage per transfer warp
 
         @partitioned_struct
         class SharedStorage:
             sched_data: Reserved[
                 cute.struct.Align[cute.struct.MemRange[Int32, sched_smem_size], 16]
             ]
-            sPush: cute.struct.Align[cute.struct.MemRange[self.d_dtype if self.d_dtype is not None else Int32, push_elems], 128]
-            push_mbar: cute.struct.Align[cute.struct.MemRange[cutlass.Int64, self.transfer_warp_count], 8]
+            sPull: cute.struct.Align[cute.struct.MemRange[self.a_dtype, pull_elems], 128]
+            pull_mbar: cute.struct.Align[cute.struct.MemRange[cutlass.Int64, self.transfer_warp_count], 8]
             sAIdx: cute.struct.Align[cute.struct.MemRange[Int32, a_idx_smem_size], 16]
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
             sD: cute.struct.Align[
@@ -1326,16 +1251,12 @@ class GemmSm100(GemmTmaBase):
             self.epi_smem_layout_staged,
             self.epi_c_smem_layout_staged,
             self.epi_tile,
-            mD if const_expr(self.intra_combine_push) else None,  # the rows the push reads (tma_tensor_d is coordinates)
-            mWalkRow,
-            mWalkDstAddress,
-            mWalkGateAddress,
-            mWalkFlagAddress,
-            mWalkNumRows,
-            mSlotBase,
-            slots_per_rank,
-            mSlotAddr,
+            walk,
             mTmaDescA,
+            # raw pool pointer for the transfer warps: the token operand (B under varlen_n, the swap-AB GEMM; else A;
+            # the kernel's A/B tensors are TMA coordinate tensors without the cp.async gather)
+            mB if const_expr(self.gather_B or varlen_args.mCuSeqlensN is not None) else mA,
+            mSFB if const_expr(self.pull_sf_words > 0) else None,  # raw SF atoms for the transfer warps' scale scatter
             tile_sched_params,
             TileSchedulerCls,
         ).launch(
@@ -1377,16 +1298,10 @@ class GemmSm100(GemmTmaBase):
         epi_smem_layout: Union[cute.Layout, cute.ComposedLayout, None],
         epi_c_smem_layout: Union[cute.Layout, cute.ComposedLayout, None],
         epi_tile: cute.Tile,
-        mY: Optional[cute.Tensor],
-        mWalkRow: Optional[cute.Tensor],
-        mWalkDstAddress: Optional[cute.Tensor],
-        mWalkGateAddress: Optional[cute.Tensor],
-        mWalkFlagAddress: Optional[cute.Tensor],
-        mWalkNumRows: Optional[cute.Tensor],
-        mSlotBase: Optional[cute.Tensor],
-        slots_per_rank: Int32,
-        mSlotAddr: Optional[cute.Tensor],
+        walk: Optional[WalkArguments],
         mTmaDescA: Optional[cute.Tensor],
+        mPool: Optional[cute.Tensor],
+        mSfPool: Optional[cute.Tensor],
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
     ):
@@ -1469,47 +1384,41 @@ class GemmSm100(GemmTmaBase):
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
 
-        # Intra-SM combine: the transfer warps push their share of the walk (each D row once its M cluster's flag,
-        # bumped by the epilogues, reads the target) into the origins' slots; they join nothing else.
-        if const_expr(self.transfer_warp_count):
-            assert tile_sched_params.combine is not None, "intra_combine_push needs the combine scheduler"
-            stage_elems = self.push_stage_elems()
-            push_stage = storage.sPush.get_tensor(
+        # Intra-SM dispatch: the transfer warps pull their share of the walk into A (rows land in the pool the
+        # AB-load warp gathers from) and bump the scheduler's flags the AB-load warp polls; they join nothing else.
+        if const_expr(self.intra_dispatch_pull):
+            assert tile_sched_params.dispatch is not None, "intra_dispatch_pull needs the dispatch scheduler"
+            stage_elems = self.pull_stage_elems()
+            pull_stage = storage.sPull.get_tensor(
                 cute.make_layout((self.transfer_warp_count, stage_elems), stride=(stage_elems, 1))
             )
-            push_mbars = storage.push_mbar.data_ptr()
-            # every CTA of the cluster signals each tile of the fixed dim it stores (combine_signal_m_cluster): the
-            # N tiles under varlen_m, the M tiles (weights) under varlen_n
-            fixed = 1 - const_expr(getattr(tile_sched_params, "varlen_dim", 0))
-            cluster_size = self.cluster_shape_mnk[0] * self.cluster_shape_mnk[1]
-            flag_target = cluster_size * -(
-                -self.intra_combine_push // (self.cta_tile_shape_mnk[fixed] * self.cluster_shape_mnk[fixed])
-            )
+            pull_mbars = storage.pull_mbar.data_ptr()
             if warp_idx >= self.transfer_warp_id[0]:
-                cute.arch.setmaxregister_decrease(self.num_regs_push)
+                cute.arch.setmaxregister_decrease(self.num_regs_pull)
                 transfer_warp = warp_idx - self.transfer_warp_id[0]
                 bid, gd = cute.arch.block_idx(), cute.arch.grid_dim()
                 cta = bid[0] + gd[0] * (bid[1] + gd[1] * bid[2])
-                push_mbar = push_mbars + transfer_warp
+                pull_mbar = pull_mbars + transfer_warp
                 if tidx % 32 == Int32(0):
-                    cute.arch.mbarrier_init(push_mbar, 1)
+                    cute.arch.mbarrier_init(pull_mbar, 1)
                 cute.arch.sync_warp()
-                push_rows(
-                    mY.iterator.toint(),
-                    Int32(self.intra_combine_push * self.d_dtype.width // 8),
-                    mWalkRow,
-                    mWalkDstAddress,
-                    mWalkGateAddress,
-                    mWalkFlagAddress,
-                    Int32(flag_target),
-                    push_stage[transfer_warp, None],
-                    push_mbar,
+                sf_pool_base = Int64(0)  # block-scaled: B's SF atoms (the kernel's own SFB) take the pulled scales
+                if const_expr(self.pull_sf_words > 0):
+                    sf_pool_base = mSfPool.iterator.toint()
+                pull_rows(
+                    mPool.iterator.toint(),
+                    Int32(self.intra_dispatch_pull * (self.b_dtype if (self.gather_B or self.varlen_n) else self.a_dtype).width // 8),
+                    walk,
+                    tile_sched_params.dispatch.flags,
+                    pull_stage[transfer_warp, None],
+                    pull_mbar,
                     cta * Int32(self.transfer_warp_count) + transfer_warp,
                     gd[0] * gd[1] * gd[2] * Int32(self.transfer_warp_count),
                     tidx % 32,
                     self.flag_batch,
-                    mWalkNumRows,
-                    chunk_bytes=self.push_chunk_bytes,
+                    self.intra_dispatch_scatter,
+                    self.pull_sf_words,
+                    sf_pool_base,
                 )
 
         # Setup smem tensor A/B/D
@@ -1637,8 +1546,8 @@ class GemmSm100(GemmTmaBase):
             a_desc_kw = {}
             if const_expr(mTmaDescA is not None):
                 # This CTA's copy of A's tensormap with L2 promotion 256B (byte 10 bits 1-2; the DSL encodes 128B,
-                # DeepGEMM 256B). Descriptor-typed pointers: gmem-space for the copy-in and the fences, generic-space
-                # for cute.copy.
+                # DeepGEMM 256B, -17 us at W=4 T=1024). Descriptor-typed pointers: gmem-space for the copy-in and the
+                # fences, generic-space for cute.copy (~/tmp/l2p_repro.py).
                 assert self.num_ab_load_warps == 1
                 bid, gd = cute.arch.block_idx(), cute.arch.grid_dim()
                 a_desc_addr = mTmaDescA.iterator.toint() + (bid[0] + gd[0] * (bid[1] + gd[1] * bid[2])) * Int32(128)
@@ -1765,14 +1674,19 @@ class GemmSm100(GemmTmaBase):
                     # free-form, not a tiler multiple (tile_n=64 shares an atom
                     # between adjacent tiles, tile_n=192 advances 1.5 atoms per
                     # tile — both are just this one formula).
-                    sfb_first_atom = (mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]) // 128
-                    gSFB_chunks = cute.local_tile(
-                        cute.domain_offset(
+                    if const_expr(varlen_manager.varlen_n):
+                        # Per-block SF atoms: the block's window starts at its own atoms.
+                        gSFB_atoms = varlen_manager.offset_block_SFB(
+                            mSFB_chunks, batch_idx, mma_tile_coord_mnl[1], self.sfb_window_atoms
+                        )
+                    else:
+                        sfb_first_atom = (mma_tile_coord_mnl[1] * self.cta_tile_shape_mnk[1]) // 128
+                        gSFB_atoms = cute.domain_offset(
                             (None, None, sfb_first_atom),
                             varlen_manager.offset_batch_SFB(mSFB_chunks, batch_idx),
-                        ),
-                        (256, self.sfb_chunks_per_ktile, self.sfb_window_atoms),
-                        (0, None, 0),
+                        )
+                    gSFB_chunks = cute.local_tile(
+                        gSFB_atoms, (256, self.sfb_chunks_per_ktile, self.sfb_window_atoms), (0, None, 0)
                     )
 
                 # Partition global tensor for TiledMMA_A/B/D
@@ -2305,6 +2219,10 @@ class GemmSm100(GemmTmaBase):
                         k_tile_cnt,
                         is_leader_cta,
                         self.varlen_n_inst(n_valid),
+                        tCtSFA,
+                        tCtSFB,
+                        copy_s2t_sfa,
+                        copy_s2t_sfb,
                     )
                 elif const_expr(len(mma_variants) > 0):
                     # varlen_n: select the MMA-N variant once per tile from the block's valid
@@ -2424,9 +2342,6 @@ class GemmSm100(GemmTmaBase):
             tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
                 tiled_copy_t2r, self.epi_d_layout, self.d_dtype, tTR_rD, sD, epi_tidx
             )
-            tiled_copy_slot, tSR_sSlot, tSR_rSlot = None, None, None
-            if const_expr(self.combine_epilogue_store):
-                tiled_copy_slot, tSR_sSlot, tSR_rSlot = self.combine_smem_partition(sD, epi_tile, epi_tidx)
             tRS_rC, tSR_rC, tSR_sC = None, None, None
             tiled_copy_s2r = None
             if const_expr(mC_mnl is not None):
@@ -2440,10 +2355,7 @@ class GemmSm100(GemmTmaBase):
             acc_consumer_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.num_acc_stage
             )
-            # combine_epilogue_store: no TMA store; the epilogue's non-TMA path runs copy_D on every epilogue thread
-            epi_store_pipeline = (
-                self.make_epi_store_pipeline() if const_expr(not self.combine_epilogue_store) else None
-            )
+            epi_store_pipeline = self.make_epi_store_pipeline()
             epi_read_state = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.epi_c_stage
             )
@@ -2471,13 +2383,7 @@ class GemmSm100(GemmTmaBase):
                 acc_pipeline.consumer_wait(acc_consumer_state)
 
                 copy_D = None
-                if const_expr(self.combine_epilogue_store):
-                    copy_D = partial(
-                        self.combine_store_subtile, tiled_copy_slot, tSR_sSlot, tSR_rSlot, epi_tile,
-                        tile_sched_params.combine.row_key, mSlotBase, slots_per_rank, mSlotAddr, varlen_manager,
-                        tile_coord_mnkl, batch_idx, epi_tidx,
-                    )
-                elif const_expr(has_D):
+                if const_expr(has_D):
                     # Staged split-K: D is the f32 partials workspace, whose batch mode is the
                     # combined (l * split_k + split) index from the scheduler.
                     d_batch_idx = batch_idx
@@ -2583,10 +2489,7 @@ class GemmSm100(GemmTmaBase):
                 )
                 # MoE combine: publish the stored D tile (flags[batch, cid_m] += 1 per N tile once its
                 # bulk stores drained) so a transfer kernel can push the M cluster's rows.
-                # (combine_epilogue_store: the rows are already in the slots, nothing to publish.)
-                if const_expr(
-                    getattr(tile_sched_params, "combine", None) is not None and not self.combine_epilogue_store
-                ):
+                if const_expr(getattr(tile_sched_params, "combine", None) is not None):
                     vd = const_expr(getattr(tile_sched_params, "varlen_dim", 0))
                     if is_tma_warp:
                         combine_signal_m_cluster(tile_sched_params, tile_coord_mnkl[vd], batch_idx)
@@ -2599,9 +2502,8 @@ class GemmSm100(GemmTmaBase):
                 work_tile = next_work_tile
 
             # Wait for D store complete
-            if const_expr(epi_store_pipeline is not None):
-                if is_tma_warp:
-                    epi_store_pipeline.producer_tail()
+            if is_tma_warp:
+                epi_store_pipeline.producer_tail()
 
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
@@ -2830,17 +2732,30 @@ class GemmSm100(GemmTmaBase):
         k_tile_cnt: Int32,
         is_leader_cta: Boolean,
         n_inst: Int32,
+        tCtSFA: Optional[cute.Tensor] = None,
+        tCtSFB: Optional[cute.Tensor] = None,
+        copy_s2t_sfa: Optional[Callable] = None,
+        copy_s2t_sfb: Optional[Callable] = None,
     ) -> Tuple[cutlass.pipeline.PipelineState, cutlass.pipeline.PipelineState]:
-        """mma() for a varlen_n tile under varlen_n_dynamic_n (quack GemmSm100.mma_dynamic_n)."""
+        """mma() for a varlen_n tile under varlen_n_dynamic_n (quack GemmSm100.mma_dynamic_n): kind::f16, or
+        kind::mxf8f6f4.block_scale with the k-block's SF tmem addresses when blockscaled."""
         a_stage0, b_stage0 = sA[None, None, None, 0], sB[None, None, None, 0]
         a_base, b_base = a_stage0.iterator.toint(), b_stage0.iterator.toint()
         a_stage_bytes = cute.size_in_bytes(self.a_dtype, a_stage0.layout)
         b_stage_bytes = cute.size_in_bytes(self.b_dtype, b_stage0.layout)
         k_blk_bytes = self.mma_inst_shape_mnk[2] * self.a_dtype.width // 8
         num_k_blocks = self.cta_tile_shape_mnk[2] // self.mma_inst_shape_mnk[2]
-        idesc = instr_desc_f16(
-            n_inst, self.mma_tiler[0], self.a_dtype == cutlass.BFloat16, self.b_dtype == cutlass.BFloat16
-        )
+        fp4 = const_expr(self.a_dtype is cutlass.Float4E2M1FN)
+        umma_blockscaled = umma_mxf4nvf4_2sm if fp4 else umma_mxf8f6f4_2sm
+        if const_expr(self.blockscaled):
+            if const_expr(fp4):
+                idesc = instr_desc_mxf4nvf4(n_inst, self.mma_tiler[0])
+            else:
+                idesc = instr_desc_mxf8f6f4(n_inst, self.mma_tiler[0])
+        else:
+            idesc = instr_desc_f16(
+                n_inst, self.mma_tiler[0], self.a_dtype == cutlass.BFloat16, self.b_dtype == cutlass.BFloat16
+            )
         peek_ab_full_status = Boolean(True)
         if 0 < k_tile_cnt and is_leader_cta:
             peek_ab_full_status = ab_pipeline.consumer_try_wait(ab_consumer_state)
@@ -2850,6 +2765,9 @@ class GemmSm100(GemmTmaBase):
             if is_leader_cta:
                 ab_pipeline.consumer_wait(ab_consumer_state, peek_ab_full_status)
                 tcgen05_fence_after_thread_sync()
+                if const_expr(self.blockscaled):  # the stage's scale factors to tmem, as mma()
+                    copy_s2t_sfa(ab_consumer_state.index)
+                    copy_s2t_sfb(ab_consumer_state.index)
                 a_addr = a_base + ab_consumer_state.index * Int32(a_stage_bytes)
                 b_addr = b_base + ab_consumer_state.index * Int32(b_stage_bytes)
                 for k_blk in cutlass.range_constexpr(num_k_blocks):
@@ -2857,13 +2775,24 @@ class GemmSm100(GemmTmaBase):
                     if const_expr(k_blk == 0):
                         accumulate = cutlass.min(k_tile, Int32(1))
                     with cute.arch.elect_one():
-                        umma_f16_2sm(
-                            tmem_addr,
-                            smem_desc_sw128_k(a_addr + Int32(k_blk * k_blk_bytes)),
-                            smem_desc_sw128_k(b_addr + Int32(k_blk * k_blk_bytes)),
-                            idesc,
-                            accumulate,
-                        )
+                        if const_expr(self.blockscaled):
+                            umma_blockscaled(
+                                tmem_addr,
+                                smem_desc_sw128_k(a_addr + Int32(k_blk * k_blk_bytes)),
+                                smem_desc_sw128_k(b_addr + Int32(k_blk * k_blk_bytes)),
+                                idesc,
+                                tCtSFA[(None, None, k_blk)].iterator.toint(),
+                                tCtSFB[(None, None, k_blk)].iterator.toint(),
+                                accumulate,
+                            )
+                        else:
+                            umma_f16_2sm(
+                                tmem_addr,
+                                smem_desc_sw128_k(a_addr + Int32(k_blk * k_blk_bytes)),
+                                smem_desc_sw128_k(b_addr + Int32(k_blk * k_blk_bytes)),
+                                idesc,
+                                accumulate,
+                            )
                 ab_pipeline.consumer_release(ab_consumer_state)
             ab_consumer_state.advance()
             peek_ab_full_status = Boolean(True)

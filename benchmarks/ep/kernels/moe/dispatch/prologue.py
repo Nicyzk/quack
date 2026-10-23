@@ -1,9 +1,12 @@
 # The quack_intra_swap arm's routing prologue in one launch: the top-k exchange (each rank stores its block into every
 # peer's gathered buffer, then an NVLink barrier that also orders the x publish issued before it on the stream), the
 # per-forward flag / semaphore resets, the routing metadata (routing_metadata.py's count + emit, plus each row's
-# combine slot address for GEMM2's epilogue store) and the dispatch walk (dispatch_pull.DispatchWalk's count +
+# combine slot address for GEMM2's epilogue store) and the dispatch walk (walk.py's count, from the token side, +
 # scatter), as phases on 128-thread CTAs over every SM, separated by software grid syncs. Replaces a NCCL all-gather,
-# a symm-mem barrier, four memsets and five dependent launches. Even-split blocks only (the swap-AB GEMMs).
+# a symm-mem barrier, four memsets and five dependent launches (results/2026-10-05/latency_optimizations.md). Even-split
+# blocks only (the swap-AB GEMMs).
+import os
+import sys
 from types import SimpleNamespace
 
 import cutlass
@@ -13,55 +16,28 @@ import torch
 import torch.distributed._symmetric_memory as symm_mem
 from cutlass.cutlass_dsl import Int32, Int64
 from quack.compile_utils import make_fake_tensor
-from quack.ep.ptx import red_add_release_sys_s32, software_grid_sync, stg_b32_raw
-from quack.gemm_sm100_ep_inter import MClusterWalk, block_rows_of
-from quack.tile_scheduler import (
-    DispatchSchedulerArguments,
-    PersistenceMode,
-    RasterOrderOption,
-    VarlenMTileSchedulerArguments,
-)
 from quack.utils import warp_prefix_sum
 from quack.varlen_utils import VARLEN_N_GRANULE, varlen_n_block_rows
 
-GROUP_THREADS = 128
-NUM_WARPS = GROUP_THREADS // 32
-SYNC_BARRIER_ID = 12  # the CTA's barrier (10 = software_grid_sync's, 11 = dispatch -> scheduler)
+from dispatch.walk import (
+    GROUP_THREADS,
+    NUM_WARPS,
+    WalkArguments,
+    fake_walk_arguments,
+    make_walk_buffers,
+    walk_scatter_phase,
+    walk_scheduler_args,
+)
+
+from quack.ep.ptx import red_add_release_sys_s32 as red_add_release_sys_s32_raw  # same PTX as the megamoe helpers
+from quack.ep.ptx import software_grid_sync, stg_b32_raw
+
+SYNC_BARRIER_ID = 12  # the CTA's barrier (10 = software_grid_sync's)
 
 
 @cute.jit
 def group_sync():
     cute.arch.barrier(barrier_id=SYNC_BARRIER_ID, number_of_threads=GROUP_THREADS)
-
-
-@cute.jit
-def group_sum(val: Int32, scratch: cute.Tensor, warp: Int32, lane: Int32) -> Int32:
-    """Sum of val over the CTA, to every thread; scratch = (NUM_WARPS,) smem."""
-    for i in cutlass.range_constexpr(5):
-        val = val + cute.arch.shuffle_sync_bfly(val, offset=1 << i)
-    if lane == Int32(0):
-        scratch[warp] = val
-    group_sync()
-    total = Int32(0)
-    for w in cutlass.range_constexpr(NUM_WARPS):
-        total = total + scratch[w]
-    group_sync()
-    return total
-
-
-@cute.jit
-def group_exclusive_scan(val: Int32, scratch: cute.Tensor, warp: Int32, lane: Int32) -> Int32:
-    """Exclusive prefix sum of val over the CTA in thread order."""
-    inclusive = warp_prefix_sum(val, lane)
-    if lane == Int32(31):
-        scratch[warp] = inclusive
-    group_sync()
-    before = Int32(0)
-    for w in cutlass.range_constexpr(NUM_WARPS):
-        if Int32(w) < warp:
-            before = before + scratch[w]
-    group_sync()
-    return before + inclusive - val
 
 
 @cute.jit
@@ -95,7 +71,7 @@ def zero_flags(flags: cute.Tensor, sem1: cute.Tensor, sem2: cute.Tensor, cta: In
 def nvlink_barrier(signal: cute.Tensor, signal_base: cute.Tensor, barrier_counter: cute.Tensor, cta: Int32,
                    lane: Int32, W: cutlass.Constexpr[int]):
     """Warp 0 of every CTA, after a grid sync: CTA 0 arrives on every rank's slot, every CTA spins on its own rank's
-    slot (no second grid sync); sense-reversing ping-pong over two slots (routed_dispatch.routed_barrier's) on the
+    slot (no second grid sync); sense-reversing ping-pong over two slots (MegaMoE's routed barrier) on the
     CTA's own counter word, release / acquire at system scope."""
     status = barrier_counter[cta] & Int32(3)
     phase = status & Int32(1)
@@ -103,7 +79,7 @@ def nvlink_barrier(signal: cute.Tensor, signal_base: cute.Tensor, barrier_counte
     if (status >> Int32(1)) != Int32(0):
         delta, target = Int32(-1), Int32(0)
     if (cta == Int32(0)) & (lane < Int32(W)):
-        red_add_release_sys_s32(signal_base[lane] + Int64(phase) * Int64(4), delta)
+        red_add_release_sys_s32_raw(signal_base[lane] + Int64(phase) * Int64(4), delta)
     cute.arch.sync_warp()
     if lane == Int32(0):
         barrier_counter[cta] = status + Int32(1)
@@ -218,13 +194,14 @@ def expert_tile_sums(counts: cute.Tensor, upto: Int32, lane: Int32, warp: Int32,
 @cute.jit
 def emit_phase(topk_g: cute.Tensor, counts: cute.Tensor, cu: cute.Tensor, s_reverse: cute.Tensor,
                s_scatter: cute.Tensor, a_idx: cute.Tensor, slot_addr: cute.Tensor, slot_base: cute.Tensor,
-               first_src_row: cute.Tensor, rank: Int32, tokens_per_rank: Int32, world: Int32, bytes_per_token: Int32,
-               cta: Int32, num_ctas: Int32, tid: Int32, lane: Int32, warp: Int32, scratch: cute.Tensor,
-               masks: cute.Tensor, cu_s: cute.Tensor, before_s: cute.Tensor, counts2: cute.Tensor, ncols: Int32,
-               block_rows: cutlass.Constexpr[int], K: cutlass.Constexpr[int], E_local: cutlass.Constexpr[int]):
+               first_src_row: cute.Tensor, rank: Int32, first_src_rank: Int32, tokens_per_rank: Int32, world: Int32,
+               bytes_per_token: Int32, slot_bytes: Int32, cta: Int32, num_ctas: Int32, tid: Int32, lane: Int32, warp: Int32,
+               scratch: cute.Tensor, masks: cute.Tensor, cu_s: cute.Tensor, before_s: cute.Tensor, counts2: cute.Tensor,
+               ncols: Int32, block_rows: cutlass.Constexpr[int], K: cutlass.Constexpr[int],
+               E_local: cutlass.Constexpr[int]):
     """The tables (routing_metadata's emit_kernel): cu, first_src_row (CTA 0), and per tile s_reverse, s_scatter,
     a_idx, slot_addr (row -> its token's combine slot on the origin rank, GEMM2's epilogue store); plus the dispatch
-    walk's per-block counts (DispatchWalk.count_kernel): a present token's owner row is its lowest local expert's
+    walk's per-block counts (walk_count_phase, from the token side): a present token's owner row is its lowest local expert's
     row, so counts2[0, e * ncols + cid] += 1 and counts2[1, ...] += its local slots for the owner row's block.
     cu_s / before_s = (E_local + 1,) smem: the expert offsets (cu_s[E_local] = total rows) and the tile's per-expert
     prefixes (before_s[E_local] = present tokens before the tile)."""
@@ -235,8 +212,8 @@ def emit_phase(topk_g: cute.Tensor, counts: cute.Tensor, cu: cute.Tensor, s_reve
     slots_per_rank = tokens_per_rank * Int32(K)
     lanes_before = (Int32(1) << lane) - Int32(1)
     expert_tile_sums(counts, n_tiles, lane, warp, cu_s, E_local)  # per-expert totals
-    if (cta == Int32(0)) & (warp == Int32(1)):  # first_src_row: tokens present from the ranks before (rank + 1) % world
-        upto = ((rank + Int32(1)) % world) * tiles_per_rank
+    if (cta == Int32(0)) & (warp == Int32(1)):  # first_src_row: tokens present from the ranks before first_src_rank
+        upto = first_src_rank * tiles_per_rank
         first = Int32(0)
         for p in cutlass.range((upto + Int32(31)) // Int32(32), unroll=1):
             j = p * Int32(32) + lane
@@ -280,7 +257,7 @@ def emit_phase(topk_g: cute.Tensor, counts: cute.Tensor, cu: cute.Tensor, s_reve
             if Int32(w) < warp:
                 pool_row = pool_row + scratch[w]
         src_rank = token // tokens_per_rank
-        slot0 = slot_base[src_rank] + Int64((token - src_rank * tokens_per_rank) * Int32(K)) * Int64(bytes_per_token)
+        slot0 = slot_base[src_rank] + Int64((token - src_rank * tokens_per_rank) * Int32(K)) * Int64(slot_bytes)
         e_min, row_min = Int32(0x7FFFFFFF), Int32(0)
         for k in cutlass.range_constexpr(K):
             if ((mask >> k) & Int32(1)) == Int32(1):
@@ -290,7 +267,7 @@ def emit_phase(topk_g: cute.Tensor, counts: cute.Tensor, cu: cute.Tensor, s_reve
                 s_reverse[f] = row
                 s_scatter[row] = f
                 a_idx[row] = pool_row
-                slot_addr[row] = slot0 + Int64(k) * Int64(bytes_per_token)
+                slot_addr[row] = slot0 + Int64(k) * Int64(slot_bytes)
                 if e_k < e_min:
                     e_min, row_min = e_k, row
         if mask != Int32(0):  # the owner row's block gets this token's owned row and its reader references
@@ -302,160 +279,35 @@ def emit_phase(topk_g: cute.Tensor, counts: cute.Tensor, cu: cute.Tensor, s_reve
         tile = tile + num_ctas
 
 
-@cute.jit
-def owner_test_flat(expert: Int32, cid: Int32, r: Int32, slot_of_row: cute.Tensor, s_reverse: cute.Tensor,
-                    topk_g: cute.Tensor, cu: cute.Tensor, flags: cute.Tensor, rank: Int32, num_experts: Int32,
-                    reader_flags: cute.Tensor, reader_rows: cute.Tensor, block_rows: cutlass.Constexpr[int],
-                    K: cutlass.Constexpr[int]):
-    """dispatch_pull.owner_test (even split) with every load unconditional on clamped indices, so two rows' chains
-    issue together: row r of block (expert, cid) -> (owner, readers, token, owned, refs)."""
-    e_start, e_end = cu[expert], cu[expert + 1]
-    b = varlen_n_block_rows(e_end - e_start, block_rows, VARLEN_N_GRANULE)
-    start = e_start + cid * b
-    row = start + r
-    in_cluster = row < cutlass.min(start + b, e_end)
-    row_c = row
-    if not in_cluster:
-        row_c = start  # a scheduled block has a first row
-    token = slot_of_row[row_c] // K
-    slot0 = token * K
-    first_reader, readers = Int32(0x7FFFFFFF), Int32(0)
-    for k in cutlass.range_constexpr(K):
-        e = topk_g[slot0 + k] - rank * num_experts
-        reader_row = s_reverse[slot0 + k]
-        mine = (e >= Int32(0)) & (e < num_experts)
-        ec = e
-        if not mine:
-            ec = Int32(0)
-        rb = varlen_n_block_rows(cu[ec + 1] - cu[ec], block_rows, VARLEN_N_GRANULE)
-        flag = Int32(cute.crd2idx((ec, (reader_row - cu[ec]) // rb), flags.layout))
-        reader_flags[k], reader_rows[k] = Int32(0), Int32(0)
-        if mine:
-            first_reader = cutlass.min(first_reader, reader_row)
-            readers = readers | Int32(1 << k)
-            reader_flags[k], reader_rows[k] = flag, reader_row
-    owner = in_cluster & (first_reader == row)
-    owned, refs = Int32(0), Int32(0)
-    if owner:
-        owned, refs = Int32(1), cute.arch.popc(readers)
-    if not in_cluster:
-        readers, token = Int32(0), Int32(0)
-    return owner, readers, token, owned, refs
-
-
-@cute.jit
-def walk1_scatter_phase(sched_params, a_idx: cute.Tensor, slot_of_row: cute.Tensor, s_reverse: cute.Tensor,
-                        topk_g: cute.Tensor, cu: cute.Tensor, flags: cute.Tensor, counts2: cute.Tensor,
-                        peer_base: cute.Tensor, pool_row: cute.Tensor, src_address: cute.Tensor, gate_ptr: cute.Tensor,
-                        gates: cute.Tensor, dst_row: cute.Tensor, num_rows: cute.Tensor, rank: Int32,
-                        tokens_per_rank: Int32, bytes_per_token: Int32, cta: Int32, num_ctas: Int32, tid: Int32,
-                        lane: Int32, warp: Int32, scratch: cute.Tensor, block_rows: cutlass.Constexpr[int],
-                        K: cutlass.Constexpr[int]):
-    """Each block's owned rows at (walk-earlier blocks' owned rows + rank among its owners), in row order
-    (DispatchWalk.scatter_kernel); counts2[(0 | 1), e * ncols + cid] = emit's per-block owned rows / references."""
-    PASSES = (block_rows + GROUP_THREADS - 1) // GROUP_THREADS
-    reader_flags = [cute.make_rmem_tensor(cute.make_layout(K), Int32) for _ in range(PASSES)]
-    reader_rows = [cute.make_rmem_tensor(cute.make_layout(K), Int32) for _ in range(PASSES)]
-    num_experts = Int32(cute.size(cu) - 1)
-    n2 = Int32(cute.size(counts2, mode=[1]))
-    ncols = n2 // num_experts
-    if cta == Int32(0):  # totals: num_rows = all owned rows, gate_ptr[num_rows] = all references (= GEMM rows)
-        owned = Int32(0)
-        i = tid
-        while i < n2:
-            owned = owned + counts2[0, i]
-            i = i + Int32(GROUP_THREADS)
-        owned = group_sum(owned, scratch, warp, lane)
-        if tid == Int32(0):
-            num_rows[0] = owned
-            gate_ptr[owned] = cu[num_experts]
-    sched = MClusterWalk.create(sched_params)
-    q = cta
-    tile = sched.m_cluster_at(q)
-    while tile.is_valid_tile:
-        expert, cid = tile.tile_idx[3], tile.tile_idx[1]
-        # walk-earlier blocks: every block of the earlier experts (unused cids hold 0) + this expert's blocks before
-        # cid in its rotation from the decode's first block
-        nblocks, first = sched._cur_num_clusters_m, sched._cur_first_cid_m
-        pos = (cid - first + nblocks) % nblocks
-        row_offset, ref_offset = Int32(0), Int32(0)
-        i = tid
-        while i < expert * ncols:
-            row_offset = row_offset + counts2[0, i]
-            ref_offset = ref_offset + counts2[1, i]
-            i = i + Int32(GROUP_THREADS)
-        c = tid
-        while c < nblocks:
-            if (c - first + nblocks) % nblocks < pos:
-                row_offset = row_offset + counts2[0, expert * ncols + c]
-                ref_offset = ref_offset + counts2[1, expert * ncols + c]
-            c = c + Int32(GROUP_THREADS)
-        row_offset = group_sum(row_offset, scratch, warp, lane)
-        ref_offset = group_sum(ref_offset, scratch, warp, lane)
-        b = block_rows_of(cu, expert, block_rows, True)
-        tests = []  # every pass's owner_test first (static passes, load chains overlapping), then the scans
-        for p in cutlass.range_constexpr(PASSES):
-            tests.append(owner_test_flat(
-                expert, cid, Int32(p * GROUP_THREADS) + tid, slot_of_row, s_reverse, topk_g, cu, flags, rank,
-                num_experts, reader_flags[p], reader_rows[p], block_rows, K,
-            ))
-        for p in cutlass.range_constexpr(PASSES):
-            owner, readers, token, owned, refs = tests[p]
-            entry = row_offset + group_exclusive_scan(owned, scratch, warp, lane)
-            ref = ref_offset + group_exclusive_scan(refs, scratch, warp, lane)
-            if owner:
-                pool_row[entry] = a_idx[cu[expert] + cid * b + Int32(p * GROUP_THREADS) + tid]
-                src_address[entry] = peer_base[token // tokens_per_rank] + Int64(token % tokens_per_rank) * Int64(
-                    bytes_per_token
-                )
-                gate_ptr[entry] = ref
-                for k in cutlass.range_constexpr(K):
-                    if ((readers >> k) & Int32(1)) == Int32(1):
-                        gates[ref] = reader_flags[p][k]
-                        dst_row[ref] = reader_rows[p][k]
-                        ref = ref + Int32(1)
-            row_offset = row_offset + group_sum(owned, scratch, warp, lane)
-            ref_offset = ref_offset + group_sum(refs, scratch, warp, lane)
-        q = q + num_ctas
-        tile = sched.m_cluster_at(q)
-
-
 class Prologue:
     """The launch: num_ctas CTAs of GROUP_THREADS threads, every SM (the grid syncs need them all resident)."""
 
-    def __init__(self, K, E_local, W, block_rows, num_ctas):
+    def __init__(self, K, E_local, W, block_rows, num_ctas, sf_atom_rows=0):
         self.K, self.E_local, self.W = K, E_local, W
         self.block_rows, self.num_ctas = block_rows, num_ctas
+        self.sf_atom_rows = sf_atom_rows  # MXFP8: SF rows per block slot (0: no scales)
         self.smem_bytes = 4 * (NUM_WARPS + E_local * NUM_WARPS + 2 * (E_local + 1)) + 256
 
     @cute.jit
     def __call__(
         self, topk, topk_g, topk_g_base, signal, signal_base, barrier_counter, grid_counter, counts, cu, s_reverse,
-        s_scatter, a_idx, slot_addr, slot_base, first_src_row, flags, counts2, peer_base, pool_row, src_address,
-        gate_ptr, gates, dst_row, num_rows, sem1, sem2, rank: Int32, tokens_per_rank: Int32, bytes_per_token: Int32,
-        stream,
+        s_scatter, a_idx, slot_addr, slot_base, first_src_row, flags, counts2, peer_base, walk: WalkArguments, sem1,
+        sem2, rank: Int32, first_src_rank: Int32, tokens_per_rank: Int32, bytes_per_token: Int32, slot_bytes: Int32,
+        stream, peer_sf_base=None, sf_bytes_per_token: Int32 = Int32(0),
     ):
-        num_experts = cute.size(cu) - 1
-        sched1 = MClusterWalk.to_underlying_arguments(  # GEMM1's dispatch order (DispatchWalk)
-            VarlenMTileSchedulerArguments(
-                problem_shape_ntile_mnl=(1, None, num_experts), total_m=cute.size(a_idx), cu_seqlens_m=cu,
-                raster_order=RasterOrderOption.AlongN, group_size=1, tile_shape_mn=(1, self.block_rows),
-                cluster_shape_mnk=(1, 1, 1), persistence_mode=PersistenceMode.NONE,
-                dispatch=DispatchSchedulerArguments(flags, first_src_row), a_idx=a_idx, varlen_dim=1,
-            )
-        )
+        sched1 = walk_scheduler_args(a_idx, cu, flags, first_src_row, self.block_rows, True)  # GEMM1's dispatch order
         self.kernel(
             sched1, topk, topk_g, topk_g_base, signal, signal_base, barrier_counter, grid_counter, counts, cu,
-            s_reverse, s_scatter, a_idx, slot_addr, slot_base, first_src_row, flags, counts2, peer_base, pool_row,
-            src_address, gate_ptr, gates, dst_row, num_rows, sem1, sem2, rank, tokens_per_rank, bytes_per_token,
+            s_reverse, s_scatter, a_idx, slot_addr, slot_base, first_src_row, flags, counts2, peer_base, walk, sem1,
+            sem2, rank, first_src_rank, tokens_per_rank, bytes_per_token, slot_bytes, peer_sf_base, sf_bytes_per_token,
         ).launch(grid=[self.num_ctas, 1, 1], block=[GROUP_THREADS, 1, 1], smem=self.smem_bytes, stream=stream)
 
     @cute.kernel
     def kernel(
         self, sched1, topk, topk_g, topk_g_base, signal, signal_base, barrier_counter, grid_counter, counts, cu,
-        s_reverse, s_scatter, a_idx, slot_addr, slot_base, first_src_row, flags, counts2, peer_base, pool_row,
-        src_address, gate_ptr, gates, dst_row, num_rows, sem1, sem2, rank: Int32, tokens_per_rank: Int32,
-        bytes_per_token: Int32,
+        s_reverse, s_scatter, a_idx, slot_addr, slot_base, first_src_row, flags, counts2, peer_base,
+        walk: WalkArguments, sem1, sem2, rank: Int32, first_src_rank: Int32, tokens_per_rank: Int32,
+        bytes_per_token: Int32, slot_bytes: Int32, peer_sf_base, sf_bytes_per_token: Int32,
     ):
         tid, _, _ = cute.arch.thread_idx()
         cta, _, _ = cute.arch.block_idx()
@@ -477,26 +329,35 @@ class Prologue:
         count_phase(topk_g, counts, counts2, rank, cta, num_ctas, tid, lane, warp, scratch, masks, K, E_local)
         software_grid_sync(grid_counter, cta, num_ctas, tid, num_threads=GROUP_THREADS)
         emit_phase(
-            topk_g, counts, cu, s_reverse, s_scatter, a_idx, slot_addr, slot_base, first_src_row, rank,
-            tokens_per_rank, Int32(W), bytes_per_token, cta, num_ctas, tid, lane, warp, scratch, masks, cu_s,
-            before_s, counts2, Int32(cute.size(flags, mode=[1])), self.block_rows, K, E_local,
+            topk_g, counts, cu, s_reverse, s_scatter, a_idx, slot_addr, slot_base, first_src_row, rank, first_src_rank,
+            tokens_per_rank, Int32(W), bytes_per_token, slot_bytes, cta, num_ctas, tid, lane, warp, scratch, masks,
+            cu_s, before_s, counts2, Int32(cute.size(flags, mode=[1])), self.block_rows, K, E_local,
         )
         software_grid_sync(grid_counter, cta, num_ctas, tid, num_threads=GROUP_THREADS)
-        walk1_scatter_phase(
-            sched1, a_idx, s_scatter, s_reverse, topk_g, cu, flags, counts2, peer_base, pool_row, src_address,
-            gate_ptr, gates, dst_row, num_rows, rank, tokens_per_rank, bytes_per_token, cta, num_ctas, tid, lane,
-            warp, scratch, self.block_rows, K,
+        walk_scatter_phase(
+            sched1, a_idx, s_scatter, s_reverse, topk_g, cu, flags, counts2, peer_base, walk, rank, tokens_per_rank,
+            bytes_per_token, cta, num_ctas, tid, lane, warp, scratch, self.block_rows, K, True, peer_sf_base,
+            sf_bytes_per_token, self.sf_atom_rows,
         )
 
 
-def make_prologue(topk_idx, x_peer_bufs, rank, W, T_local, K, E_local, max_rows, block_rows, slot_base, group):
+def make_prologue(
+    topk_idx, x_peer_bufs, rank, W, T_local, K, E_local, max_rows, block_rows, slot_base, group, x_sf_peer_bufs=None,
+    slot_row_bytes=None, first_src_rank=None,
+):
     """Host side: (run, meta, walk1). run() = the one launch (the x publish goes before it on the stream; the
     kernel's NVLink barrier orders it for the peers' pulls); run.sem1 / run.sem2 = the GEMMs' dynamic-persistence
     semaphores, zeroed by the kernel each forward. meta = routing_metadata's tables (cu, s_reverse, s_scatter, a_idx,
     first_src_row) plus slot_addr (per row, its combine slot's address: GEMM2's epilogue store); walk1 =
-    make_dispatch_walk's walk (pool_row, src_address, gate_ptr, gates, dst_row, num_rows, flags, first_src_row,
-    block_rows). block_rows = the swap GEMMs' tile N (the even-split unit), slot_base = make_combine_buffers'."""
+    make_walk_buffers' walk (with x_sf_peer_bufs: the block-scaled scale lane). block_rows = the swap GEMMs' tile N
+    (the even-split unit), slot_base = make_combine_buffers'; slot_row_bytes = one combine slot's bytes (default: a
+    bf16 row of x's width; pass it when x's rows are not bf16, e.g. fp8). first_src_rank = the source rank each
+    expert's walk starts at (default the peer after this rank, the ring; 0 = ascending, bench_ablations.py)."""
     dev = topk_idx.device
+    if first_src_rank is None:
+        first_src_rank = (rank + 1) % W
+    if slot_row_bytes is None:
+        slot_row_bytes = x_peer_bufs[rank].shape[1] * 2
     assert topk_idx.dtype == torch.int32 and topk_idx.shape == (T_local, K)
     assert T_local % GROUP_THREADS == 0, "tiles must not straddle source ranks"
     TK = T_local * K
@@ -522,29 +383,31 @@ def make_prologue(topk_idx, x_peer_bufs, rank, W, T_local, K, E_local, max_rows,
         first_src_row=i32(1),
     )
     flags = torch.zeros(E_local, ncols, dtype=torch.int32, device=dev)
-    walk1 = SimpleNamespace(
-        pool_row=i32(W * T_local), src_address=i64(W * T_local), gate_ptr=i32(W * T_local + 1), gates=i32(max_rows),
-        dst_row=i32(max_rows), num_rows=i32(1), flags=flags, counters=flags.view(-1), first_src_row=meta.first_src_row,
-        block_rows=block_rows,
-    )
+    sf = x_sf_peer_bufs is not None
+    walk1 = make_walk_buffers(W, T_local, max_rows, flags, meta.first_src_row, block_rows, True, sf)
     peer_base = torch.tensor([b.data_ptr() for b in x_peer_bufs], dtype=torch.int64, device=dev)
     row_bytes = x_peer_bufs[rank].shape[1] * x_peer_bufs[rank].element_size()
     sem1, sem2 = torch.zeros(1, dtype=torch.int32, device=dev), torch.zeros(1, dtype=torch.int32, device=dev)
-    kernel = Prologue(K, E_local, W, block_rows, num_ctas)
+    kernel = Prologue(K, E_local, W, block_rows, num_ctas, walk1.sf_atom_rows)
     v = lambda: make_fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1)
     v64 = lambda: make_fake_tensor(Int64, (cute.sym_int(),), leading_dim=0, divisibility=1)
     m = lambda: make_fake_tensor(Int32, (cute.sym_int(), cute.sym_int()), leading_dim=1, divisibility=1)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+    sf_fake, sf_arg, sf_row_bytes = None, None, 0
+    if sf:
+        sf_fake = v64()
+        sf_arg = torch.tensor([b.data_ptr() for b in x_sf_peer_bufs], dtype=torch.int64, device=dev)
+        sf_row_bytes = x_sf_peer_bufs[rank].shape[1] * x_sf_peer_bufs[rank].element_size()
     fn = cute.compile(
         kernel, v(), v(), v64(), v(), v64(), v(), v(), m(), v(), v(), v(), v(), v64(), v64(), v(), m(), m(), v64(),
-        v(), v64(), v(), v(), v(), v(), v(), v(), Int32(rank), Int32(T_local), Int32(row_bytes), stream,
-        options="--enable-tvm-ffi",
+        fake_walk_arguments(sf), v(), v(), Int32(rank), Int32(first_src_rank), Int32(T_local), Int32(row_bytes), Int32(slot_row_bytes),
+        stream, sf_fake, Int32(sf_row_bytes), options="--enable-tvm-ffi",
     )
     run = lambda: fn(
         topk_idx.view(-1), topk_g, sync.topk_g_base, signal, sync.signal_base, sync.barrier_counter, sync.grid_counter,
         sync.counts, meta.cu, meta.s_reverse, meta.s_scatter, meta.a_idx, meta.slot_addr, slot_base, meta.first_src_row,
-        flags, sync.counts2, peer_base, walk1.pool_row, walk1.src_address, walk1.gate_ptr, walk1.gates, walk1.dst_row,
-        walk1.num_rows, sem1, sem2, rank, T_local, row_bytes,
+        flags, sync.counts2, peer_base, walk1.args, sem1, sem2, rank, first_src_rank, T_local, row_bytes, slot_row_bytes, sf_arg,
+        sf_row_bytes,
     )
     run.sync = sync
     run.sem1, run.sem2 = sem1, sem2
