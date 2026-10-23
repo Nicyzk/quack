@@ -951,9 +951,9 @@ class TileStore(EpiOp):
                 gemm.arch in (100, 120) and tensor.element_type.width in (4, 8)
             ), "gated aux output must be 16-bit (or fp8/fp4 on SM100/SM120)"
             if self.pair_dim == "m":
-                assert gemm.arch == 100 and tensor.element_type.width in (8, 16), (
-                    "M-paired gated aux: SM100, 16-bit or fp8 (quantized)"
-                )
+                assert (gemm.arch == 100 and tensor.element_type.width in (8, 16)) or (
+                    gemm.arch == 90 and tensor.element_type.width == 16
+                ), "M-paired gated aux: SM100 16-bit or fp8 (quantized), SM90 16-bit"
                 assert layout.is_m_major_c(), "M-paired gated aux must be m-major"
             else:
                 assert gemm.d_layout is None or gemm.d_layout.is_n_major_c()
@@ -1073,6 +1073,25 @@ class TileStore(EpiOp):
                 copy_atom_postact_c, tiled_mma_gated_postact
             )
             return cute.make_tiled_copy_S(copy_atom_r2s, tiled_copy_c_atom)
+        if self.gated and self.pair_dim == "m" and gemm.arch == 90:
+            # The wgmma accumulator's (r, r+8) row pairs collapsed: thread t of epilogue warp w (16
+            # accumulator rows each) owns postact row 8w + t/4 at columns 8g + 2(t%4) + j, in the
+            # pair view's (j, g) register order; one element per copy, m-major tile.
+            num_warps = gemm.num_epi_warps
+            epi_m = cute.size(gemm.epi_tile[0])
+            assert epi_m == 16 * num_warps, (
+                "M-paired gated aux on SM90 needs 16 accumulator rows per epilogue warp per subtile"
+            )
+            half_m = epi_m // 2
+            epi_n = cute.size(getattr(params, self._epi_tile_key())[1])
+            layout_tv = cute.make_layout(
+                ((4, 8, num_warps), (2, epi_n // 8)),
+                stride=((2 * half_m, 1, 8), (half_m, 8 * half_m)),
+            )
+            atom = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(), getattr(gemm, self._dtype_gemm_attr())
+            )
+            return cute.make_tiled_copy(atom, layout_tv, (half_m, epi_n))
         if self.gated and self.pair_dim == "m" and gemm.arch == 100:
             # The 16dp256b load's (r, r+8) row pairs collapsed: thread t of epilogue warp w owns
             # postact row 16w + 8*m2 + t/4 (m2 = its 16-row group) at columns 8g + 2(t%4) + j,
@@ -1171,7 +1190,8 @@ class TileStore(EpiOp):
         dtype (per-op rounding), plus the gated STSM register permute."""
         dtype = getattr(gemm, self._dtype_gemm_attr())
         rounding = self.rounding if self.rounding is not None else gemm.rounding_mode
-        if const_expr(self.gated and gemm.arch in (90, 120) and dtype.width < 16):
+        stsm_gated = const_expr(self.gated and self.pair_dim == "n" and gemm.arch in (90, 120))
+        if const_expr(stsm_gated and dtype.width < 16):
             # The store TV follows the 16-bit STSM C-atom contract (see
             # _make_tiled_copy_r2s); narrow (fp8/fp4) quantized postact
             # applies the same register permute at fp32 granularity
@@ -1186,7 +1206,7 @@ class TileStore(EpiOp):
             tRS_rAuxOut_out = convert_f32_frag_sr(tRS_rAuxOut, dtype, seed, tidx)
         else:
             tRS_rAuxOut_out = tRS_rAuxOut.to(dtype)
-        if const_expr(self.gated and gemm.arch in (90, 120) and dtype.width == 16):
+        if const_expr(stsm_gated and dtype.width == 16):
             # The STSM store contract's register permute (16-bit prmt form).
             layout_utils.permute_gated_Cregs_b16(tRS_rAuxOut_out)
         return tRS_rAuxOut_out
@@ -1194,7 +1214,7 @@ class TileStore(EpiOp):
     @cute.jit
     def store_r2s(self, gemm, tiled_copy, frag_out, tRS_s_stage, tidx):
         """Copy one converted subtile from registers to this op's smem stage."""
-        if const_expr(self.gated and self.pair_dim == "m" and gemm.arch == 100):
+        if const_expr(self.gated and self.pair_dim == "m" and gemm.arch in (90, 100)):
             # The pair view's registers already follow the tiled copy's value order; the dtype
             # convert flattened their nesting, so view them in the store partition's (V, 1, 1) shape
             src = cute.make_tensor(frag_out.iterator, cute.make_layout(tRS_s_stage.shape))
