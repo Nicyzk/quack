@@ -48,7 +48,7 @@ def operands(M, N, K, rank, world):
     b_hp = torch.randn(N, k_local, dtype=torch.bfloat16, device="cuda") / K**0.5
     a_q, a_sc, a_blk = quantize(a_hp)
     b_q, b_sc, b_blk = quantize(b_hp)
-    return dict(a_q=a_q, a_sc=a_sc, a_blk=a_blk, b_q=b_q, b_sc=b_sc, b_blk=b_blk)
+    return dict(a_q=a_q, a_sc=a_sc, a_blk=a_blk, b_q=b_q, b_sc=b_sc, b_blk=b_blk, a_hp=a_hp, b_hp=b_hp)
 
 
 def scaled_mm(a_q, a_blk, b_q, b_blk, d):
@@ -110,7 +110,47 @@ def arm_legs(ops, M, N, K, rank, world):
     return gemm_leg, sets, [("cuBLAS GEMM", gemm_leg), ("NCCL RS", rs_leg)], (D_full, D_rs), lambda: D_rs
 
 
-ARMS = {"quack": arm_quack, "nccl": arm_nccl, "legs": arm_legs}
+def arm_te(ops, M, N, K, rank, world):
+    """Transformer Engine Userbuffers GEMM+RS on MXFP8 operands (misc/te_ub.py): te.Linear row-parallel with
+    ub_overlap_rs under the MXFP8 recipe; A pre-quantized by TE's MXFP8 quantizer per rotate set (as the other arms
+    take quantized A), the weight quantized once by the module (is_first_microbatch) and cached."""
+    import transformer_engine.pytorch as te
+    import transformer_engine_torch as tex
+    from transformer_engine.common.recipe import MXFP8BlockScaling
+    from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
+
+    from te_ub import init_ub, rs_linear
+
+    init_ub(M, N, world)
+    lin = rs_linear(K, N, world, ops["b_hp"])
+    recipe = MXFP8BlockScaling()
+    quant = MXFP8Quantizer(tex.DType.kFloat8E4M3, rowwise=True, columnwise=False)
+    sets = [(quant(ops["a_hp"].clone()),) for _ in range(l2_rotate_count(ops["a_q"], ops["b_q"]))]
+    last = {}
+
+    def fn(a_te, first=False):
+        with te.fp8_autocast(enabled=True, fp8_recipe=recipe):
+            last["d"] = lin(a_te, is_first_microbatch=first)
+
+    with torch.no_grad():
+        fn(sets[0][0], first=True)  # the weight's one-time quantization
+    return fn, sets, None, (lin, sets), lambda: last["d"]
+
+
+ARMS = {"quack": arm_quack, "nccl": arm_nccl, "te": arm_te, "legs": arm_legs}
+
+
+def ref_err_hp(ops, d_slab, M, rank, world):
+    """max|slab - fp32 full-K reference from the bf16 operands| / max|ref| (for arms that quantize with their own
+    quantizer: the error is then the fp8 level for every arm, not the quantizer difference)."""
+    a_sh = [torch.empty_like(ops["a_hp"]) for _ in range(world)]
+    b_sh = [torch.empty_like(ops["b_hp"]) for _ in range(world)]
+    dist.all_gather(a_sh, ops["a_hp"])
+    dist.all_gather(b_sh, ops["b_hp"])
+    ref = torch.cat(a_sh, 1).float() @ torch.cat(b_sh, 1).float().T
+    m_per = M // world
+    ref = ref[rank * m_per:(rank + 1) * m_per]
+    return ((d_slab.float() - ref).abs().max() / ref.abs().max()).item()
 
 
 def ref_err(ops, d_slab, M, rank, world):
@@ -136,7 +176,11 @@ def main():
     p.add_argument("--ref_check", action="store_true")
     p.add_argument("--quack_configs", default=None,
                    help="'tm,tn,cm,cn[,sw,static];...' (default: blockscaled tiles x sw {1,8}, static)")
+    p.add_argument("--te-rs-sms", type=int, default=16, help="te: the RS pipeline's comm SMs (TE's default 16; one value per process)")
     args = p.parse_args()
+    import te_ub
+
+    te_ub.RS_SMS = args.te_rs_sms
     M, N, K = args.m, args.n, args.k
     global quack_configs
     quack_configs = parse_quack_configs(args.quack_configs or MX_TILES, clc_ok=False)
@@ -155,7 +199,8 @@ def main():
         ref_fn(*ref_sets[0])
         torch.cuda.synchronize()
         dist.barrier()
-        checks = [(args.arm, ref_err(ops, read(), M, rank, world)),
+        err = ref_err_hp if args.arm == "te" else ref_err  # te quantizes with TE's quantizer: check against the bf16 operands
+        checks = [(args.arm, err(ops, read(), M, rank, world)),
                   ("cuBLAS+NCCL", ref_err(ops, ref_read(), M, rank, world))]
     _gpu_warmup()
     kw = [{}] * len(arg_sets)
@@ -184,7 +229,8 @@ def main():
     clean_print(f"  {name + ':':<14} {ms:.3f} ms | {tf(ms):.2f} TFLOp/s", print_once=True)
     clean_print(f"  {'cuBLAS+NCCL:':<14} {ref_ms:.3f} ms | {tf(ref_ms):.2f} TFLOp/s", print_once=True)
     for name, v in checks:
-        clean_print(f"  {name + ' rel err:':<22} {v:.4e} (max|err|/max|ref|, fp32 dequant ref)", print_once=True)
+        ref_kind = "fp32 ref from the bf16 operands (TE quantizes them itself)" if name == "te" else "fp32 dequant ref"
+        clean_print(f"  {name + ' rel err:':<22} {v:.4e} (max|err|/max|ref|, {ref_kind})", print_once=True)
     dist.barrier()
     torchrun_finalize()
 

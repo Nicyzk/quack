@@ -708,6 +708,35 @@ def _asynctp_l2_rotate_inputs(dtype, M, N, K, rank, world):
     return fn, l2_rotate_arg_sets(B, D), (A,)
 
 
+def _te_ub(dtype, M, N, K, rank, world):
+    """Transformer Engine Userbuffers AG+GEMM overlap (misc/te_ub.py): te.Linear column-parallel with
+    ub_overlap_ag, the "ring_exchange" P2P ring on 1 SM beside the cuBLASLt GEMM; the output is allocated per
+    call. B rides the module's weight; is_first_microbatch=False skips its per-call workspace refresh."""
+    from te_ub import ag_linear, init_ub
+
+    shard_m = M // world
+    A = torch.randn(shard_m, K, dtype=torch.bfloat16, device="cuda") / math.sqrt(K)
+    B = torch.randn(N, K, dtype=torch.bfloat16, device="cuda") / math.sqrt(K)
+    init_ub(M, K, world)
+    lin = ag_linear(K, N, world, B)
+    res = {}
+
+    def fn(a, d):
+        res["out"] = lin(a, is_first_microbatch=False)
+
+    with torch.no_grad():
+        lin(A)  # the first call: TE's one-time weight workspace
+    return Kernel(lambda: fn(A, None), _NOOP, A, lin.weight.data, lambda: res["out"].float(), _NOOP, raw=res, fn=fn)
+
+
+def _te_ub_l2_rotate_inputs(dtype, M, N, K, rank, world):
+    """(fn, arg_sets) for the te_ub arm: the A shard rotates (it is copied into the Userbuffers buffer every call),
+    B stays the module's weight (as asynctp's single rotating operand)."""
+    kern = _te_ub(dtype, M, N, K, rank, world)
+    D = torch.empty(M, N, dtype=torch.bfloat16, device="cuda")  # sizing only
+    return kern.fn, l2_rotate_arg_sets(kern.A, D), (kern,)
+
+
 def _nccl(dtype, M, N, K, rank, world):
     """NCCL all-gather + cuBLAS GEMM reference."""
     shard_m = M // world
@@ -728,6 +757,7 @@ BASELINES = {
     "tk":          {"factory": _tk},
     "cutlass":     {"factory": _blackwell},
     "asynctp":     {"factory": _asynctp},
+    "te_ub":       {"factory": _te_ub},
     "legs":        {"factory": None},  # bound legs (cuBLAS GEMM, CE AG); timing-only
     "82":          {"binary": True},
     "flux":        {"h100_lib": True},
@@ -893,6 +923,7 @@ def main():
         "tk":      (_tk_l2_rotate_inputs, True),
         "cutlass": (_blackwell_l2_rotate_inputs, False),
         "asynctp": (_asynctp_l2_rotate_inputs, True),
+        "te_ub":   (_te_ub_l2_rotate_inputs, True),
         "legs":    (_legs_l2_rotate_inputs, True),
     }
     rotate_inputs, rotate_capture = ROTATE_INPUTS.get(args.baseline, (None, True))

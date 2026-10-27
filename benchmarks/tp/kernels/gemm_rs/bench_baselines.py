@@ -340,6 +340,26 @@ def _asynctp(dtype, M, N, K, rank, world):
                   raw=res, fn=fn)
 
 
+def _te_ub(dtype, M, N, K, rank, world):
+    """Transformer Engine Userbuffers GEMM+RS overlap (misc/te_ub.py): te.Linear row-parallel with ub_overlap_rs,
+    the "pipeline" chunked cuBLASLt GEMM with the reduce-scatter on 16 comm SMs; the slab is allocated per call.
+    fn(a, b) swaps the rotating B into the module's weight (a pointer swap)."""
+    from te_ub import init_ub, rs_linear
+
+    A, B = _operands(torch.bfloat16, M, N, K, world)
+    init_ub(M, N, world)
+    lin = rs_linear(K, N, world, B)
+    res = {}
+
+    def fn(a, b):
+        lin.weight.data = b
+        res["out"] = lin(a, is_first_microbatch=False)
+
+    with torch.no_grad():
+        lin(A)  # the first call: TE's one-time weight workspace
+    return Kernel(lambda: fn(A, B), _NOOP, A, B, lambda: res["out"].float(), _NOOP, raw=res, fn=fn)
+
+
 def _kernel_l2_rotate_inputs(factory, dtype, M, N, K, rank, world, swizzles=None):
     """(fn, arg_sets[, sweep]) for do_bench_l2_rotate_all from a Kernel with fn:
     cloned (A, B) k-shards are the L2-turnover payload; the plain-tensor arms
@@ -427,6 +447,7 @@ BASELINES = {
     "tk":          {"factory": _tk,        "nvshmem": False},
     "cutlass":     {"factory": _blackwell, "nvshmem": False},
     "asynctp":     {"factory": _asynctp,   "nvshmem": False},
+    "te_ub":       {"factory": _te_ub,     "nvshmem": False},
     "legs":        {"factory": None,       "nvshmem": False},  # bound legs, timing-only
     "82":          {"binary": True},
     "flux":        {"h100_lib": True},
@@ -534,6 +555,7 @@ def main():
     p.add_argument("--model", choices=list(MODEL_CONFIGS), required=True, help="shape source (MODEL_CONFIGS)")
     p.add_argument("--site", choices=("out", "down"), required=True, help="row-parallel GEMM (SITES)")
     p.add_argument("--m", type=int, required=True, help="rows (2048 prefill, 8192 training)")
+    p.add_argument("--te-rs-sms", type=int, default=16, help="te_ub: the RS pipeline's comm SMs (TE's default 16; one value per process)")
     p.add_argument("--ref_check", action="store_true",
                    help="Max rel err of the kernel & reference vs an fp32 full-K GEMM.")
     p.add_argument("--r2r_check", action="store_true",
@@ -549,6 +571,9 @@ def main():
                         "the cutlass arm sweeps the same set minus what it cannot implement")
     args = p.parse_args()
     M, (N, K) = args.m, SITES[args.site](MODEL_CONFIGS[args.model])
+    import te_ub
+
+    te_ub.RS_SMS = args.te_rs_sms
     global quack_configs
     quack_configs = parse_quack_configs(args.quack_configs, clc_ok=False)
 
@@ -596,6 +621,7 @@ def main():
         "tk":      (_tk_rs_l2_rotate_inputs, False),
         "cutlass": (_blackwell_l2_rotate_inputs, True),
         "asynctp": (_asynctp_l2_rotate_inputs, False),
+        "te_ub":   (partial(_kernel_l2_rotate_inputs, _te_ub), True),
         "legs":    (_legs_l2_rotate_inputs, True),
     }
     rotate_inputs, rotate_capture = ROTATE_INPUTS.get(args.baseline, (None, True))
