@@ -45,6 +45,22 @@ the column-major production order, under epi_reduce). The row-major cells are th
 quack` run with that line set to `AlongM`, under `QUACK_CACHE_ENABLED=0` so the jit cache does not serve the
 old cubin; revert afterwards.
 
+## Versions
+
+The B300 tables: della-tridao (8x B300, driver 610.57.04), conda env `ml-env-cu13`. Every reference column runs
+on the same torch + NCCL as our arms.
+
+| component | version |
+|---|---|
+| torch | 2.13.0+cu130; its `torch.distributed` loads the env's `nvidia-nccl-cu13` 2.31.2 (the NCCL of the cuBLAS+NCCL, NCCL+cuBLAS and async-TP columns; `nccl_env.py` sets its channel floor) |
+| nvidia-cutlass-dsl | 4.7.0 (+ apache-tvm-ffi 0.1.12): the quack kernels |
+| transformer_engine | 2.19.0 (`transformer_engine` + `transformer_engine_cu13` wheels; `transformer_engine_torch` built from the PyPI sdist against the env's torch, NCCL and cuDNN 9.20 headers): the `te_ub` / `te` columns |
+| flashinfer-python | 0.7.2: the `*+flashinfer` and `flashinfer` arms |
+| nvidia-nvshmem-cu13 / nvshmem4py-cu13 | 3.4.5 / 0.3.0: the multimem legs |
+| ThunderKittens (ParallelKittens) | `~/ThunderKittens` at 67845f5f (2026-09-12), the `tk` arms built per world size |
+| cutlass | `~/cutlass` at c26cef04 (2026-08-15): the DistGEMM examples and the `82` binary |
+| flux, triton_dist | H100 only, their own envs (below) |
+
 ## External baselines
 
 Not in this tree; each arm locates its dependency by the path below and fails with a clear import error if
