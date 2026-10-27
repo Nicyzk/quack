@@ -5,7 +5,8 @@ seeds, checks and reporting; every arm computes routed + shared inside its timed
 Arms:
   mok              Mixture-of-Kittens (~/mixture-of-kittens, `mok.functional`): schedule build (top-k all-gather) +
                    the fused dispatch / MLP / combine megakernel with the shared expert inside; output = routed + shared.
-                   One arm mok@N per --mok-comm-sms value (its fwd_num_comm_sms; even, 4-52 recommended).
+                   One arm mok@N/M per --mok-comm-sms value N (its fwd_num_comm_sms; even, 4-52 recommended)
+                   crossed with --mok-minibatch value M (its minibatch_size).
   mok_mxfp8        the same with the routed weights prequantized to MXFP8 (mok quantizes x in-kernel after the bf16
                    dispatch; combine and the shared expert stay bf16).
   megamoe          DeepGEMM's megamoe with num_shared_experts=1 (shared MLP inside the kernel).
@@ -21,6 +22,7 @@ MXFP8 arms).
   torchrun --nproc_per_node=W bench_forward_shared_expert.py mok megamoe quack_intra_swap --t-local 1024 --ref_check --no-canary
 """
 import argparse
+import itertools
 import os
 
 import torch
@@ -63,7 +65,8 @@ def reference_shared_megamoe_mxfp8(x, topk_idx, scores, E, I, w1s, w2s):
 
 
 def _mok(model, x, topk_idx, scores, w1_cat, w1_il, w2, ws, rank, W, T_local, args, w1s, w2s, mxfp8=False):
-    """One arm per --mok-comm-sms / --mok-mxfp8-comm-sms value (mok@N), each with its own MoKConfig and workspace."""
+    """One arm per --mok-comm-sms / --mok-mxfp8-comm-sms value x --mok-minibatch value (mok@N/M), each with its own
+    MoKConfig and workspace."""
     from mok import functional, ops
 
     H, I, K, E_local, dev = model.H, model.I, model.topk, model.E // W, x.device
@@ -73,8 +76,9 @@ def _mok(model, x, topk_idx, scores, w1_cat, w1_il, w2, ws, rank, W, T_local, ar
         gate, up, w2 = (ops.mxfp8_quantize(w, True, False)[:2] for w in (gate, up, w2))
     gate_s, up_s = w1s[:I].contiguous(), w1s[I:].contiguous()
     arms = {}
-    for n in (args.mok_mxfp8_comm_sms if mxfp8 else args.mok_comm_sms).split(","):
-        cfg = functional.MoKConfig(fwd_num_comm_sms=int(n))
+    sms = (args.mok_mxfp8_comm_sms if mxfp8 else args.mok_comm_sms).split(",")
+    for n, mb in itertools.product(sms, args.mok_minibatch.split(",")):
+        cfg = functional.MoKConfig(fwd_num_comm_sms=int(n), minibatch_size=int(mb))
         space = functional.get_workspace(cfg, dist.group.WORLD, device=dev, num_local_tokens=T_local, hidden_size=H, topk=K)
         out = [torch.zeros(T_local, H, dtype=torch.bfloat16, device=dev)]
 
@@ -82,7 +86,7 @@ def _mok(model, x, topk_idx, scores, w1_cat, w1_il, w2, ws, rank, W, T_local, ar
             schedule = functional.build_schedule(space, cfg, topk64, num_local_experts=E_local)
             out[0], _ = functional.forward(cfg, space, schedule, x, scores, gate_s, up_s, w2s, gate, up, w2)
 
-        name = f"{'mok_mxfp8' if mxfp8 else 'mok'}@{int(n)}"
+        name = f"{'mok_mxfp8' if mxfp8 else 'mok'}@{int(n)}/{int(mb)}"
         arms[name] = Kernel(run, _NOOP, lambda out=out: out[0].float(), lambda out=out: out[0].zero_(), lambda ref: ref)
     return arms
 
@@ -226,6 +230,7 @@ def main():
     p.add_argument("--comm-sms", type=int, default=16, help="quack_inter: SMs of the pull / push partition")
     p.add_argument("--mok-comm-sms", type=str, default="24", help="mok: fwd_num_comm_sms, one arm per comma-separated value (mok recommends even 4-52; its bf16 benchmark default 24)")
     p.add_argument("--mok-mxfp8-comm-sms", type=str, default="36", help="mok_mxfp8: fwd_num_comm_sms, one arm per comma-separated value (its mxfp8 benchmark default 36)")
+    p.add_argument("--mok-minibatch", type=str, default="4096", help="mok / mok_mxfp8: minibatch_size, one arm per comma-separated value crossed with the comm SMs (mok's default 4096; its README: tune in 2048-16384, a multiple of 256 dividing the 131072 macrobatch)")
     p.add_argument("--ref_check", action="store_true")
     p.add_argument("--r2r_check", action="store_true")
     p.add_argument("--no-canary", action="store_true")

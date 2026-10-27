@@ -51,12 +51,12 @@ Usage:
         quack_inter quack_intra_swap sonic --comm-sms 16 --presatisfied --ref_check
 """
 import os
+import sys
 
 os.environ.setdefault("TRITON_CACHE_AUTOTUNING", "1")  # sonic's triton autotune choices persist across launches
 
 import argparse
 import statistics
-import sys
 from types import SimpleNamespace
 
 import cutlass
@@ -120,6 +120,7 @@ TILE, CLUSTER = ((256, 256), (2, 1)) if SM100 else ((128, 256), (2, 1))
 
 class GemmDefaultSm100IntraCombine(GemmDefaultEpiMixin, GemmSm100IntraCombine):
     pass
+
 
 
 class GemmDefaultSm90IntraCombine(GemmDefaultEpiMixin, GemmSm90IntraCombine):
@@ -462,7 +463,8 @@ def _sonic_a2a_ref(model, y, scores, scores_g, topk_idx_g, meta, ws, gemm2, rank
 
 BASELINES = {
     "quack_inter": _quack_inter, "quack_intra_epi": _quack_intra_epi,
-    "quack_inter_swap": _quack_inter_swap, "quack_intra_swap": _quack_intra_swap, "sonic": _sonic_chain,
+    "quack_inter_swap": _quack_inter_swap, "quack_intra_swap": _quack_intra_swap,
+    "sonic": _sonic_chain,
     "sonic_a2a": _sonic_a2a_ref, "deepep_te": _deepep_te,
 }
 QUACK = tuple(k for k in BASELINES if k.startswith("quack"))

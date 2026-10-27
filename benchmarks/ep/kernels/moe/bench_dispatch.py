@@ -62,6 +62,7 @@ MODEL_CONFIGS = {
     "glm_5_2": ModelConfig(6144, 2048, 256, 8),  # GLM-5.2 (+1 shared expert)
     "qwen3_5_397b": ModelConfig(4096, 1024, 512, 10),  # Qwen3.5-397B-A17B (+1 shared expert of 1024)
     "qwen3_235b": ModelConfig(4096, 1536, 128, 8),
+    "qwen3_next_80b": ModelConfig(2048, 512, 512, 10),  # Qwen3-Next-80B-A3B (+1 shared expert): the push-bound end
     "mixtral_8x22b": ModelConfig(6144, 16384, 8, 2),
     "olmoe": ModelConfig(2048, 1024, 64, 8),
 }

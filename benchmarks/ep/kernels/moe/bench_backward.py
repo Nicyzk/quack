@@ -5,7 +5,8 @@ alone is timed.
 
 Arms:
   mok         Mixture-of-Kittens' fused bf16 backward (functional.backward on the setup forward's schedule + context,
-              shared expert inside; one arm mok@N per --mok-comm-sms value = its bwd_num_comm_sms)
+              shared expert inside; one arm mok@N/M per --mok-comm-sms value N = its bwd_num_comm_sms crossed with
+              --mok-minibatch value M = its minibatch_size)
   deepep_te   DeepEP dispatch of dout on the forward's handle (the combine's adjoint), the kernels of TE
               GroupedLinear's fc2 and fc1 backwards called explicitly (its grouped GEMM: dgrad NN, wgrad NT; TE
               dswiglu) on the setup forward's saved activations, the score grads reduced to their tokens by DeepEP's
@@ -25,6 +26,7 @@ Arms:
   torchrun --nproc_per_node=4 bench_backward.py mok deepep_te quack_intra_swap --model dsv3_e128 --t-local 1024 --ref_check --r2r_check
 """
 import argparse
+import itertools
 import os
 
 import torch
@@ -77,7 +79,7 @@ def reference_backward(x, topk_idx, scores, dout, E, I, rank, E_local, w1s, w2s,
 
 
 def _mok(model, x, topk_idx, scores, dout, w1_cat, w2, w1s, w2s, rank, W, T_local, args, ws):
-    """One arm per --mok-comm-sms value (mok@N): its own MoKConfig (bwd_num_comm_sms = N) and workspace, the setup
+    """One arm per --mok-comm-sms x --mok-minibatch value (mok@N/M): its own MoKConfig and workspace, the setup
     forward's schedule + context replayed by every backward call."""
     from mok import functional
 
@@ -86,8 +88,8 @@ def _mok(model, x, topk_idx, scores, dout, w1_cat, w2, w1s, w2s, rank, W, T_loca
     gate, up = w1_cat[:, :I].contiguous(), w1_cat[:, I:].contiguous()  # (E_local, I, H) each; w2 (E_local, H, I)
     gate_s, up_s = w1s[:I].contiguous(), w1s[I:].contiguous()
     arms = {}
-    for n in args.mok_comm_sms.split(","):
-        cfg = functional.MoKConfig(fwd_num_comm_sms=24, bwd_num_comm_sms=int(n))
+    for n, mb in itertools.product(args.mok_comm_sms.split(","), args.mok_minibatch.split(",")):
+        cfg = functional.MoKConfig(fwd_num_comm_sms=24, bwd_num_comm_sms=int(n), minibatch_size=int(mb))
         space = functional.get_workspace(cfg, dist.group.WORLD, device=dev, num_local_tokens=T_local, hidden_size=H, topk=K)
         schedule = functional.build_schedule(space, cfg, topk64, num_local_experts=E_local)
         _, ctx = functional.forward(cfg, space, schedule, x, scores, gate_s, up_s, w2s, gate, up, w2)
@@ -100,7 +102,7 @@ def _mok(model, x, topk_idx, scores, dout, w1_cat, w2, w1s, w2s, rank, W, T_loca
             d_x, d_s, d_gate, d_up, d_down, d_sg, d_su, d_sd = out["g"]
             return {"dx": d_x, "dscores": d_s, "dw1": torch.cat((d_gate, d_up), 1), "dw2": d_down, "dw1s": torch.cat((d_sg, d_su)), "dw2s": d_sd}
 
-        arms[f"mok@{int(n)}"] = (run, grads)
+        arms[f"mok@{int(n)}/{int(mb)}"] = (run, grads)
     return arms
 
 
@@ -260,6 +262,7 @@ def main():
     p.add_argument("--model", choices=list(MODEL_CONFIGS), default="dsv3")
     p.add_argument("--t-local", type=int, default=8192)
     p.add_argument("--mok-comm-sms", type=str, default="28", help="mok: bwd_num_comm_sms, one arm per comma-separated value (its benchmark default 28)")
+    p.add_argument("--mok-minibatch", type=str, default="4096", help="mok: minibatch_size, one arm per comma-separated value crossed with the comm SMs (mok's default 4096; its README: tune in 2048-16384, a multiple of 256 dividing the 131072 macrobatch)")
     p.add_argument("--ref_check", action="store_true")
     p.add_argument("--r2r_check", action="store_true")
     args = p.parse_args()

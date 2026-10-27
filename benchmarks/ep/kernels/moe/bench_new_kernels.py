@@ -13,6 +13,9 @@ requantized as the senders did), max rel err < 2^-6.
 
   torchrun --nproc_per_node=W bench_new_kernels.py --t-local 1024 --activations swiglu geglu relu_sq --ref_check
   torchrun --nproc_per_node=W bench_new_kernels.py --t-local 1024 --formats nvfp4 --activations swiglu geglu --ref_check
+  PYTHONPATH=~/nccl-extensions/python-overlay:$PYTHONPATH CUDA_HOME=/usr/local/cuda-13.3 torchrun --nproc_per_node=W \
+      bench_new_kernels.py --formats nvfp4 --activations geglu --baselines nccl_ep_te --nccl-ep-sms 16,32,64,all --ref_check
+  (nccl_ep_te needs the libnccl_ep.so rebuilt against the env's NCCL, ~/nccl-extensions/README-local.md, and nvcc for its JIT)
 """
 import argparse
 import itertools
@@ -61,13 +64,16 @@ def reference_postact(activation, rows, cu, w1_cat, I):
     return out
 
 
-def fc1_stage_quantized(fmt, activation, model, x, topk_idx, w1_cat, ws, rank, W, T_local, block_rows, clusters, desc, rows_bf16):
+def fc1_stage_quantized(
+    fmt, activation, model, x, topk_idx, w1_cat, ws, rank, W, T_local, block_rows, clusters, desc, rows_bf16, first_src_rank=None
+):
     """The fused dispatch + fc1 stage (a gated activation, bf16 postact) with quantized operands and its own walk over
     the packed rows + scale rows, plus its bounds: the bare GEMM1 over the rows the stage landed (gates pre-satisfied)
     and the pull alone. fmt "mxfp8": e4m3 + ue8m0 per 32 (quack to_mx); "nvfp4": e2m1 + ue4m3 per 16 with one
     per-tensor scale each, x's from the amax over all ranks (every rank's rows share the scale the receiving GEMM
-    applies), alpha = pts_w * pts_x. Returns (arms, postact, reference fn, keep): the caller holds `keep` for as long
-    as the arms run (the symmetric x buffers; the walk carries their addresses, not references)."""
+    applies), alpha = pts_w * pts_x. first_src_rank = make_prologue's (the source rank each expert's walk starts at;
+    rows_bf16 must be landed in the same order). Returns (arms, postact, reference fn, keep): the caller holds `keep`
+    for as long as the arms run (the symmetric x buffers; the walk carries their addresses, not references)."""
     H, I, K, E_local, dev = model.H, model.I, model.topk, model.E // W, x.device
     max_rows = W * T_local * min(K, E_local)
     e8m0 = torch.float8_e8m0fnu
@@ -104,7 +110,7 @@ def fc1_stage_quantized(fmt, activation, model, x, topk_idx, w1_cat, ws, rank, W
     buffers = make_combine_buffers(T_local, K, H, torch.bfloat16, ws.ep_group)  # the prologue's slot table (unused here)
     prologue, meta, walk = make_prologue(
         topk_idx, xq_peers, rank, W, T_local, K, E_local, max_rows, block_rows, buffers.slot_base, ws.ep_group,
-        x_sf_peer_bufs=xs_peers, slot_row_bytes=H * 2,
+        x_sf_peer_bufs=xs_peers, slot_row_bytes=H * 2, first_src_rank=first_src_rank,
     )
     atoms = walk.sf_atom_rows // 128
     rows = torch.empty(max_rows, cols, dtype=x_dtype, device=dev)
@@ -134,15 +140,23 @@ def fc1_stage_quantized(fmt, activation, model, x, topk_idx, w1_cat, ws, rank, W
     }
     want = lambda: reference_postact(activation, rows_dq, meta.cu, w1_dq, I)
     posts = {f"dispatch+gemm1 {activation} {fmt}": (a, want)}
-    if plain:  # the unfused pair: the same stage storing the raw preact, then the activation as its own pass
+    if plain or gated:  # the unfused pair: the same stage storing the raw preact, then the activation as its own pass
         fn_p, Cls_p, _ = bf.compile_gemm1_gated_swap(
             cute_dtype, model, W, T_local, intra_pull=H, gather_B=False, mx=fmt, quant_postact=False,
             activation=None, gated=False,
         )
-        pre, post = torch.empty_like(a), torch.empty_like(a)
+        # gated: the 2I-wide preact over the interleaved weights (interleave_gate_up: per 16 columns, 8 gate then 8 up),
+        # the pass pairs them
+        pre, post = torch.empty(max_rows, 2 * I if gated else I, dtype=torch.bfloat16, device=dev), torch.empty_like(a)
         epi_p = Cls_p.EpilogueArguments(mAuxOut=pre.T, **alpha_kw)
         gemm1_p = lambda: fn_p(w1_q_il, rows, None, None, epi_p, sched, varlen, sfa, sf1[None], walk.args, desc)
-        act_c = torch.compile(lambda h, out: out.copy_(TORCH_ACT[activation](h)))
+        act = TORCH_ACT[activation]
+
+        def gated_pass(h):
+            g = h.view(*h.shape[:-1], -1, 2, 8)
+            return act(g[..., 0, :], g[..., 1, :]).reshape(*h.shape[:-1], -1)
+
+        act_c = torch.compile(lambda h, out: out.copy_(gated_pass(h) if gated else act(h)))
         n_rows = rows_bf16.shape[0]  # the landed rows (meta.cu is only filled once the prologue has run)
         act_g = bf.capture_graph(lambda: act_c(pre[:n_rows], post[:n_rows]))  # graphed: eager hides under host enqueue
         arms[f"dispatch+gemm1 {activation}-preact {fmt}"] = lambda: (prologue(), gemm1_p())
@@ -187,22 +201,23 @@ class NcclRouting:
         return send_splits, recv_splits, num_recv, recv_to_grouped, torch.cat((cu.new_zeros(1), cu)), rows
 
 
-def fc1_stage_te(kind, fmt, activation, model, x, topk_idx, w1_cat, ws, rank, W, T_local):
-    """fc1_stage_unfused's TE arms, see there."""
+def fc1_stage_te(kind, fmt, activation, model, x, topk_idx, w1_cat, ws, rank, W, T_local, sms=None):
+    """fc1_stage_unfused's TE arms, see there; sms = NCCL EP's SM budget (nccl_ep_te)."""
     import transformer_engine.pytorch as te
     import transformer_engine_torch as tex
     from transformer_engine.common.recipe import MXFP8BlockScaling, NVFP4BlockScaling
-    from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
+    from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm, general_grouped_gemm_for_grouped_tensor
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer, MXFP8Tensor
     from transformer_engine.pytorch.tensor.nvfp4_tensor import NVFP4Quantizer, NVFP4Tensor
+    from transformer_engine.pytorch.tensor.storage.grouped_tensor_storage import GroupedTensorStorage
 
     assert fmt in FORMATS, f"{kind}: --formats mxfp8 / nvfp4"
     H, I, K, E_local, dev = model.H, model.I, model.topk, model.E // W, x.device
     max_rows = W * T_local * min(K, E_local)
     mx, gated = fmt == "mxfp8", activation in gate_fn_map
-    w1_src = w1_cat if gated else w1_cat[:, :I].contiguous()
+    w1_src = w1_cat if gated or activation == "none" else w1_cat[:, :I].contiguous()  # none: the 2I-wide (gated-shape) preact
     n_out = w1_src.shape[1]
-    te_act = {"swiglu": tex.swiglu, "geglu": tex.geglu, "relu_sq": tex.srelu}[activation]
+    te_act = {"swiglu": tex.swiglu, "geglu": tex.geglu, "relu_sq": tex.srelu, "none": lambda h, _: h}[activation]
     e4m3, e2m1 = tex.DType.kFloat8E4M3, tex.DType.kFloat4E2M1
     dq = lambda t: t.dequantize(dtype=torch.float32)
     want_from = lambda rows_dq, cu, w_dq: reference_postact(activation, rows_dq, cu, torch.stack(w_dq), I)
@@ -248,7 +263,7 @@ def fc1_stage_te(kind, fmt, activation, model, x, topk_idx, w1_cat, ws, rank, W,
 
         return run, lambda: state["out"][: int(state["cu"][-1])], want, (buffer, lin, ones)
 
-    assert kind == "nccl_te", kind
+    assert kind in ("nccl_te", "nccl_ep_te"), kind
     q_x = quantizer(None if mx else ws.ep_group)
     xq = q_x(x)
     xd, xs = xq._rowwise_data, xq._rowwise_scale_inv[:T_local]  # the rows' bytes, one scale row per row
@@ -256,16 +271,7 @@ def fc1_stage_te(kind, fmt, activation, model, x, topk_idx, w1_cat, ws, rank, W,
     amax = getattr(xq, "_amax_rowwise", None)
     w_q = [quantizer()(w1_src[e]) for e in range(E_local)]
     routing = NcclRouting(topk_idx, E_local, ws.ep_group)
-    token_of_copy = routing.sort_indices // K
-    send_rows = torch.empty(T_local * K, cols, dtype=torch.uint8, device=dev)
-    send_sf = torch.empty(T_local * K, sfc, dtype=torch.uint8, device=dev)
-    recv_rows = torch.empty(max_rows, cols, dtype=torch.uint8, device=dev)
-    recv_sf = torch.empty(max_rows, sfc, dtype=torch.uint8, device=dev)
-    grouped_rows = torch.empty(max_rows, cols, dtype=torch.uint8, device=dev)
-    grouped_sf = torch.empty(max_rows, sfc, dtype=torch.uint8, device=dev)
-    sf_pad = torch.zeros((max_rows + 127) // 128 * 128 + E_local * 128, sfc, dtype=torch.uint8, device=dev)
     pre = torch.empty(max_rows, n_out, dtype=torch.bfloat16, device=dev)
-    experts = torch.arange(E_local, device=dev, dtype=torch.int32)
     r128 = lambda n: (n + 127) // 128 * 128
 
     def qview(data, sinv, rows):  # a quantized view over the rows' bytes and their scale rows (128-row padded)
@@ -275,6 +281,84 @@ def fc1_stage_te(kind, fmt, activation, model, x, topk_idx, w1_cat, ws, rank, W,
         return NVFP4Tensor((rows, H), torch.bfloat16, rowwise_data=data, rowwise_scale_inv=sinv, columnwise_data=None,
                            columnwise_scale_inv=None, amax_rowwise=amax, amax_columnwise=None, fp4_dtype=e2m1, quantizer=q_x,
                            with_gemm_swizzled_scales=False, requires_grad=False)
+
+    if kind == "nccl_ep_te":
+        import nccl.ep as ep
+        from nccl.ep.interop.torch import get_nccl_comm_from_group
+
+        align = 128  # TE's scale rows per expert start 128-aligned: NCCL EP pads each expert's slot zone to it
+        rows_l = routing.build()[5]  # valid rows per local expert; routing is fixed, so built once (setup, as the handle)
+        cu = torch.tensor([0, *itertools.accumulate(rows_l)], dtype=torch.int32, device=dev)
+        starts = [sum(r128(n) for n in rows_l[:e]) for e in range(E_local)]
+        budget = W * T_local * K + (align - 1) * E_local  # static recv slots: every expert's zone padded
+        comm = get_nccl_comm_from_group(ws.ep_group)
+        group = ep.Group.create(comm, ep.GroupConfig(
+            algorithm=ep.Algorithm.HIGH_THROUGHPUT, num_experts=model.E, max_dispatch_tokens_per_rank=T_local,
+            max_recv_tokens_per_rank=budget, max_token_bytes=(cols + sfc + 15) // 16 * 16, num_topk=K, max_num_sms=sms or 0,
+        ))
+        counts, offsets, total = (torch.zeros(n, dtype=torch.int32, device=dev) for n in (E_local, E_local, 1))
+        info = ep.LayoutInfo(expert_counters=ep.Tensor(counts), expert_offsets=ep.Tensor(offsets), recv_total_counter=ep.Tensor(total))
+        idx64 = ep.Tensor(topk_idx.to(torch.int64).contiguous())  # the handle keeps the descriptor: it must outlive it
+        handle = group.create_handle(ep.Layout.EXPERT_MAJOR, idx64, layout_info=info,
+                                     config=ep.HandleConfig(dispatch_output_per_expert_alignment=align), stream=torch.cuda.current_stream())
+        torch.cuda.synchronize()
+        assert offsets.tolist() == starts and int(total) == starts[-1] + r128(rows_l[-1]), (offsets.tolist(), starts, int(total))
+        recv_rows = torch.empty(budget, cols, dtype=torch.uint8, device=dev)
+        recv_sf = torch.zeros(budget, sfc, dtype=torch.uint8, device=dev)  # only landed rows are written: the padding stays 0
+        slot_w = torch.empty(budget, dtype=torch.float32, device=dev)  # HT forward dispatch requires the per-slot weight output
+        ones = torch.ones(T_local, K, dtype=torch.float32, device=dev)
+        d_in = ep.DispatchInputs(tokens=ep.Tensor(xd.view(torch.float8_e4m3fn)), topk_weights=ep.Tensor(ones), scales=ep.Tensor(xs))
+        d_out = ep.DispatchOutputs(tokens=ep.Tensor(recv_rows.view(torch.float8_e4m3fn)), topk_weights=ep.Tensor(slot_w), scales=ep.Tensor(recv_sf))
+        d_cfg = ep.DispatchConfig(quantization_recipe=ep.DispatchQuantizationRecipe.FWD)  # the bytes + scale rows forwarded as is
+        views = [qview(recv_rows[s : s + n], recv_sf[s : s + r128(n)], n) for s, n in zip(starts, rows_l)]
+        num_recv, total = int(cu[-1]), starts[-1] + r128(rows_l[-1])
+        # the GEMM leg = TE's single-launch grouped GEMM (GroupedLinear's path): one quantized tensor over the zones,
+        # members = each zone's valid rows (tensor_offsets in logical elements), output compact in cu order. cuBLASLt
+        # wants GEMM-swizzled scales: the weights' once, the landed (compact) scale rows per call; the swizzle op
+        # writes a new scale buffer and re-points the tensor at it (and is a no-op once its flag is set), so the
+        # view over the zones is rebuilt per call and recv_sf stays compact for the reference
+        for w in w_q:
+            tex.swizzle_scales_for_gemm_(w)
+        first_dims = torch.tensor(rows_l, dtype=torch.int64, device=dev)
+        in_off = torch.tensor([*(s * H for s in starts), total * H], dtype=torch.int64, device=dev)
+        out_off = torch.tensor([int(c) * n_out for c in cu.tolist()], dtype=torch.int64, device=dev)
+        out = GroupedTensorStorage(shape=(num_recv, n_out), dtype=torch.bfloat16, num_tensors=E_local, quantizer=None,
+                                   data=pre[:num_recv].reshape(-1), first_dims=first_dims, tensor_offsets=out_off)
+        amax_g = None if amax is None else amax.expand(E_local).contiguous()
+
+        def dispatch():
+            handle.dispatch(d_in, d_out, config=d_cfg, stream=torch.cuda.current_stream())
+
+        def gemm():
+            whole = qview(recv_rows[:total], recv_sf[:total], total)
+            tex.swizzle_scales_for_gemm_(whole)
+            a = GroupedTensorStorage(shape=(total, H), dtype=torch.bfloat16, num_tensors=E_local, quantizer=q_x,
+                                     data=whole._rowwise_data.reshape(-1), scale_inv=whole._rowwise_scale_inv.reshape(-1),
+                                     amax=amax_g, first_dims=first_dims, tensor_offsets=in_off, with_gemm_swizzled_scales=True)
+            general_grouped_gemm_for_grouped_tensor(w_q, a, out, layout="TN")
+            state["out"] = te_act(pre[:num_recv], None)
+
+        def run():
+            dispatch()
+            gemm()
+
+        run.legs = {"nccl_ep alone": dispatch, "te fc1 alone": gemm}
+
+        def want():  # the operand as delivered: each expert's zone, dequantized (the weights requantized: w_q is swizzled)
+            return want_from(torch.cat([dq(v) for v, n in zip(views, rows_l) if n]), cu, [dq(quantizer()(w1_src[e])) for e in range(E_local)])
+
+        keep = (group, handle, comm, info, idx64, d_in, d_out, recv_rows, recv_sf, slot_w, ones, pre, xq, w_q, views, out)
+        return run, lambda: state["out"], want, keep
+
+    token_of_copy = routing.sort_indices // K
+    send_rows = torch.empty(T_local * K, cols, dtype=torch.uint8, device=dev)
+    send_sf = torch.empty(T_local * K, sfc, dtype=torch.uint8, device=dev)
+    recv_rows = torch.empty(max_rows, cols, dtype=torch.uint8, device=dev)
+    recv_sf = torch.empty(max_rows, sfc, dtype=torch.uint8, device=dev)
+    grouped_rows = torch.empty(max_rows, cols, dtype=torch.uint8, device=dev)
+    grouped_sf = torch.empty(max_rows, sfc, dtype=torch.uint8, device=dev)
+    sf_pad = torch.zeros((max_rows + 127) // 128 * 128 + E_local * 128, sfc, dtype=torch.uint8, device=dev)
+    experts = torch.arange(E_local, device=dev, dtype=torch.int32)
 
     def run():
         send_splits, recv_splits, num_recv, recv_to_grouped, cu, rows_l = routing.build()
@@ -309,9 +393,14 @@ def fc1_stage_te(kind, fmt, activation, model, x, topk_idx, w1_cat, ws, rank, W,
     return run, lambda: state["out"], want, keep
 
 
-def fc1_stage_unfused(kind, activation, model, x, topk_idx, w1_cat, ws, rank, W, T_local, fmt=None):
+def fc1_stage_unfused(kind, activation, model, x, topk_idx, w1_cat, ws, rank, W, T_local, fmt=None, sms=None):
     """Unfused baselines for the dispatch + fc1 stage, NCCL all_to_all for the dispatch (NcclRouting's schedule per
     call) then a grouped GEMM and the activation in torch:
+      "nccl_ep_te" (fmt): NVIDIA nccl-extensions' NCCL EP (`nccl.ep`, high-throughput mode, expert-major layout,
+        `sms` SMs) dispatching the TE-quantized rows + scale rows as bytes into 128-aligned per-expert zones, then
+        TE's single-launch grouped-tensor GEMM over the zones (GroupedLinear's path: the landed scale rows swizzled
+        for cuBLASLt per call) and the activation as a TE op; the handle (routing) is built at setup. Its
+        `run.legs` = the dispatch alone and the swizzle + GEMM + activation alone;
       "nccl_quack_nvfp4": x and w1 in NVFP4 (quack's recipe, x's per-tensor scale over all ranks), the packed rows
         and e4m3 scale rows over NCCL as bytes, the received scales relaid into quack's per-expert padded SF layout,
         quack's grouped varlen-M blockscaled GEMM (compile_blockscaled_gemm_tvm_ffi, 128x128 tiles), alpha and the
@@ -329,8 +418,8 @@ def fc1_stage_unfused(kind, activation, model, x, topk_idx, w1_cat, ws, rank, W,
 
     H, I, K, E_local, dev = model.H, model.I, model.topk, model.E // W, x.device
     max_rows = W * T_local * min(K, E_local)
-    if kind in ("nccl_te", "deepep_te"):
-        return fc1_stage_te(kind, fmt, activation, model, x, topk_idx, w1_cat, ws, rank, W, T_local)
+    if kind in ("nccl_te", "deepep_te", "nccl_ep_te"):
+        return fc1_stage_te(kind, fmt, activation, model, x, topk_idx, w1_cat, ws, rank, W, T_local, sms)
     routing = NcclRouting(topk_idx, E_local, ws.ep_group)
     token_of_copy = routing.sort_indices // K
     act_fn = TORCH_ACT[activation]
@@ -418,7 +507,8 @@ def main():
     p.add_argument("--t-local", type=int, default=1024)
     p.add_argument("--activations", nargs="+", default=["swiglu", "geglu", "relu_sq"], choices=sorted(TORCH_ACT))
     p.add_argument("--formats", nargs="+", default=["bf16"], choices=["none", "bf16", *FORMATS], help="operand formats of the fused stage; mxfp8 / nvfp4 rows carry their bounds and take gated activations only; none: baselines only")
-    p.add_argument("--baselines", nargs="*", default=[], choices=["nccl_quack_nvfp4", "nccl_torch_bf16", "nccl_te", "deepep_te"], help="unfused dispatch + fc1 baselines (see fc1_stage_unfused), one per activation; nccl_te / deepep_te one per --formats format")
+    p.add_argument("--baselines", nargs="*", default=[], choices=["nccl_quack_nvfp4", "nccl_torch_bf16", "nccl_te", "deepep_te", "nccl_ep_te"], help="unfused dispatch + fc1 baselines (see fc1_stage_unfused), one per activation; nccl_te / deepep_te / nccl_ep_te one per --formats format")
+    p.add_argument("--nccl-ep-sms", type=str, default="16,32,64,all", help="nccl_ep_te: NCCL EP's SM budget, one arm per comma-separated value (its HT default 16; all = the device's SM count: nothing runs beside the dispatch in the unfused chain)")
     p.add_argument("--ref_check", action="store_true")
     args = p.parse_args()
     args.sonic_metadata = False
@@ -464,16 +554,24 @@ def main():
                 gemm_flops = 2 * total_m * H * (I if act in act_fn_map else 2 * I)
                 for name in fmt_arms:
                     flops[name] = None if name.startswith("pull") or " pass " in name else gemm_flops
-        te_kinds = ("nccl_te", "deepep_te")  # one arm per quantized format
+        te_kinds = ("nccl_te", "deepep_te", "nccl_ep_te")  # one arm per quantized format
+        n_sm = torch.cuda.get_device_properties(dev).multi_processor_count
+        ep_sms = [n_sm if s == "all" else int(s) for s in args.nccl_ep_sms.split(",")]
         for kind in args.baselines:
             for act in args.activations:
                 for fmt in [f for f in args.formats if f in FORMATS] if kind in te_kinds else [None]:
                     assert kind in te_kinds or act in gate_fn_map, f"{kind}: gated activations only, got {act}"
-                    run_b, out_b, want_b, pinned = fc1_stage_unfused(kind, act, model, x, topk_idx, w1_cat, ws, rank, W, T_local, fmt)
-                    name = f"{kind} {act}" + (f" {fmt}" if fmt else "")
-                    arms[name], flops[name] = run_b, 2 * total_m * H * (2 * I if act in gate_fn_map else I)
-                    keep.append(pinned)
-                    posts[name] = (out_b, want_b)
+                    for sms in ep_sms if kind == "nccl_ep_te" else [None]:
+                        run_b, out_b, want_b, pinned = fc1_stage_unfused(kind, act, model, x, topk_idx, w1_cat, ws, rank, W, T_local, fmt, sms)
+                        tag = f" {act}" + (f" {fmt}" if fmt else "")
+                        name = f"{kind}{'' if sms is None else f'@{sms}'}{tag}"
+                        arms[name], flops[name] = run_b, 2 * total_m * H * (2 * I if act in gate_fn_map else I)
+                        keep.append(pinned)
+                        posts[name] = (out_b, want_b)
+                        for leg, fn in getattr(run_b, "legs", {}).items():  # the GEMM leg is the same at every SM count
+                            if leg.startswith("nccl_ep") or sms == ep_sms[0]:
+                                leg_name = f"{leg}{f'@{sms}' if leg.startswith('nccl_ep') else ''}{tag}"
+                                arms[leg_name], flops[leg_name] = fn, None
         for act in args.activations if "bf16" in args.formats else ():
             gated = act in gate_fn_map
             assert gated or act in act_fn_map, act

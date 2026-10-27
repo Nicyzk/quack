@@ -19,6 +19,12 @@ gemm2+combine (GEMM2 + barrier + reduce) timed as stages beside the whole forwar
 ref-checked.
 
   torchrun --nproc_per_node=4 bench_ablations.py src-order --model dsv4_pro --t-local 4096 --ref_check
+
+src-order-fc1 (W ranks, torchrun): the quantized fused dispatch + fc1 stage (bench_new_kernels.fc1_stage_quantized,
+--format nvfp4 / mxfp8, --activation) built twice, ring vs ascending source order (make_prologue's first_src_rank):
+the fused stage and the pull alone per order, the GEMM1 alone once, both fused stages ref-checked.
+
+  torchrun --nproc_per_node=8 bench_ablations.py src-order-fc1 --model dsv4_pro --t-local 4096 --format nvfp4 --activation geglu --ref_check
 """
 import argparse
 import os
@@ -189,17 +195,112 @@ def src_order(args):
             print(f"  forward {order}: ref " + " ".join(f"{c}" for _, c in gathered for c in [c[order]]))
 
 
+def src_order_fc1(args):
+    import bench_new_kernels as bnk
+    from quack.activation import gate_fn_map
+
+    rank, W = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
+    dev = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
+    torch.cuda.set_device(dev)
+    dist.init_process_group("nccl", device_id=dev)
+    model = MODEL_CONFIGS[args.model]
+    H, I, E, K = model
+    T_local, E_local = args.t_local, E // W
+    fmt, act = args.format, args.activation
+    args.sonic_metadata = False
+    ws = SymmMemManager(None, dev)._get_or_alloc(T_local, H, K, E_local, torch.bfloat16, DispatchMode.RANK_DEDUP_DISPATCH_TRITON)
+    g = torch.Generator(device=dev).manual_seed(123 + rank)
+    x = torch.randn(T_local, H, generator=g, device=dev, dtype=torch.bfloat16)
+    topk_idx = torch.rand(T_local, E, generator=g, device=dev).topk(K, dim=-1).indices.to(torch.int32)
+    scores = torch.rand(T_local, K, generator=g, device=dev).softmax(-1)
+    local = [expert_weights(e, H, I, dev) for e in range(rank * E_local, (rank + 1) * E_local)]
+    w1_cat = torch.stack([w1 for w1, _ in local])
+    w2 = torch.stack([w2 for _, w2 in local])
+    del local
+    w1_il = w1_cat.view(E_local, 2, I, H).transpose(1, 2).reshape(E_local, 2 * I, H).contiguous()
+    shared = (model, x, topk_idx, scores, w1_cat, w1_il, w2, ws, rank, W, T_local, args)
+
+    with torch.no_grad():
+        arms, posts, keep = {}, {}, []
+        block_rows = bf.compile_gemm1_gated_swap(cutlass.BFloat16, model, W, T_local, intra_pull=H, gather_B=False)[2]
+        desc = torch.empty(torch.cuda.get_device_properties(dev).multi_processor_count * 16, dtype=torch.int64, device=dev)
+        for order in ("ring", "ascending"):
+            args.src_order = order
+            run = bf.BASELINES["quack_intra_swap"](*shared)["quack_intra_swap"].run  # the bf16 pipeline: its landed rows in this order
+            pt = run.parts
+            total_m = int(pt.cu[-1].item())
+            first = (rank + 1) % W if order == "ring" else 0
+            fmt_arms, fmt_posts, pinned = bnk.fc1_stage_quantized(
+                fmt, act, model, x, topk_idx, w1_cat, ws, rank, W, T_local, block_rows, pt.clusters, desc, pt.rows[:total_m],
+                first_src_rank=first,
+            )
+            keep.append((pinned, run))
+            for name, fn in fmt_arms.items():
+                if name.startswith("gemm1 alone"):
+                    if order == "ring":
+                        arms[name] = fn  # the same GEMM over the landed rows, whatever their order
+                    continue
+                arms[f"{name} {order}"] = fn
+            posts[f"dispatch+gemm1 {act} {fmt} {order}"] = fmt_posts[f"dispatch+gemm1 {act} {fmt}"]
+        gemm_flops = 2 * total_m * H * (2 * I if act in gate_fn_map else I)
+        for fn in arms.values():  # every kernel once before the timed calls
+            fn()
+        torch.cuda.synchronize()
+        dist.barrier()
+        checks = {}
+        if args.ref_check:
+            for name, (a, want_fn) in posts.items():
+                a.zero_()
+                torch.cuda.synchronize()
+                dist.barrier()
+                arms[name]()
+                torch.cuda.synchronize()
+                dist.barrier()
+                want = want_fn()
+                err = ((a[:total_m].float() - want).abs().max() / want.abs().max()).item()
+                checks[name] = (err < 2**-6, err)
+        ms = bench_all(arms, ws.x_hdl)
+        unstable = [None] * W
+        dist.all_gather_object(unstable, [k for k, v in ms.items() if arm_stats(v)[3]])
+        rerun = [k for k in arms if any(k in u for u in unstable)]
+        if rerun:
+            again = bench_all({k: arms[k] for k in rerun}, ws.x_hdl)
+            ms.update({k: v for k, v in again.items() if not arm_stats(v)[3]})
+
+    stats = {k: arm_stats(v) for k, v in ms.items()}
+    gathered = [None] * W
+    dist.all_gather_object(gathered, (stats, checks))
+    if rank == 0:
+        med = {k: max((s[k] for s, _ in gathered), key=lambda t: t[0]) for k in ms}
+        print(
+            f"<source rank order, {fmt} fc1 {act} {args.model} (H={H} I={I} E={E} top-{K}) | W={W} T_local={T_local} "
+            f"total_m={total_m} (rank 0) | warm {WARM_S * 1e3:.0f} ms, {REPS} x {WINDOW_S * 1e3:.0f} ms blocks, rerun={rerun}>"
+        )
+        for k, (m, lo, hi, _) in med.items():
+            flag = "  UNSTABLE" if any(s[k][3] for s, _ in gathered) else ""
+            rate = "" if k.startswith("pull") else f"{gemm_flops / m / 1e9:5.0f} TFLOP/s"
+            print(f"  {k + ':':<36} {m * 1e3:7.0f} us  [{lo * 1e3:.0f}-{hi * 1e3:.0f}]  {rate}{flag}")
+        for name in checks:
+            ok = all(c[name][0] for _, c in gathered)
+            err = max(c[name][1] for _, c in gathered)
+            print(f"  {name} ref: {'ok' if ok else 'MISMATCH'} max rel err {err:.3e}")
+    dist.barrier()
+    os._exit(0)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("mode", choices=("walk", "src-order"))
+    p.add_argument("mode", choices=("walk", "src-order", "src-order-fc1"))
     p.add_argument("--model", choices=list(MODEL_CONFIGS), default="dsv4_pro")
     p.add_argument("--t-local", type=int, default=4096)
     p.add_argument("--emulated-w", type=str, default="2,4,8", help="walk: the EP sizes emulated, one table row each")
     p.add_argument("--rounds", type=int, default=20, help="walk: rounds of one launch per arm, arm order rotated")
     p.add_argument("--full-blocks", action="store_true", help="walk: one whole token block per slice (W blocks per expert) instead of the real rows")
     p.add_argument("--ref_check", action="store_true", help="src-order: both whole forwards vs the reference")
+    p.add_argument("--format", choices=("nvfp4", "mxfp8"), default="nvfp4", help="src-order-fc1: the stage's operand format")
+    p.add_argument("--activation", default="geglu", help="src-order-fc1: the stage's activation")
     args = p.parse_args()
-    (walk if args.mode == "walk" else src_order)(args)
+    {"walk": walk, "src-order": src_order, "src-order-fc1": src_order_fc1}[args.mode](args)
 
 
 if __name__ == "__main__":
