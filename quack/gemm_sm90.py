@@ -590,7 +590,7 @@ class GemmSm90(GemmTmaBase):
             assert mAuxA is not None, "the transform's raw aux operand (e.g. seed) needs mA.sf"
         # the comm warps run the epilogue and read C themselves (per subtile, from gmem): the GEMM stages no C
         mC_comm = None
-        if const_expr(self.dist_op.finalizes_epilogue):
+        if const_expr(self.dist_op.runs_evt):
             mC_comm, mC = mC, None
         if const_expr(not a_owned):
             # Tensors arrive batch-first: rotate (l, x, y) -> (x, y, l) at trace time.
@@ -777,9 +777,9 @@ class GemmSm90(GemmTmaBase):
             tma_atom_c,
             tma_tensor_c,
         ) = self.make_tma_epilogue_atoms_and_tensors(mD, mC, epilogue_args, varlen_m)
-        if const_expr(self.dist_op.finalizes_epilogue):
+        if const_expr(self.dist_op.runs_evt):
             assert not any(op.is_tile_load() for op in getattr(self, "_epi_ops", ())), (
-                "finalizes_epilogue: TileLoad epilogue inputs are not staged for the comm warps"
+                "runs_evt: TileLoad epilogue inputs are not staged for the comm warps"
             )
 
         epilogue_params = self.epi_to_underlying_arguments(epilogue_args)

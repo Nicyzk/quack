@@ -213,7 +213,7 @@ def _run_rank():
             check(f"lamport{'+c' if has_c else ''} iter={it}", out, ref, base)
 
     # --- through an epilogue module: dist_op= / dist_op_args= on the torch-facing call ---
-    from quack.epilogue.library import identity_epi
+    from quack.epilogue.library import identity_epi, linear_act_mod
     from quack.gemm_config import GemmConfig
     from quack.tile_scheduler import RasterOrderOption
 
@@ -238,6 +238,35 @@ def _run_rank():
         torch.cuda.synchronize(device)
         rows = slice(rank * slab, (rank + 1) * slab)
         check(f"mod rs iter={it}", out, full_ref(a, b)[rows], nccl_rs(a, b))
+
+    # --- GEMM + RS + ReLU: the mod's EVT runs in the comm warps after the reduce (store_tile stores the
+    # raw partial); the aux output is (m, n) for the frontend's check, the comm warps fill this rank's slab ---
+    relu_mod = linear_act_mod("relu", gated=False, has_c=False, has_rowvec=False, has_colvec=False)
+    d, out, args = make_reduce_scatter_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
+    post = torch.zeros(m, n, dtype=dtype, device=device)
+    for it in range(NUM_ITERS):
+        torch.manual_seed(8000 + 10 * it + rank)
+        a = torch.randn(m, k, dtype=dtype, device=device) / 8
+        b = torch.randn(n, k, dtype=dtype, device=device) / 8
+        relu_mod.gemm(
+            a,
+            b,
+            d,
+            None,
+            epi_args={"mAuxOut": post},
+            tile_M=TILE_M,
+            tile_N=TILE_N,
+            cluster_M=1,
+            cluster_N=1,
+            raster_order=RasterOrderOption.AlongN,
+            dist_op=ReduceScatter(rank, world),
+            dist_op_args=args,
+        )
+        torch.cuda.synchronize(device)
+        rows = slice(rank * slab, (rank + 1) * slab)
+        ref, base = full_ref(a, b)[rows], nccl_rs(a, b)
+        check(f"rs+relu D iter={it}", out, ref, base)
+        check(f"rs+relu iter={it}", post[:slab], ref.relu(), base.relu())
 
     d, out, args = make_lamport_buffers(m, n, dtype, TILE_M)  # D's own extent passes the module path's checks
     for it in range(max(NUM_ITERS, 5)):

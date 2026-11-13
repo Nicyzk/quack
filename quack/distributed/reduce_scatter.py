@@ -1,6 +1,6 @@
-# GEMM + reduce-scatter as the GEMM's distributed operator (finalizes_epilogue: the GEMM's epilogue warps store raw
-# partials, this operator's comm warps reduce them and run the epilogue). Every rank's epilogue warps store
-# their raw K-partial of each tile into their symmetric D (d_dtype, epilogue(partial_only)) and release-add
+# GEMM + reduce-scatter as the GEMM's distributed operator (runs_evt: the GEMM's epilogue warps store raw
+# partials, this operator's comm warps reduce them and run the EVT). Every rank's epilogue warps store
+# their raw K-partial of each tile into their symmetric D (d_dtype, epilogue(store_partial)) and release-add
 # the flag of the rank whose M slab owns the tile. The comm warps step this CTA's static schedule: at
 # tile row pid_m = (stripe, pos) they reduce stripe `stripe` of owned tile `pos` (the cutlass RS remap:
 # the world's CTAs at one position share one owned tile, equal work, no slab walk), wait for the tile's
@@ -24,7 +24,7 @@ from cutlass import Int32, Int64
 from cutlass.cute.typing import AddressSpace
 from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import mlir_namedtuple
-from quack.gemm_base import DistOp, EpiFrame
+from quack.gemm_base import DistOp
 from quack.varlen_utils import VarlenManager
 
 COMM_WARPS = 4
@@ -166,7 +166,7 @@ class ReduceScatter(DistOp):
 
     num_warps = COMM_WARPS
     regs = None  # 12 warps at 168 each, as intra-sm ran it; a split must fit the released pool
-    finalizes_epilogue = True
+    runs_evt = True
     broadcast = False  # AllReduce: commit by multimem st into every rank's (m, n) out
 
     def __init__(self, rank: int, world: int):
@@ -191,15 +191,10 @@ class ReduceScatter(DistOp):
         chunk = math.gcd(loop_m, max(1, SUBTILE_ATOMS // loop_n))
         return slice_m, (atom_thr_m, atom_thr_n), (1, atom), chunk
 
-    def epi_frame(self, gemm):
-        slice_m, (atom_thr_m, atom_thr_n), _, chunk = self._stripe(gemm)
-        cta_n = gemm.cta_tile_shape_mnk[1]
+    def epi_warp_shape_mnk(self, gemm):
+        _, (_, atom_thr_n), _, _ = self._stripe(gemm)
         warps_n = max(1, atom_thr_n // cute.arch.WARP_SIZE)
-        return EpiFrame(
-            (slice_m, cta_n),
-            (chunk * atom_thr_m, cta_n),
-            (gemm.num_comm_warps // warps_n, warps_n, 1),
-        )
+        return (gemm.num_comm_warps // warps_n, warps_n, 1)
 
     @cute.jit
     def signal_tile(self, gemm, ctx, tile_coord_mnkl, epi_store_pipeline, is_tma_warp, tidx: Int32):

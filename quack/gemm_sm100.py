@@ -726,7 +726,7 @@ class GemmSm100(GemmTmaBase):
                 mSFB = layout_utils.expand(mSFB, 0, 1)
         # the comm warps run the epilogue and read C themselves (per subtile, from gmem): the GEMM stages no C
         mC_comm = None
-        if const_expr(self.dist_op.finalizes_epilogue):
+        if const_expr(self.dist_op.runs_evt):
             mC_comm, mC = mC, None
         # Tensors arrive batch-first: rotate (l, x, y) -> (x, y, l) at trace time.
         # Dense rank-2 operands get a trivial batch mode appended instead.
@@ -991,9 +991,9 @@ class GemmSm100(GemmTmaBase):
             tma_atom_c,
             tma_tensor_c,
         ) = self.make_tma_epilogue_atoms_and_tensors(mD, mC, epilogue_args, varlen_m)
-        if const_expr(self.dist_op.finalizes_epilogue):
+        if const_expr(self.dist_op.runs_evt):
             assert not any(op.is_tile_load() for op in getattr(self, "_epi_ops", ())), (
-                "finalizes_epilogue: TileLoad epilogue inputs are not staged for the comm warps"
+                "runs_evt: TileLoad epilogue inputs are not staged for the comm warps"
             )
 
         epilogue_params = self.epi_to_underlying_arguments(epilogue_args)

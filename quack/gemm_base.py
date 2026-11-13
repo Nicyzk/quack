@@ -65,7 +65,7 @@ class DistOpCtx:
         epi_params=None,  # the epilogue's params and smem tensors: a finalizing operator re-enters
         epi_smem_tensors=None,  # gemm.epilogue with them
         varlen=None,  # the VarlenManager
-        mC=None,  # finalizes_epilogue: the C operand (gmem), read per subtile by the comm warps
+        mC=None,  # runs_evt: the C operand (gmem), read per subtile by the comm warps
     ):
         self.args, self.smem, self.sched_params = args, smem, sched_params
         self.TileSchedulerCls, self.varlen = TileSchedulerCls, varlen
@@ -73,28 +73,20 @@ class DistOpCtx:
         self.mC = mC
 
 
-class EpiFrame:
-    """The rectangle a finalizing operator's comm warps run the GEMM's epilogue on: tile_mn (a stripe of
-    the CTA tile, or all of it), the subtile they visit it in (reading C per subtile themselves) and their
-    warp arrangement (what the epilogue ops' smem is laid out for)."""
-
-    def __init__(self, tile_mn, subtile, warp_shape_mnk):
-        self.tile_mn, self.subtile, self.warp_shape_mnk = tile_mn, subtile, warp_shape_mnk
-
-
 class DistOp:
     """A distributed operator fused into the GEMM (GemmSmXX(..., dist_op=DistOp subclass)). It owns the
     per-tile gate (wait_tile) and publish (signal_tile), its comm warps (num_warps, regs = (epilogue,
     other, comm) or None, smem via smem_bytes / smem_struct as storage.dist_op) and the destination of the
-    GEMM's staged subtile (store_coord / store_drain / store_fixup, epi_frame when it finalizes the epilogue).
+    GEMM's staged subtile (store_coord / store_drain / store_fixup, epi_warp_shape_mnk when it finalizes
+    the epilogue).
     The GEMM owns the mainloop, the epilogue and the staging of the store; every hook sees the kernel
     through one DistOpCtx. This base is the no-operator default."""
 
     num_warps = 0
     regs = None
-    # the operator's comm warps run the epilogue (after reducing across ranks); the GEMM's epilogue warps
-    # store the raw partial into D through the usual store path (epilogue(partial_only=True)) and run no op
-    finalizes_epilogue = False
+    # the EVT runs in the operator (after reducing across ranks), not in the GEMM: the GEMM's epilogue
+    # warps store the raw partial into D (epilogue(store_partial=True)) and run no op
+    runs_evt = False
 
     def smem_bytes(self, gemm) -> int:
         """Bytes off the A/B/epilogue stage budget (smem_struct's size)."""
@@ -112,8 +104,9 @@ class DistOp:
         """The dist_op_args bundle of fake tensors for cute.compile (None: the kernel takes none)."""
         return None
 
-    def epi_frame(self, gemm):
-        """finalizes_epilogue: the EpiFrame the comm warps' epilogue runs on."""
+    def epi_warp_shape_mnk(self, gemm):
+        """runs_evt: the (m, n, k) warp arrangement the comm warps run the epi ops in (what the
+        ops' smem is laid out for); the tile and subtile they run on are arguments of their epilogue call."""
         return None
 
     def d_shape(self, shape):
@@ -129,7 +122,7 @@ class DistOp:
 
     @cute.jit
     def store_fixup(self, frg):
-        """finalizes_epilogue: in-place fixup of the converted (d_dtype) partial before it is staged for
+        """runs_evt: in-place fixup of the converted (d_dtype) partial before it is staged for
         the store; the store itself stays the GEMM's."""
         # TODO: make this an epilogue node on the partial store path (post-convert), not a hook
         return
@@ -349,9 +342,9 @@ class GemmBase:
 
     def epi_smem_warp_shape_mnk(self):
         """The warps the epilogue and its ops' smem are laid out for: the operator's frame when it
-        warps run the epilogue (finalizes_epilogue), else this arch's epilogue warps."""
-        if self.dist_op.finalizes_epilogue:
-            return self.dist_op.epi_frame(self).warp_shape_mnk
+        warps run the epilogue (runs_evt), else this arch's epilogue warps."""
+        if self.dist_op.runs_evt:
+            return self.dist_op.epi_warp_shape_mnk(self)
         return self.epi_warp_shape_mnk()
 
     def epi_warp_shape_mnk(self):
@@ -409,7 +402,7 @@ class GemmBase:
         load_C: Optional[Callable] = None,
         # Store the raw accumulator as D (converted, the operator's store_fixup applied) and run no
         # epi op, C load or aux output: the operator's warps run the epilogue on the reduced value.
-        partial_only: cutlass.Constexpr[bool] = False,
+        store_partial: cutlass.Constexpr[bool] = False,
         # The tile the epilogue is framed on: the CTA tile unless the caller runs it on a
         # sub-tile (a reducer's comm warps: a (cta_m / world, cta_n) stripe). Constexpr: a
         # plain tuple kwarg would be staged to runtime Int32s.
@@ -421,7 +414,7 @@ class GemmBase:
             tile_shape_mn if tile_shape_mn is not None else self.cta_tile_shape_mnk[:2]
         )
         has_C = const_expr(tRS_rC is not None)
-        has_epi_load = const_expr(self.epi_c_stage > 0 and load_C is None and not partial_only)
+        has_epi_load = const_expr(self.epi_c_stage > 0 and load_C is None and not store_partial)
         has_D = const_expr(copy_D is not None)
         assert not (copy_D is not None and commit_D is not None), (
             "copy_D (smem+TMA) and commit_D (register-direct) are alternative D store paths"
@@ -431,7 +424,7 @@ class GemmBase:
         )
         use_tma_epi = const_expr(epi_store_pipeline is not None)
         use_tma_c = const_expr(epi_pipeline is not None)
-        inline_epi_load = const_expr(copy_C is not None and not partial_only)
+        inline_epi_load = const_expr(copy_C is not None and not store_partial)
 
         # Store contexts — one per stored output, D first (when present), then
         # the aux TileStore outputs. Each is ``(op, quant, tiled_copy, tRS_s,
@@ -442,10 +435,10 @@ class GemmBase:
         # ``store_pred`` is None for an unconditional store, else a
         # per-CTA-tile Boolean (e.g. GemmSymmetric skips the mirrored write
         # on diagonal tiles). D's host pieces stay kernel-built (see DStore).
-        if const_expr(partial_only):
+        if const_expr(store_partial):
             # the raw partial as D alone: no aux output, no codec; the convert then the operator's fixup
             assert has_D and self.rounding_mode != RoundingMode.RS, (
-                "partial_only commits D with round-to-nearest"
+                "store_partial commits D with round-to-nearest"
             )
             store_ctxs = ((DStore(), None, tiled_copy_r2s, tRS_sD, copy_D, None),)
         else:
@@ -472,7 +465,7 @@ class GemmBase:
         num_prev_subtiles = tile_scheduler.num_tiles_executed * epi_tile_num
 
         epi_tensors = None
-        if const_expr(not partial_only):
+        if const_expr(not store_partial):
             epi_tensors = self.epi_begin(
                 params,
                 epi_smem_tensors,
@@ -487,7 +480,7 @@ class GemmBase:
                 tile_shape_mn=frame_mn,
             )
 
-        if const_expr(self.epi_needs_acc_prepass and not partial_only):
+        if const_expr(self.epi_needs_acc_prepass and not store_partial):
             assert self.arch in (90, 100, 120), (
                 "acc prepass needs a re-readable accumulator (SM90/SM120 registers / SM100 tmem)"
             )
@@ -554,7 +547,7 @@ class GemmBase:
                     # TODO: cp.async wait once we switch to cp.async
                     epilogue_barrier.arrive_and_wait()
             epi_loop_tensors = {}
-            if const_expr(not partial_only):
+            if const_expr(not store_partial):
                 epi_loop_tensors = self.epi_begin_loop(params, epi_tensors, epi_coord)
             if const_expr(inline_epi_load and epi_idx + self.epi_c_stage < epi_tile_num):
                 epi_coord_C = epi_tile_layout.get_hier_coord(epi_idx + self.epi_c_stage)
@@ -574,7 +567,7 @@ class GemmBase:
             # Length matches ``aux_out_ctxs``. ``()`` for the default
             # epilogue (no aux output).
             tRS_rAuxOuts = ()
-            if const_expr(not partial_only):
+            if const_expr(not store_partial):
                 iket.range_push("epi_math")
                 tRS_rAuxOuts = self.epi_visit_subtile(params, epi_loop_tensors, tRS_rD, tRS_rC)
                 iket.range_pop()
@@ -617,7 +610,7 @@ class GemmBase:
                         epi_idx,
                     )
                 )
-            if const_expr(partial_only):
+            if const_expr(store_partial):
                 self.dist_op.store_fixup(store_frags_out[0])
             iket.range_push("epi_store_acq")
             if const_expr(use_tma_epi):
@@ -670,7 +663,7 @@ class GemmBase:
             if const_expr(commit_D is not None):
                 commit_D(tRS_rD, epi_coord)
 
-        if const_expr(not partial_only):
+        if const_expr(not store_partial):
             self.epi_end(
                 params,
                 epi_tensors,
@@ -912,10 +905,10 @@ class GemmBase:
                 # workspace with generic loads, so no async-proxy fence is needed
                 # after the acquire.
                 split_k_sem.wait_eq(self.split_k - 1)
-            if const_expr(self.dist_op.finalizes_epilogue):
+            if const_expr(self.dist_op.runs_evt):
                 # the operator's warps finalize (reduce across ranks, then the epilogue): this rank's
                 # epilogue warps commit the raw partial through the D store path
-                epi_read_state, epi_producer_state = epi_fn(finalizer_load_acc, partial_only=True)
+                epi_read_state, epi_producer_state = epi_fn(finalizer_load_acc, store_partial=True)
             else:
                 epi_read_state, epi_producer_state = epi_fn(finalizer_load_acc)
             if const_expr(self.split_k > 1 and self.split_k_mode != SplitKMode.SEPARATE):

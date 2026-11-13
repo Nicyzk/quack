@@ -27,7 +27,7 @@ from quack.distributed.reduce_scatter import (
     commit_subtile_local,
     load_subtile,
 )
-from quack.gemm_base import DistOp, EpiFrame
+from quack.gemm_base import DistOp
 
 SLOTS = 3
 LAMPORT_BATCH = 8  # 16-byte atoms in flight per sentinel wait (1 = serial spin)
@@ -159,7 +159,7 @@ class AllReduceLamport(DistOp):
 
     num_warps = COMM_WARPS
     regs = None
-    finalizes_epilogue = True
+    runs_evt = True
 
     def __init__(self, rank: int, world: int):
         self.rank, self.world = rank, world
@@ -171,14 +171,12 @@ class AllReduceLamport(DistOp):
         m, n = shape
         return (SLOTS * self.world * m, n)
 
-    def epi_frame(self, gemm):
+    def epi_warp_shape_mnk(self, gemm):
         cta_m, cta_n = gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[1]
         threads = gemm.num_comm_warps * cute.arch.WARP_SIZE
-        (thr_m, thr_n), _, chunk = _frame(gemm.d_dtype, cta_m, cta_n, threads)
+        (_, thr_n), _, _ = _frame(gemm.d_dtype, cta_m, cta_n, threads)
         warps_n = max(1, thr_n // cute.arch.WARP_SIZE)
-        return EpiFrame(
-            (cta_m, cta_n), (chunk * thr_m, cta_n), (gemm.num_comm_warps // warps_n, warps_n, 1)
-        )
+        return (gemm.num_comm_warps // warps_n, warps_n, 1)
 
     @cute.jit
     def store_coord(self, gemm, ctx, tile_coord_mnkl):
