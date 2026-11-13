@@ -9,7 +9,6 @@
 # Usage: d, out, args = make_lamport_buffers(m, n, dtype, tile_m); args.slot.add_(1) before every launch;
 # mod(a, b, out={"D": d}, config=cfg, dist_op=AllReduceLamport(rank, world), dist_op_args=args); out is the
 # result. Direct: GemmSm100(..., dist_op=AllReduceLamport(rank, world)), launch with mD=d, dist_op_args=args.
-import math
 from functools import partial
 from typing import NamedTuple
 
@@ -20,17 +19,10 @@ from cutlass.cutlass_dsl import any_, while_generate, yield_out
 from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import mlir_namedtuple
 from quack.distributed.ptx import ld_relaxed_gpu_global_4xu32, st_weak_global_4xu32
-from quack.distributed.reduce_scatter import (
-    COMM_WARPS,
-    SUBTILE_ATOMS,
-    _symm,
-    commit_subtile_local,
-    load_subtile,
-)
+from quack.distributed.reduce_scatter import _frame, _symm, commit_subtile_local, load_subtile
 from quack.gemm_base import DistOp
 
 SLOTS = 3
-LAMPORT_BATCH = 8  # 16-byte atoms in flight per sentinel wait (1 = serial spin)
 
 
 @mlir_namedtuple
@@ -84,7 +76,7 @@ def lamport_reduce_subtile(
     tRS_rD: cute.Tensor,
     epi_coord: cute.Coord,
     no_release: cutlass.Constexpr[bool] = False,
-    batch: cutlass.Constexpr[int] = LAMPORT_BATCH,
+    batch: cutlass.Constexpr[int] = 8,  # 16-byte atoms in flight per sentinel wait (1 = serial spin)
 ) -> None:
     """gemm.epilogue's load_acc_subtile: batched poll over the (atom, source mirror) lattice, atom-major:
     issue ``batch`` 16 B loads back to back, spin reloading them until no last word is the sentinel (the
@@ -134,18 +126,6 @@ def lamport_reduce_subtile(
     tRS_rD.store(acc.load())
 
 
-def _frame(dtype, rows, cols, threads):
-    """Thread layout over a (rows, cols) frame, 16-byte atoms n fastest, ~SUBTILE_ATOMS atoms in flight per
-    thread per subtile: (thr_shape, val_shape, chunk)."""
-    atom = 128 // dtype.width
-    thr_n = math.gcd(cols // atom, threads)
-    thr_m = threads // thr_n
-    assert rows % thr_m == 0 and cols % (atom * thr_n) == 0, "the frame tiles over the threads"
-    loop_m, loop_n = rows // thr_m, cols // (atom * thr_n)
-    chunk = math.gcd(loop_m, max(1, SUBTILE_ATOMS // loop_n))
-    return (thr_m, thr_n), (1, atom), chunk
-
-
 def _tiled_copy(dtype, thr_shape, val_shape):
     return cute.make_tiled_copy_tv(
         cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), dtype),
@@ -157,7 +137,7 @@ def _tiled_copy(dtype, thr_shape, val_shape):
 class AllReduceLamport(DistOp):
     """GEMM + one-shot all-reduce over `world` ranks, d_dtype D; the whole tile is this CTA's."""
 
-    num_warps = COMM_WARPS
+    num_warps = 4
     regs = None
     runs_evt = True
 

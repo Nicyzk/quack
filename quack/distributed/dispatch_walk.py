@@ -32,7 +32,6 @@ except ImportError:
 
 GROUP_THREADS = 128  # threads per walk CTA
 NUM_WARPS = GROUP_THREADS // 32
-BLOCK_ROWS = 256  # the M-cluster GEMMs' block (tile M 256, cluster (2, 1))
 
 
 @mlir_namedtuple
@@ -414,7 +413,7 @@ def even_split_block_rows(rows, tile_n, granule=VARLEN_N_GRANULE):
     return ((rows + num_blocks - 1) // num_blocks + granule - 1) // granule * granule
 
 
-def flag_targets(cu_seqlens_m, flags, block_rows=BLOCK_ROWS, even_split=False):
+def flag_targets(cu_seqlens_m, flags, block_rows, even_split=False):
     """What the flags read once every row has landed: rows of each (expert, block) in flags' shape; the blocks are
     block_rows rows (the GEMM's M cluster) or, even_split, the swap-AB GEMM's N blocks (block_rows = its tile N)."""
     rows = (cu_seqlens_m[1:] - cu_seqlens_m[:-1]).to(torch.int64)[:, None]
@@ -450,7 +449,7 @@ def make_walk_buffers(W, T_local, max_rows, flags, block_rows, even_split=False,
 
 
 def make_dispatch_walk(
-    topk_idx_g, s_scatter, s_reverse, rank, a_idx, cu_seqlens, x_peer_bufs, block_rows=BLOCK_ROWS,
+    topk_idx_g, s_scatter, s_reverse, rank, a_idx, cu_seqlens, x_peer_bufs, block_rows,
     even_split=False, x_sf_peer_bufs=None,
 ):
     """GPU-built walk in the GEMM's order: (build, walk). build() launches count + scatter in one host call, no

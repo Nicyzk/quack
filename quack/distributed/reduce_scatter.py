@@ -28,8 +28,16 @@ from quack.gemm_base import DistOp
 from quack.tile_scheduler import RasterOrderOption
 from quack.varlen_utils import VarlenManager
 
-COMM_WARPS = 4
-SUBTILE_ATOMS = 8  # 16-byte atoms in flight per thread per reduce visit (the measured knee)
+def _frame(dtype, rows, cols, threads, subtile_atoms=8):
+    """Thread layout over a (rows, cols) frame, 16-byte atoms n fastest, ~subtile_atoms atoms in flight per
+    thread per subtile (the measured knee): (thr_shape, val_shape, chunk)."""
+    atom = 128 // dtype.width
+    thr_n = math.gcd(cols // atom, threads)
+    thr_m = threads // thr_n
+    assert rows % thr_m == 0 and cols % (atom * thr_n) == 0, "the frame tiles over the threads"
+    loop_m, loop_n = rows // thr_m, cols // (atom * thr_n)
+    chunk = math.gcd(loop_m, max(1, subtile_atoms // loop_n))
+    return (thr_m, thr_n), (1, atom), chunk
 
 
 @mlir_namedtuple
@@ -165,7 +173,7 @@ def commit_subtile_broadcast(frgOut_mc: cute.Tensor, tRS_rD: cute.Tensor, epi_co
 class ReduceScatter(DistOp):
     """GEMM + reduce-scatter over `world` ranks along M (slab = m // world rows per rank), d_dtype D."""
 
-    num_warps = COMM_WARPS
+    num_warps = 4
     regs = None  # 12 warps at 168 each, as intra-sm ran it; a split must fit the released pool
     runs_evt = True
     raster_order = RasterOrderOption.AlongN  # the reducers' measured raster (S2 schedule)
@@ -180,18 +188,13 @@ class ReduceScatter(DistOp):
         )
 
     def _stripe(self, gemm):
-        """The comm threads over a (cta_m // world, cta_n) stripe, 16-byte atoms n fastest, ~SUBTILE_ATOMS
-        atoms in flight per thread per epilogue subtile: (slice_m, thr_shape, val_shape, chunk)."""
+        """The comm threads' _frame over this rank's (cta_m // world, cta_n) stripe of the tile:
+        (slice_m, thr_shape, val_shape, chunk)."""
         cta_m, cta_n = gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[1]
         assert cta_m % self.world == 0, "the tile's M splits into one stripe per rank"
         slice_m = cta_m // self.world
-        atom = 128 // gemm.d_dtype.width
         threads = gemm.num_comm_warps * cute.arch.WARP_SIZE
-        atom_thr_n = math.gcd(cta_n // atom, threads)
-        atom_thr_m = threads // atom_thr_n
-        loop_m, loop_n = slice_m // atom_thr_m, cta_n // (atom * atom_thr_n)
-        chunk = math.gcd(loop_m, max(1, SUBTILE_ATOMS // loop_n))
-        return slice_m, (atom_thr_m, atom_thr_n), (1, atom), chunk
+        return slice_m, *_frame(gemm.d_dtype, slice_m, cta_n, threads)
 
     def epi_warp_shape_mnk(self, gemm):
         _, (_, atom_thr_n), _, _ = self._stripe(gemm)

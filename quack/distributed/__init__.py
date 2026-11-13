@@ -2,14 +2,14 @@
 """Distributed (multi-GPU overlapped) GEMMs.
 
 Package layout:
-- all_gather_gemm.py: the AllGather operator (the GEMM's dist_op; its bundle
+- all_gather.py: the AllGather operator (the GEMM's dist_op; its bundle
   AllGatherArguments), AllGatherRunner (ce-push transport, gather() context;
   the module docstring is the full design record) and
   BlockScaledAllGatherRunner (adds a scale-factor lane under the same
   arrival flags, for blockscaled GEMMs)
 """
 
-from quack.distributed.all_gather_gemm import (
+from quack.distributed.all_gather import (
     AllGather,
     AllGatherArguments,
     AllGatherRunner,

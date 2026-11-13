@@ -1,7 +1,7 @@
-# MoE dispatch as the GEMM's distributed operator (gemm_base.DistOp). DispatchGate = the gate alone: wait_tile spins until
-# flags[expert, block] reaches the block's row count before the tile's gathered loads (the rows land by another
-# kernel). DispatchPull adds transfer warps per CTA running pull_rows over the device walk (dispatch_walk.py),
-# landing each row once in the pool the GEMM's gather-A reads and bumping flags[expert, block]. The scheduler is the
+# MoE dispatch as the GEMM's distributed operator (gemm_base.DistOp). DispatchPull: transfer warps per CTA run
+# pull_rows over the device walk (dispatch_walk.py), landing each row once in the pool the GEMM's gather-A reads and
+# bumping flags[expert, block]; wait_tile spins until flags[expert, block] reaches the block's row count before the
+# tile's gathered loads. The scheduler is the
 # GEMM's plain expert-grouped order: nothing rides the scheduler args. make_dispatch_pool allocates the pool and
 # builds the walk (flags included); the GEMM's D is the caller's output.
 #
@@ -25,8 +25,6 @@ from quack.cute_dsl_utils import mlir_namedtuple
 from quack.distributed.dispatch_walk import WalkArguments, fake_walk_arguments, make_dispatch_walk
 from quack.distributed.ptx import cp_async_bulk_s2g, red_add_release_gpu_s32, tma_load_1d
 from quack.gemm_base import DistOp
-
-TRANSFER_WARPS = 4
 
 
 def pull_chunk_bytes(hidden, dtype, max_bytes=4096):
@@ -163,13 +161,6 @@ def pull_rows(
 
 
 @mlir_namedtuple
-class GateArguments(NamedTuple):
-    """DispatchGate's bundle (the GEMM's dist_op_args)."""
-
-    flags: cute.Tensor  # (E_local, max M blocks) int32, +1 per landed row: the gate's counters
-
-
-@mlir_namedtuple
 class DispatchArguments(NamedTuple):
     """The transfer warps' bundle (the GEMM's dist_op_args)."""
 
@@ -190,15 +181,27 @@ def fake_dispatch_arguments(pool_dtype, sf=False):
     return DispatchArguments(fake_walk_arguments(sf), pool, _fake_flags(), sf_pool)
 
 
-class DispatchGate(DistOp):
-    """The dispatch gate alone (no comm warps): before a tile's gathered loads, spin until the tile's M block has
-    all its rows (flags[expert, block] == rows in the block). The rows land by any transport."""
+class DispatchPull(DistOp):
+    """The dispatch pull as the GEMM's comm warps, gated per tile on the landed row counts. pull_bytes = one row's
+    bytes; scatter = the row lands in every reader's expert-major row (walk.dst_row) instead of the pool row;
+    sf_words = 4-byte scale words per row for block-scaled rows (K / (4 sf_vec_size)), 0 = none."""
+
+    num_warps = 4
+    regs = (232, 120, 40)  # 4 warp groups share 512: epilogue 232, the GEMM's others 120 each, the transfer loop 40
+    flag_batch = 1  # publish each row as it lands: ~6 rows per warp, batching only delays every block's readiness
+
+    def __init__(self, pull_bytes: int, scatter: bool = False, sf_words: int = 0):
+        self.pull_bytes = pull_bytes
+        self.pull_chunk = pull_chunk_bytes(pull_bytes, cutlass.Uint8)  # a chunk of the row per stage
+        self.scatter = scatter
+        self.sf_words = sf_words
 
     def fake_args(self, d_dtype):
-        return GateArguments(_fake_flags())
+        return fake_dispatch_arguments(d_dtype, sf=self.sf_words > 0)
 
     @cute.jit
     def wait_tile(self, gemm, ctx, tile_coord_mnkl, gate: Int32) -> Int32:
+        """Before a tile's gathered loads: spin until its M block has all its rows (flags[expert, block])."""
         pid_m, batch = tile_coord_mnkl[0], tile_coord_mnkl[3]
         cluster_m = gemm.cluster_shape_mnk[0]
         block_rows = Int32(gemm.cta_tile_shape_mnk[0] * cluster_m)
@@ -213,32 +216,13 @@ class DispatchGate(DistOp):
             val = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="sys")
         return gate
 
-
-class DispatchPull(DispatchGate):
-    """The dispatch pull as the GEMM's comm warps, gated as DispatchGate. pull_bytes = one row's bytes; scatter =
-    the row lands in every reader's expert-major row (walk.dst_row) instead of the pool row; sf_words = 4-byte
-    scale words per row for block-scaled rows (K / (4 sf_vec_size)), 0 = none."""
-
-    num_warps = TRANSFER_WARPS
-    regs = (232, 120, 40)  # 4 warp groups share 512: epilogue 232, the GEMM's others 120 each, the transfer loop 40
-    flag_batch = 1  # publish each row as it lands: ~6 rows per warp, batching only delays every block's readiness
-
-    def __init__(self, pull_bytes: int, scatter: bool = False, sf_words: int = 0):
-        self.pull_bytes = pull_bytes
-        self.pull_chunk = pull_chunk_bytes(pull_bytes, cutlass.Uint8)  # a chunk of the row per stage
-        self.scatter = scatter
-        self.sf_words = sf_words
-
-    def fake_args(self, d_dtype):
-        return fake_dispatch_arguments(d_dtype, sf=self.sf_words > 0)
-
     def smem_bytes(self, gemm):
-        return stage_bytes(self.pull_chunk, cutlass.Uint8, TRANSFER_WARPS)
+        return stage_bytes(self.pull_chunk, cutlass.Uint8, self.num_warps)
 
     def smem_struct(self, gemm):
         class PullStorage:
-            stage: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, TRANSFER_WARPS * self.pull_chunk], 128]
-            mbar: cute.struct.Align[cute.struct.MemRange[cutlass.Int64, TRANSFER_WARPS], 8]
+            stage: cute.struct.Align[cute.struct.MemRange[cutlass.Uint8, self.num_warps * self.pull_chunk], 128]
+            mbar: cute.struct.Align[cute.struct.MemRange[cutlass.Int64, self.num_warps], 8]
 
         return cute.struct(PullStorage)
 
@@ -247,7 +231,7 @@ class DispatchPull(DispatchGate):
         """The transfer warps: this CTA's share of the walk, rows into the pool, flags bumped as rows land."""
         chunk = self.pull_chunk
         dist_op_args, smem = ctx.args, ctx.smem
-        stage = smem.stage.get_tensor(cute.make_layout((TRANSFER_WARPS, chunk), stride=(chunk, 1)))
+        stage = smem.stage.get_tensor(cute.make_layout((self.num_warps, chunk), stride=(chunk, 1)))
         transfer_warp = warp_idx - gemm.comm_warp_ids[0]
         mbar = smem.mbar.data_ptr() + transfer_warp
         if tidx % 32 == Int32(0):
@@ -266,8 +250,8 @@ class DispatchPull(DispatchGate):
             dist_op_args.flags,
             stage[transfer_warp, None],
             mbar,
-            cta * Int32(TRANSFER_WARPS) + transfer_warp,
-            num_ctas * Int32(TRANSFER_WARPS),
+            cta * Int32(self.num_warps) + transfer_warp,
+            num_ctas * Int32(self.num_warps),
             tidx % 32,
             self.flag_batch,
             self.scatter,

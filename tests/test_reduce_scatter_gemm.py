@@ -82,7 +82,7 @@ def _run_rank():
         get_max_active_clusters,
         torch2cute_dtype_map,
     )
-    from quack.distributed.lamport import AllReduceLamport, make_lamport_buffers
+    from quack.distributed.all_reduce_lamport import AllReduceLamport, make_lamport_buffers
     from quack.distributed.reduce_scatter import (
         AllReduce,
         ReduceScatter,
