@@ -13,7 +13,7 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.compile_utils import div_for_dtype, fake_batched  # noqa: F401  (re-exported)
 from quack.gemm_config import SplitKMode
 from quack.cute_dsl_utils import get_compile_target_capacity, torch2cute_dtype_map
-from quack.tile_scheduler import AgSchedulerArguments, RasterOrderOption, TileSchedulerOptions
+from quack.tile_scheduler import RasterOrderOption, TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments
 
 
@@ -255,7 +255,7 @@ def make_scheduler_args(
     max_swizzle_size,
     tile_count_semaphore,
     batch_idx_permute=None,
-    ag_args=None,  # the AllGather operator's AllGatherArguments bundle, or None
+    shard_tile_order=None,  # the operator's make_scheduler_args(dist_op_args), or None
 ):
     return TileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
@@ -264,23 +264,27 @@ def make_scheduler_args(
         tile_count_semaphore=(
             tile_count_semaphore.data_ptr() if tile_count_semaphore is not None else None
         ),
-        ag=(
-            AgSchedulerArguments(
-                num_shards=Int32(ag_args.num_shards), first_shard=Int32(ag_args.first_shard)
-            )
-            if ag_args is not None
-            else None
-        ),
+        shard_tile_order=shard_tile_order,
         batch_idx_permute=batch_idx_permute,
     )
+
+
+def dist_op_raster_order(dist_op, raster_order):
+    """The operator's raster when it sets one (the caller's must agree or be Heuristic)."""
+    if dist_op is None or dist_op.raster_order is None:
+        return raster_order
+    assert raster_order in (RasterOrderOption.Heuristic, dist_op.raster_order), (
+        f"raster_order {raster_order} conflicts with the dist_op's {dist_op.raster_order}"
+    )
+    return dist_op.raster_order
 
 
 def make_fake_scheduler_args(
     has_semaphore,
     has_batch_idx_permute,
     l_sym,
-    has_ag=False,
     raster_order=RasterOrderOption.Heuristic,  # constexpr: baked here, the launch value is ignored
+    shard_tile_order=None,  # the operator's make_scheduler_args on its fake bundle, or None
 ):
     return TileSchedulerOptions(
         max_active_clusters=Int32(1),
@@ -289,11 +293,7 @@ def make_fake_scheduler_args(
         tile_count_semaphore=(
             make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=4) if has_semaphore else None
         ),
-        ag=(
-            AgSchedulerArguments(num_shards=Int32(1), first_shard=Int32(0))
-            if has_ag
-            else None
-        ),
+        shard_tile_order=shard_tile_order,
         batch_idx_permute=(
             fake_tensor(Int32, (l_sym,), leading_dim=0, divisibility=4)
             if has_batch_idx_permute
@@ -461,7 +461,7 @@ def validate_ag_geometry(A, ag_args, tile_M, cluster_M):
     )
 
 
-def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None, ag_args=None, A=None):
+def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None, dist_op_args=None, A=None):
     """Per-call TileSchedulerOptions for a cached plan.
 
     Must mirror make_fake_scheduler_args in the variant's _compile_* function:
@@ -469,21 +469,24 @@ def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None, ag_a
     instead), so when the compiled signature has None there the semaphore the
     caller passed is dropped rather than forwarded.
 
-    AG+GEMM callers must pass A (the gathered kernel-A tensor) so the shard
-    geometry is validated against the plan's tile config on every launch —
-    frontends can't forget it by construction.
+    The operator's tile order (plan.dist_op.make_scheduler_args(dist_op_args)) is per call;
+    callers with one pass A (the kernel-A tensor) so the shard geometry is validated against
+    the plan's tile config on every launch — frontends can't forget it by construction.
     """
-    if ag_args is not None:
-        assert A is not None, "plan_scheduler_args: ag_args requires A for geometry validation"
-        validate_ag_geometry(A, ag_args, plan.tile_M, plan.cluster_M)
-    if plan.scheduler_static is not None:
+    shard_tile_order = (
+        plan.dist_op.make_scheduler_args(dist_op_args) if plan.dist_op is not None else None
+    )
+    if shard_tile_order is not None:
+        assert A is not None, "plan_scheduler_args: a shard tile order requires A for geometry validation"
+        validate_ag_geometry(A, dist_op_args, plan.tile_M, plan.cluster_M)
+    elif plan.scheduler_static is not None:
         return plan.scheduler_static
     return make_scheduler_args(
         plan.max_active_clusters,
         plan.max_swizzle_size,
         tile_count_semaphore if plan.scheduler_uses_semaphore else None,
         batch_idx_permute,
-        ag_args=ag_args,
+        shard_tile_order=shard_tile_order,
     )
 
 

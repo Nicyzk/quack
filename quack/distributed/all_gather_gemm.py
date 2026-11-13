@@ -262,6 +262,7 @@ from quack.blockscaled.operand import BlockScaledFormat, BlockScaledOperand
 from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import mlir_namedtuple
 from quack.gemm_base import DistOp
+from quack.tile_scheduler import ShardTileOrder
 
 __all__ = ["AllGather", "AllGatherArguments", "AllGatherRunner", "BlockScaledAllGatherRunner"]
 
@@ -280,8 +281,8 @@ def _check(err_ret):
 @mlir_namedtuple
 class AllGatherArguments(NamedTuple):
     """AllGather's bundle (the GEMM's dist_op_args; what gather() yields). The gate spins on the
-    flags; the frontends also read the shard geometry off it for the scheduler's `ag` bundle (the
-    shard-major rotated decode, validated against the tile config by validate_ag_geometry)."""
+    flags; make_scheduler_args reads the shard geometry off it for the scheduler's shard tile order
+    (the shard-major rotated decode, validated against the tile config by validate_ag_geometry)."""
 
     # (num_shards * num_chunks,) Int32, symmetric, chunk-major within a shard (flag idx =
     # shard * num_chunks + chunk), each a copy of the call's device epoch once that chunk landed
@@ -309,6 +310,10 @@ class AllGather(DistOp):
             Int32(0),
             Int32(0),
         )
+
+    def make_scheduler_args(self, dist_op_args):
+        """Shard-major from this rank's shard: tiles are consumed in arrival order."""
+        return ShardTileOrder(Int32(dist_op_args.num_shards), Int32(dist_op_args.first_shard))
 
     @cute.jit
     def wait_tile(self, gemm, ctx, tile_coord_mnkl, gate: Int32) -> Int32:

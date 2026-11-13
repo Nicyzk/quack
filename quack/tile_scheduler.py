@@ -121,21 +121,20 @@ class WorkTileInfo:
 
 
 @mlir_namedtuple
-class AgSchedulerArguments(NamedTuple):
-    """AllGather+GEMM tile order (make_scheduler_args builds it from the AllGather operator's
-    AllGatherArguments bundle). A's M dim is sharded across num_shards ranks, delivered in ring
-    order: work ids decode shard-major, ring-rotated by first_shard so the local shard's tiles are
-    issued first, with the usual L2 swizzle *inside* each shard."""
+class ShardTileOrder(NamedTuple):
+    """Shard-major tile order, set by AllGather.make_scheduler_args from its bundle: A's M dim is
+    sharded across num_shards ranks, delivered in ring order; work ids decode shard-major, rotated so
+    first_shard's tiles are issued first, with the usual L2 swizzle *inside* each shard."""
 
     num_shards: Int32
     first_shard: Int32
 
 
 @mlir_namedtuple
-class AgParams(NamedTuple):
-    """Decode-ready AllGather scheduler params: AgSchedulerArguments plus the derived
-    per-shard cluster geometry. Work ids decode shard-major with the L2 swizzle confined to one
-    shard's (nclusters_m_per_shard, ncluster_n) sub-problem — the group/serpentine divmods in
+class ShardTileOrderParams(NamedTuple):
+    """Decode-ready shard tile order: ShardTileOrder plus the derived per-shard cluster geometry.
+    Work ids decode shard-major with the L2 swizzle confined to one shard's
+    (nclusters_m_per_shard, ncluster_n) sub-problem — the group/serpentine divmods in
     TileScheduler.Params are built on the SUB-shape when this is set; problem_shape_ncluster_mnl
     stays the full problem (grid sizing and validity)."""
 
@@ -153,7 +152,7 @@ class TileSchedulerOptions(NamedTuple):
     max_swizzle_size: Int32 = Int32(8)
     tile_count_semaphore: Optional[cute.Pointer] = None
     batch_idx_permute: Optional[cute.Tensor] = None
-    ag: Optional[AgSchedulerArguments] = None
+    shard_tile_order: Optional[ShardTileOrder] = None
 
 
 @dataclass
@@ -168,7 +167,7 @@ class TileSchedulerArguments:
     # Split-K: the L (z) dimension of the work-id space is multiplied by num_split_k, with the
     # split index as the fastest-varying component. problem_shape_ntile_mnl[2] stays the true L.
     num_split_k: cutlass.Constexpr[int] = 1
-    ag: Optional[AgSchedulerArguments] = None
+    shard_tile_order: Optional[ShardTileOrder] = None
 
 
 class TileScheduler:
@@ -191,7 +190,7 @@ class TileScheduler:
         cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
         persistence_mode: cutlass.Constexpr[PersistenceMode]
         num_split_k: cutlass.Constexpr[int] = 1
-        ag: Optional[AgParams] = None
+        shard_tile_order: Optional[ShardTileOrderParams] = None
 
         @staticmethod
         @cute.jit
@@ -205,21 +204,22 @@ class TileScheduler:
                 args.problem_shape_ntile_mnl[2],
             )
             num_clusters_per_problem = cute.size(problem_shape_ncluster_mn)
-            # AllGather: raster/group/serpentine operate on one shard's sub-problem.
-            ag_params = None
+            # shard tile order: raster/group/serpentine operate on one shard's sub-problem.
+            shard_params = None
             problem_shape_ncluster_mn_swz = problem_shape_ncluster_mn
-            if const_expr(args.ag is not None):
-                ag_nclusters_m_per_shard = problem_shape_ncluster_mn[0] // args.ag.num_shards
-                ag_params = AgParams(
-                    num_shards=args.ag.num_shards,
-                    first_shard=args.ag.first_shard,
+            if const_expr(args.shard_tile_order is not None):
+                order = args.shard_tile_order
+                nclusters_m_per_shard = problem_shape_ncluster_mn[0] // order.num_shards
+                shard_params = ShardTileOrderParams(
+                    num_shards=order.num_shards,
+                    first_shard=order.first_shard,
                     clusters_per_shard_fdd=FastDivmod(
-                        ag_nclusters_m_per_shard * problem_shape_ncluster_mn[1]
+                        nclusters_m_per_shard * problem_shape_ncluster_mn[1]
                     ),
-                    nclusters_m_per_shard=ag_nclusters_m_per_shard,
+                    nclusters_m_per_shard=nclusters_m_per_shard,
                 )
                 problem_shape_ncluster_mn_swz = (
-                    ag_nclusters_m_per_shard,
+                    nclusters_m_per_shard,
                     problem_shape_ncluster_mn[1],
                 )
             # NOTE(ag raster, tried July 2026 — negative result): resolving the
@@ -265,7 +265,7 @@ class TileScheduler:
                 args.cluster_shape_mnk,
                 args.persistence_mode,
                 args.num_split_k,
-                ag_params,
+                shard_params,
             )
 
     def __init__(
@@ -428,10 +428,10 @@ class TileScheduler:
                 if params.raster_order == RasterOrder.AlongM
                 else (
                     params.problem_shape_ncluster_mnl[0]
-                    if const_expr(params.ag is None)
-                    # AllGather: the swizzle runs inside one shard, so the
+                    if const_expr(params.shard_tile_order is None)
+                    # shard tile order: the swizzle runs inside one shard, so the
                     # serpentine reflects over the shard's M extent.
-                    else params.ag.nclusters_m_per_shard
+                    else params.shard_tile_order.nclusters_m_per_shard
                 )
             )
             cid_slow = ncluster_slow - 1 - cid_slow
@@ -521,17 +521,18 @@ class TileScheduler:
             # the misses are uniformly spread and already pipeline-hidden —
             # prefetch has nothing to smooth. This cost is fundamental to
             # consuming shards in arrival order; spend effort elsewhere.
-            ag_shard = Int32(0)
-            if const_expr(params.ag is not None):
-                ag_shard, cluster_id_in_problem = divmod(
-                    cluster_id_in_problem, params.ag.clusters_per_shard_fdd
+            shard = Int32(0)
+            if const_expr(params.shard_tile_order is not None):
+                order = params.shard_tile_order
+                shard, cluster_id_in_problem = divmod(
+                    cluster_id_in_problem, order.clusters_per_shard_fdd
                 )
-                ag_shard = ag_shard + params.ag.first_shard
-                if ag_shard >= params.ag.num_shards:
-                    ag_shard = ag_shard - params.ag.num_shards
+                shard = shard + order.first_shard
+                if shard >= order.num_shards:
+                    shard = shard - order.num_shards
             cid_m, cid_n = self._swizzle_cta(cluster_id_in_problem, loc=loc, ip=ip)
-            if const_expr(params.ag is not None):
-                cid_m = cid_m + ag_shard * params.ag.nclusters_m_per_shard
+            if const_expr(params.shard_tile_order is not None):
+                cid_m = cid_m + shard * params.shard_tile_order.nclusters_m_per_shard
             pid_m, pid_n = self._cluster_id_to_cta_id(
                 cid_m, cid_n, block_zero_only=block_zero_only, loc=loc, ip=ip
             )

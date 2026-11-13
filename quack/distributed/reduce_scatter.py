@@ -25,6 +25,7 @@ from cutlass.cute.typing import AddressSpace
 from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import mlir_namedtuple
 from quack.gemm_base import DistOp
+from quack.tile_scheduler import RasterOrderOption
 from quack.varlen_utils import VarlenManager
 
 COMM_WARPS = 4
@@ -167,6 +168,7 @@ class ReduceScatter(DistOp):
     num_warps = COMM_WARPS
     regs = None  # 12 warps at 168 each, as intra-sm ran it; a split must fit the released pool
     runs_evt = True
+    raster_order = RasterOrderOption.AlongN  # the reducers' measured raster (S2 schedule)
     broadcast = False  # AllReduce: commit by multimem st into every rank's (m, n) out
 
     def __init__(self, rank: int, world: int):

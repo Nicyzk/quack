@@ -86,6 +86,8 @@ class DistOp:
     # the EVT runs in the operator (after reducing across ranks), not in the GEMM: the GEMM's epilogue
     # warps store the raw partial into D (epilogue(store_partial=True)) and run no op
     runs_evt = False
+    # the tile raster the operator needs (RasterOrderOption); None: the caller's
+    raster_order = None
 
     def smem_bytes(self, gemm) -> int:
         """Bytes off the A/B/epilogue stage budget (smem_struct's size)."""
@@ -101,6 +103,11 @@ class DistOp:
 
     def fake_args(self, d_dtype):
         """The dist_op_args bundle of fake tensors for cute.compile (None: the kernel takes none)."""
+        return None
+
+    def make_scheduler_args(self, dist_op_args):
+        """Host: the tile order from the bundle, a tile_scheduler.ShardTileOrder (shard-major over M
+        from first_shard) or None for the default order; called on fake_args at compile."""
         return None
 
     def epi_warp_shape_mnk(self, gemm):
@@ -1000,11 +1007,11 @@ class GemmBase:
                 batch_idx_permute=scheduler_args.batch_idx_permute,
                 persistence_mode=persistence_mode,
                 num_split_k=self.split_k,
-                ag=getattr(scheduler_args, "ag", None),
+                shard_tile_order=getattr(scheduler_args, "shard_tile_order", None),
             )
         else:
-            assert getattr(scheduler_args, "ag", None) is None, (
-                "AllGather+GEMM does not support varlen_m"
+            assert getattr(scheduler_args, "shard_tile_order", None) is None, (
+                "the shard tile order does not support varlen_m"
             )
             assert self.split_k == 1, "split_k does not support varlen_m"
             has_epi_tile_store = any(

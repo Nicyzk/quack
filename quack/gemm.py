@@ -16,7 +16,6 @@ from quack.gemm_config import SplitKMode
 from quack.tile_scheduler import RasterOrderOption
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
-from quack.distributed.all_gather_gemm import AllGather
 from quack.gemm_default_epi import (
     GemmDefaultEpiMixin,
     GemmDefaultSm80,
@@ -42,7 +41,7 @@ from quack.gemm_tvm_ffi_utils import (
     scalar_mode,
     scalar_arg,
     plan_scheduler_args,
-    validate_ag_geometry,
+    dist_op_raster_order,
     launch_gemm,
 )
 
@@ -90,7 +89,6 @@ def _compile_gemm(
     sfd_col_dtype=None,
     a_mma_dtype=None,  # blockscaled: MMA element types when they differ from the
     b_mma_dtype=None,  # storage dtypes (packed fp6 crosses the boundary as bytes)
-    has_ag=False,  # AllGather+GEMM: ag scheduler fields in the compiled signature
     dist_op=None,  # the distributed operator (quack.gemm_base.DistOp; picklable, its state is the key)
     raster_order=RasterOrderOption.Heuristic,
 ):
@@ -191,8 +189,10 @@ def _compile_gemm(
         (is_dynamic_persistent and device_capacity[0] <= 9),
         has_batch_idx_permute,
         l,
-        has_ag=has_ag,
         raster_order=raster_order,
+        shard_tile_order=(
+            dist_op.make_scheduler_args(dist_op.fake_args(d_dtype)) if dist_op is not None else None
+        ),
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
@@ -269,7 +269,7 @@ class _GemmPlan(NamedTuple):
     tile_N: int
     cluster_M: int
     cluster_N: int
-    has_ag: bool  # AllGather+GEMM: dist_op_args also feed the scheduler's ag bundle
+    dist_op: object  # the operator: its make_scheduler_args(dist_op_args) is the per-call tile order
 
 
 # (metadata key) -> _GemmPlan. Grows with distinct (shape, stride, dtype, flag)
@@ -453,12 +453,6 @@ def gemm(
     # call with different data pointers.
     if (dist_op is None) != (dist_op_args is None):
         raise ValueError("dist_op and dist_op_args go together")
-    has_ag = isinstance(dist_op, AllGather)
-    if has_ag:
-        # Shard/chunk geometry (see validate_ag_geometry): enforced at launch
-        # for every frontend via plan_scheduler_args; checked here too so a
-        # bad-geometry cold call fails before the (expensive) compile.
-        validate_ag_geometry(A, dist_op_args, tile_M, cluster_M)
     key = (
         tensor_key(A),
         tensor_key(B),
@@ -543,7 +537,6 @@ def gemm(
             b_kn=b_kn,
             bs_format_a=bs_format_a,
             bs_format_b=bs_format_b,
-            has_ag=has_ag,
             dist_op=dist_op,
             SFD=SFD,
             sfd_norm_const=sfd_norm_const,
@@ -654,7 +647,7 @@ def run_gemm_plan(
             mSFDCol=SFDCol,
         )
     scheduler_args = plan_scheduler_args(
-        plan, tile_count_semaphore, batch_idx_permute, dist_op_args if plan.has_ag else None, A=A
+        plan, tile_count_semaphore, batch_idx_permute, dist_op_args, A=A
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
 
@@ -715,7 +708,6 @@ def _build_gemm_plan(
     b_kn=False,
     bs_format_a=None,
     bs_format_b=None,
-    has_ag=False,
     dist_op=None,
     SFD=None,
     sfd_norm_const=None,
@@ -734,6 +726,7 @@ def _build_gemm_plan(
         assert not varlen and not gather_A, "dist_op requires a dense GEMM"
         assert persistent, "dist_op requires the persistent scheduler"
         assert split_k == 1, "dist_op does not support split_k"
+        raster_order = dist_op_raster_order(dist_op, raster_order)
     if add_to_output:
         assert not varlen_m, "Add to output not supported with varlen_m"
     assert split_k >= 1, "split_k must be >= 1"
@@ -963,7 +956,6 @@ def _build_gemm_plan(
         sfd_col_dtype,
         a_mma_dtype,
         b_mma_dtype,
-        has_ag,
         dist_op,
         raster_order,
     )
@@ -999,7 +991,7 @@ def _build_gemm_plan(
             sr_seed=None,
         )
     scheduler_static = None
-    if not scheduler_uses_semaphore and batch_idx_permute is None and not has_ag:
+    if not scheduler_uses_semaphore and batch_idx_permute is None:
         scheduler_static = make_scheduler_args(max_active_clusters, max_swizzle_size, None, None)
 
     return _GemmPlan(
@@ -1022,5 +1014,5 @@ def _build_gemm_plan(
         tile_N=tile_N,
         cluster_M=cluster_M,
         cluster_N=cluster_N,
-        has_ag=has_ag,
+        dist_op=dist_op,
     )

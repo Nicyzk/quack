@@ -32,7 +32,6 @@ from quack.gemm_config import SplitKMode, cta_tile_shape_m
 from quack.tile_scheduler import RasterOrderOption
 from quack.epilogue.ops import EpiOp
 from quack.compile_utils import div_for_dtype, fake_batched
-from quack.distributed.all_gather_gemm import AllGather
 from quack.gemm_runtime.identity import (
     resolve_gemm_class,
     resolve_transform_a,
@@ -41,6 +40,7 @@ from quack.gemm_runtime.identity import (
 from quack.gemm_tvm_ffi_utils import (
     compile_gemm_kernel,
     compute_cu_tiles_m,
+    dist_op_raster_order,
     launch_gemm,
     make_fake_gemm_tensors,
     make_fake_scheduler_args,
@@ -118,7 +118,6 @@ def _compile_gemm_epi(
     b_mma_dtype=None,
     post_init_attrs=(),  # ((attr, value), ...) setattr'd on the gemm object pre-trace
     packed_cd=None,  # "n" | "m": raw 16-bit D/C, f32-recast at trace (dgated)
-    has_ag=False,  # AllGather+GEMM: ag scheduler fields in the compiled signature
     split_k=1,  # K-dim split factor, constexpr kernel specialization
     split_k_mode=SplitKMode.SERIAL,  # SERIAL/PARALLEL only (SEPARATE rejected upstream)
     # A-operand transform (SM90 RS / SM120 warp-MMA mainloop,
@@ -230,8 +229,10 @@ def _compile_gemm_epi(
         (is_dynamic_persistent and device_capacity[0] == 9),
         False,
         l,
-        has_ag=has_ag,
         raster_order=raster_order,
+        shard_tile_order=(
+            dist_op.make_scheduler_args(dist_op.fake_args(d_dtype)) if dist_op is not None else None
+        ),
     )
     varlen_args = make_fake_varlen_args(
         varlen_m,
@@ -305,7 +306,7 @@ class GemmEpiPlan(NamedTuple):
     epi_arg_keys: tuple  # ((op_name, key), ...) as compiled
     tile_M: int  # scheduler-cluster geometry, for launch-time AG validation
     cluster_M: int  # (see validate_ag_geometry in plan_scheduler_args)
-    has_ag: bool  # AllGather+GEMM: dist_op_args also feed the scheduler's ag bundle
+    dist_op: object  # the operator: its make_scheduler_args(dist_op_args) is the per-call tile order
     # Launch-overhead precomputation (host hot path): (name, converter, key)
     # triples — converter is the op's bound ``host_call_arg``, or None when the
     # op inherits the identity default (the value passes straight through) —
@@ -378,7 +379,7 @@ def build_gemm_epi_plan(
 ) -> GemmEpiPlan:
     """Derive majors/dtypes/epi keys from tensor metadata and compile (or hit
     the jit cache). Variant wrappers call this after their validation asserts."""
-    has_ag = isinstance(dist_op, AllGather)  # its bundle also feeds the scheduler's ag fields
+    raster_order = dist_op_raster_order(dist_op, raster_order)
     transform_ref, owned_fmt, transform_dims = None, None, None
     if transform_a is not None:
         from quack.operand_transform.host import as_transform_mod
@@ -475,7 +476,6 @@ def build_gemm_epi_plan(
         b_mma_dtype=b_mma_dtype,
         post_init_attrs=post_init_attrs,
         packed_cd=packed_cd,
-        has_ag=has_ag,
         split_k=split_k,
         split_k_mode=split_k_mode,
         transform_a_ref=transform_ref,
@@ -488,11 +488,10 @@ def build_gemm_epi_plan(
     # Must mirror make_fake_scheduler_args above: only the SM90 dynamic
     # scheduler consumes the semaphore, so it's the only non-static case.
     scheduler_uses_semaphore = is_dynamic_persistent and device_capacity[0] == 9
-    # AG plans get PER-CALL scheduler args (the flags seq advances every
-    # iteration), never the prebuilt static tuple.
+    # an operator's tile order is per call; plan_scheduler_args skips the static tuple then
     scheduler_static = (
         make_scheduler_args(max_active_clusters, max_swizzle_size, None)
-        if not scheduler_uses_semaphore and not has_ag
+        if not scheduler_uses_semaphore
         else None
     )
     plan_ops = _ops_by_name(GemmCls)
@@ -529,7 +528,7 @@ def build_gemm_epi_plan(
             if varlen_m and _has_m_fold_sink(plan_ops, epi_keys)
             else None
         ),
-        has_ag=has_ag,
+        dist_op=dist_op,
     )
 
 
@@ -586,9 +585,7 @@ def run_gemm_epi_plan(
         fields["split_k_semaphore"] = sem.permute(1, 2, 0)
         fields["split_k_workspace"] = ws.permute(3, 1, 2, 0)
     epi_args = plan.gemm_cls.EpilogueArguments._make(fields.values())
-    scheduler_args = plan_scheduler_args(
-        plan, tile_count_semaphore, ag_args=dist_op_args if plan.has_ag else None, A=A
-    )
+    scheduler_args = plan_scheduler_args(plan, tile_count_semaphore, dist_op_args=dist_op_args, A=A)
     cu_tiles_m = (
         compute_cu_tiles_m(cu_seqlens_m, plan.cu_tiles_tile_m)
         if cu_seqlens_m is not None and plan.cu_tiles_tile_m is not None
