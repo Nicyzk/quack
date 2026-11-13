@@ -59,7 +59,7 @@ import torch.distributed as dist
 
 from quack.blockscaled.operand import BlockScaledOperand
 from quack.blockscaled.quantize import pack_scale_2d_to_blocked_contig, to_mx
-from quack.distributed import AllGatherRunner, BlockScaledAllGatherRunner
+from quack.distributed import AllGather, AllGatherRunner, BlockScaledAllGatherRunner
 from quack.gemm import gemm as quack_gemm
 
 SF_VEC = 32
@@ -260,7 +260,10 @@ def run_shape(rank, ws, device, M, N, K):
 
     def quack_bf16_ag():
         with runner_bf16.gather(a_hp) as (a_full, ag_args):
-            quack_gemm(a_full, b_hp, d, None, None, 256, 256, 2, 1, ag_args=ag_args)
+            quack_gemm(
+                a_full, b_hp, d, None, None, 256, 256, 2, 1,
+                dist_op=AllGather(), dist_op_args=ag_args,
+            )
 
     def quack_mx_staged():
         packed = pack_scale_2d_to_blocked_contig(a_sc.view(1, m, K // SF_VEC))
@@ -268,7 +271,7 @@ def run_shape(rank, ws, device, M, N, K):
         with runner_mx.gather(op) as (a_op, ag_args):
             quack_gemm(
                 a_op.qdata, b_q, d, None, None, *CFG,
-                SFA=a_op.scale, SFB=sfb, **MX, ag_args=ag_args,
+                SFA=a_op.scale, SFB=sfb, **MX, dist_op=AllGather(), dist_op_args=ag_args,
             )
 
     sfa_nccl = torch.empty_like(sfa_static)
@@ -283,7 +286,7 @@ def run_shape(rank, ws, device, M, N, K):
         with runner_mx.gather(a_q_u8) as (a_full, ag_args):
             quack_gemm(
                 a_full.view(torch.float8_e4m3fn), b_q, d, None, None, *CFG,
-                SFA=sfa_nccl, SFB=sfb, **MX, ag_args=ag_args,
+                SFA=sfa_nccl, SFB=sfb, **MX, dist_op=AllGather(), dist_op_args=ag_args,
             )
 
     ag_bf16_dst = torch.empty(M, K, dtype=torch.bfloat16, device=device)

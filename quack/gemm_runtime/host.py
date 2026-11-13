@@ -29,9 +29,10 @@ from quack.cache import jit_cache
 from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import get_max_active_clusters, torch2cute_dtype_map
 from quack.gemm_config import SplitKMode, cta_tile_shape_m
+from quack.tile_scheduler import RasterOrderOption
 from quack.epilogue.ops import EpiOp
 from quack.compile_utils import div_for_dtype, fake_batched
-from quack.gemm_base import AllGather
+from quack.distributed.all_gather_gemm import AllGather
 from quack.gemm_runtime.identity import (
     resolve_gemm_class,
     resolve_transform_a,
@@ -128,7 +129,8 @@ def _compile_gemm_epi(
     # arg, kernel-N (the activation M) is the only symbolic dim.
     transform_a_ref=None,
     transform_dims=None,
-    comm=None,  # SM100 Comm object (picklable; its state is in the key)
+    dist_op=None,  # SM100 DistOp object (picklable; its state is in the key)
+    raster_order=RasterOrderOption.Heuristic,
 ):
     """Compile one epilogue-GEMM variant against fake symbolic tensors.
 
@@ -183,8 +185,8 @@ def _compile_gemm_epi(
             a_mma_dtype=a_mma_dtype,
             b_mma_dtype=b_mma_dtype,
         )
-        if comm is not None:
-            # the comm's D is its wire with its own M extent (a Lamport wire stacks mirrors
+        if dist_op is not None:
+            # the operator's D is its wire with its own M extent (a Lamport wire stacks mirrors
             # along M): untie it from A's M in the compiled signature
             mD = fake_batched(
                 d_dtype,
@@ -225,7 +227,11 @@ def _compile_gemm_epi(
     epi_args = GemmCls.EpilogueArguments(**fields)
 
     scheduler_args = make_fake_scheduler_args(
-        (is_dynamic_persistent and device_capacity[0] == 9), False, l, has_ag=has_ag
+        (is_dynamic_persistent and device_capacity[0] == 9),
+        False,
+        l,
+        has_ag=has_ag,
+        raster_order=raster_order,
     )
     varlen_args = make_fake_varlen_args(
         varlen_m,
@@ -275,7 +281,7 @@ def _compile_gemm_epi(
         cd_packed=packed_cd,
         split_k=split_k,
         split_k_mode=split_k_mode,
-        comm=AllGather() if has_ag else comm,  # the ag bundle's gate is the AllGather operator
+        dist_op=dist_op,
     )
 
 
@@ -299,6 +305,7 @@ class GemmEpiPlan(NamedTuple):
     epi_arg_keys: tuple  # ((op_name, key), ...) as compiled
     tile_M: int  # scheduler-cluster geometry, for launch-time AG validation
     cluster_M: int  # (see validate_ag_geometry in plan_scheduler_args)
+    has_ag: bool  # AllGather+GEMM: dist_op_args also feed the scheduler's ag bundle
     # Launch-overhead precomputation (host hot path): (name, converter, key)
     # triples — converter is the op's bound ``host_call_arg``, or None when the
     # op inherits the identity default (the value passes straight through) —
@@ -345,6 +352,7 @@ def build_gemm_epi_plan(
     persistent=True,
     is_dynamic_persistent=False,
     max_swizzle_size=8,
+    raster_order=RasterOrderOption.Heuristic,
     varlen_m=False,
     gather_A=False,
     b_kn=False,
@@ -359,7 +367,6 @@ def build_gemm_epi_plan(
     post_init_attrs=(),
     gemm_cls_ref=None,
     packed_cd=None,  # "n" | "m": D/C passed RAW 16-bit, f32-recast at trace (dgated)
-    has_ag=False,  # AllGather+GEMM (see quack/distributed/): dense persistent only
     split_k=1,
     split_k_mode=SplitKMode.SERIAL,
     # A-operand transform handle (format name / DecodeFormat / a_transform
@@ -367,10 +374,11 @@ def build_gemm_epi_plan(
     # operand_transform.host.w4_operand_views (blob view + optional strip);
     # the ctor a_dtype comes from the format's mma_dtype.
     transform_a=None,
-    comm=None,  # SM100 Comm object (see quack/distributed/): dense static persistent only
+    dist_op=None,  # DistOp object (see quack/distributed/): dense persistent only
 ) -> GemmEpiPlan:
     """Derive majors/dtypes/epi keys from tensor metadata and compile (or hit
     the jit cache). Variant wrappers call this after their validation asserts."""
+    has_ag = isinstance(dist_op, AllGather)  # its bundle also feeds the scheduler's ag fields
     transform_ref, owned_fmt, transform_dims = None, None, None
     if transform_a is not None:
         from quack.operand_transform.host import as_transform_mod
@@ -472,7 +480,8 @@ def build_gemm_epi_plan(
         split_k_mode=split_k_mode,
         transform_a_ref=transform_ref,
         transform_dims=transform_dims,
-        comm=comm,
+        dist_op=dist_op,
+        raster_order=raster_order,
     )
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
@@ -520,6 +529,7 @@ def build_gemm_epi_plan(
             if varlen_m and _has_m_fold_sink(plan_ops, epi_keys)
             else None
         ),
+        has_ag=has_ag,
     )
 
 
@@ -531,7 +541,6 @@ def run_gemm_epi_plan(
     C,
     epi_values,
     *,
-    ag_args=None,  # forwarded to the scheduler (AllGather+GEMM flags contract)
     tile_count_semaphore=None,
     cu_seqlens_m=None,
     cu_seqlens_k=None,
@@ -540,7 +549,7 @@ def run_gemm_epi_plan(
     SFB=None,
     split_k_buffers=None,  # (sem, ws) raw from _split_k_buffers: reuse across
     # calls when the kernel leaves them reusable (serial self-resets)
-    comm_args=None,  # the comm object's per-call bundle (plans compiled with comm=)
+    dist_op_args=None,  # the operator's per-call bundle (plans compiled with dist_op=)
 ) -> None:
     """Launch a resolved plan: only per-call pointers and scalar values here.
 
@@ -577,7 +586,9 @@ def run_gemm_epi_plan(
         fields["split_k_semaphore"] = sem.permute(1, 2, 0)
         fields["split_k_workspace"] = ws.permute(3, 1, 2, 0)
     epi_args = plan.gemm_cls.EpilogueArguments._make(fields.values())
-    scheduler_args = plan_scheduler_args(plan, tile_count_semaphore, ag_args=ag_args, A=A)
+    scheduler_args = plan_scheduler_args(
+        plan, tile_count_semaphore, ag_args=dist_op_args if plan.has_ag else None, A=A
+    )
     cu_tiles_m = (
         compute_cu_tiles_m(cu_seqlens_m, plan.cu_tiles_tile_m)
         if cu_seqlens_m is not None and plan.cu_tiles_tile_m is not None
@@ -585,5 +596,5 @@ def run_gemm_epi_plan(
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=cu_tiles_m)
     launch_gemm(
-        plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB, comm_args=comm_args
+        plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB, dist_op_args=dist_op_args
     )

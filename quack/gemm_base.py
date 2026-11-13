@@ -28,7 +28,6 @@ from quack.tile_scheduler import (
     TileSchedulerArguments,
     VarlenMTileScheduler,
     VarlenMTileSchedulerArguments,
-    ag_wait_m_tile,
 )
 from quack.varlen_utils import VarlenManager
 
@@ -52,15 +51,15 @@ class NamedBarrierGemm(enum.IntEnum):
 COMM_BARRIER_ID = max(NamedBarrierGemm) + 1
 
 
-class CommCtx:
+class DistOpCtx:
     """What a kernel hands the operator's hooks: built once per kernel after setup, the same object at
     every call point. Operators unpack the fields they use into locals before any dynamic loop (the DSL
     cannot read a Python object inside a staged region)."""
 
     def __init__(
         self,
-        args=None,  # the operator's per-call bundle (comm_args)
-        smem=None,  # its SharedStorage field (storage.comm)
+        args=None,  # the operator's per-call bundle (dist_op_args)
+        smem=None,  # its SharedStorage field (storage.dist_op)
         sched_params=None,  # the tile scheduler params (gates read their bundles here)
         TileSchedulerCls=None,  # the scheduler factory, for warps that replay the static schedule
         epi_params=None,  # the epilogue's params and smem tensors: a finalizing operator re-enters
@@ -83,13 +82,13 @@ class EpiFrame:
         self.tile_mn, self.subtile, self.warp_shape_mnk = tile_mn, subtile, warp_shape_mnk
 
 
-class Comm:
-    """A distributed operator fused into the GEMM (GemmSmXX(..., comm=Comm subclass)). It owns the
+class DistOp:
+    """A distributed operator fused into the GEMM (GemmSmXX(..., dist_op=DistOp subclass)). It owns the
     per-tile gate (wait_tile) and publish (signal_tile), its comm warps (num_warps, regs = (epilogue,
-    other, comm) or None, smem via smem_bytes / smem_struct as storage.comm) and the destination of the
+    other, comm) or None, smem via smem_bytes / smem_struct as storage.dist_op) and the destination of the
     GEMM's staged subtile (store_coord / store_drain / store_fixup, epi_frame when it finalizes the epilogue).
     The GEMM owns the mainloop, the epilogue and the staging of the store; every hook sees the kernel
-    through one CommCtx. This base is the no-comm default."""
+    through one DistOpCtx. This base is the no-operator default."""
 
     num_warps = 0
     regs = None
@@ -110,27 +109,29 @@ class Comm:
         return (type(self).__module__, type(self).__qualname__, tuple(sorted(vars(self).items())))
 
     def fake_args(self, d_dtype):
-        """The comm_args bundle of fake tensors for cute.compile (None: the kernel takes none)."""
+        """The dist_op_args bundle of fake tensors for cute.compile (None: the kernel takes none)."""
         return None
 
     def epi_frame(self, gemm):
         """finalizes_epilogue: the EpiFrame the comm warps' epilogue runs on."""
         return None
 
-    def wire_shape(self, shape):
-        """Host: the shape of D (the operator's wire) for a problem whose output is `shape`; the runner
-        allocates it and the frontend validates it from this one place."""
+    def d_shape(self, shape):
+        """Host: the shape of D for a problem whose output is `shape` (the buffer factory allocates it,
+        the frontend validates it from this one place)."""
         return shape
 
     @cute.jit
     def store_coord(self, gemm, ctx, tile_coord_mnkl):
-        """The tile coordinate in D the epilogue stores this schedule tile at (D is the operator's wire)."""
+        """The tile coordinate in D the epilogue stores this schedule tile at (D is the operator's, not
+        the caller's output)."""
         return tile_coord_mnkl
 
     @cute.jit
     def store_fixup(self, frg):
-        """finalizes_epilogue: in-place fixup of the converted (wire-dtype) partial before it is staged for
+        """finalizes_epilogue: in-place fixup of the converted (d_dtype) partial before it is staged for
         the store; the store itself stays the GEMM's."""
+        # TODO: make this an epilogue node on the partial store path (post-convert), not a hook
         return
 
     def store_drain(self, gemm, ctx, sD, epi_tile, tidx):
@@ -161,35 +162,6 @@ class Comm:
         walk), gemm.comm_barrier for its syncs, teardown included. Never a consumer of the scheduler
         pipeline. ctx's epilogue materials are for a finalizing operator re-entering gemm.epilogue;
         ctx.mC is the C operand it reads per subtile itself (load_C)."""
-        return
-
-
-class AllGather(Comm):
-    """AllGather + GEMM: the transport is the copy engine (quack/distributed/all_gather_gemm.py), so
-    the operator is only the load-warp gate on the shard / chunk arrival flags the scheduler's `ag`
-    bundle carries. Implied by ag_args at the frontends; no comm warps, no comm_args."""
-
-    @cute.jit
-    def wait_tile(self, gemm, ctx, tile_coord_mnkl, gate: Int32) -> Int32:
-        return ag_wait_m_tile(ctx.sched_params, tile_coord_mnkl[0], gemm.cluster_shape_mnk[0], gate)
-
-
-class CommRunner:
-    """The host half of a distributed operator, what a caller passes as comm=: it owns the wire the GEMM
-    stores through (D), the result, the per-launch state and any coordination between launches, and
-    carries the kernel-side operator. The frontend takes D = wire and comm_args = args() from it and
-    calls before_launch() once per launch; the caller never sees the wire."""
-
-    comm: Comm
-    wire = None  # the tensor the GEMM stores through
-    out = None  # the result
-
-    def args(self):
-        """This launch's comm_args bundle."""
-        return self._args
-
-    def before_launch(self):
-        """Per-launch state (slot / epoch bumps, resets); runs once, before the kernel is enqueued."""
         return
 
 
@@ -376,10 +348,10 @@ class GemmBase:
     EpilogueParams = ParamsBase
 
     def epi_smem_warp_shape_mnk(self):
-        """The warps the epilogue and its ops' smem are laid out for: the comm frame's when the comm
+        """The warps the epilogue and its ops' smem are laid out for: the operator's frame when it
         warps run the epilogue (finalizes_epilogue), else this arch's epilogue warps."""
-        if self.comm.finalizes_epilogue:
-            return self.comm.epi_frame(self).warp_shape_mnk
+        if self.dist_op.finalizes_epilogue:
+            return self.dist_op.epi_frame(self).warp_shape_mnk
         return self.epi_warp_shape_mnk()
 
     def epi_warp_shape_mnk(self):
@@ -430,12 +402,12 @@ class GemmBase:
         tidx: Int32,
         is_tma_warp: cutlass.Boolean,
         # Register-direct D store per subtile, replacing the smem+TMA copy_D path
-        # (a comm operator's warps).
+        # (a distributed operator's warps).
         commit_D: Optional[Callable] = None,
-        # Register-direct C load per subtile, replacing the smem-staged C (a comm operator's
+        # Register-direct C load per subtile, replacing the smem-staged C (a distributed operator's
         # warps read C from gmem themselves).
         load_C: Optional[Callable] = None,
-        # Store the raw accumulator as D (converted, the comm's store_fixup applied) and run no
+        # Store the raw accumulator as D (converted, the operator's store_fixup applied) and run no
         # epi op, C load or aux output: the operator's warps run the epilogue on the reduced value.
         partial_only: cutlass.Constexpr[bool] = False,
         # The tile the epilogue is framed on: the CTA tile unless the caller runs it on a
@@ -471,7 +443,7 @@ class GemmBase:
         # per-CTA-tile Boolean (e.g. GemmSymmetric skips the mirrored write
         # on diagonal tiles). D's host pieces stay kernel-built (see DStore).
         if const_expr(partial_only):
-            # the raw partial as D alone: no aux output, no codec; the convert then the comm's fixup
+            # the raw partial as D alone: no aux output, no codec; the convert then the operator's fixup
             assert has_D and self.rounding_mode != RoundingMode.RS, (
                 "partial_only commits D with round-to-nearest"
             )
@@ -646,7 +618,7 @@ class GemmBase:
                     )
                 )
             if const_expr(partial_only):
-                self.comm.store_fixup(store_frags_out[0])
+                self.dist_op.store_fixup(store_frags_out[0])
             iket.range_push("epi_store_acq")
             if const_expr(use_tma_epi):
                 if is_tma_warp:
@@ -940,7 +912,7 @@ class GemmBase:
                 # workspace with generic loads, so no async-proxy fence is needed
                 # after the acquire.
                 split_k_sem.wait_eq(self.split_k - 1)
-            if const_expr(self.comm.finalizes_epilogue):
+            if const_expr(self.dist_op.finalizes_epilogue):
                 # the operator's warps finalize (reduce across ranks, then the epilogue): this rank's
                 # epilogue warps commit the raw partial through the D store path
                 epi_read_state, epi_producer_state = epi_fn(finalizer_load_acc, partial_only=True)
@@ -961,16 +933,16 @@ class GemmBase:
                         epi_store_pipeline.producer_tail()
         return epi_read_state, epi_producer_state
 
-    def comm_setup(self, comm, comm_warp_ids, static_schedule: bool = True):
+    def dist_op_setup(self, dist_op, comm_warp_ids, static_schedule: bool = True):
         """Host, in a kernel's constructor: bind the operator and the warps this arch gives it
-        (comm_warp_ids: the kernel's choice, up to comm.num_warps; a new group on SM100, the producer
+        (comm_warp_ids: the kernel's choice, up to dist_op.num_warps; a new group on SM100, the producer
         group's spare warps on SM90). Derives the comm barrier; comm warps need a static schedule to replay."""
-        self.comm = comm if comm is not None else Comm()
+        self.dist_op = dist_op if dist_op is not None else DistOp()
         self.comm_warp_ids = tuple(comm_warp_ids)
         self.num_comm_warps = len(self.comm_warp_ids)
-        assert self.num_comm_warps <= self.comm.num_warps and (
-            (self.num_comm_warps > 0) == (self.comm.num_warps > 0)
-        ), "comm_warp_ids: some of the comm's warps, up to comm.num_warps"
+        assert self.num_comm_warps <= self.dist_op.num_warps and (
+            (self.num_comm_warps > 0) == (self.dist_op.num_warps > 0)
+        ), "comm_warp_ids: some of the operator's warps, up to dist_op.num_warps"
         assert static_schedule or not self.num_comm_warps, (
             "comm warps mirror the static schedule; a dynamic scheduler steals per CTA"
         )

@@ -47,7 +47,7 @@ class GemmConfig:
     cluster_k: int = 1
     split_k: int = 1
     swap_ab: bool = False
-    # raster_order: int = 1
+    raster_order: int = 2  # tile_scheduler.RasterOrderOption: 0 AlongM, 1 AlongN, 2 Heuristic
     max_swizzle_size: int = 8
     device_capacity: int = 9
     # whether to use TMA gather (vs normal cp.async) for gather_A on SM100

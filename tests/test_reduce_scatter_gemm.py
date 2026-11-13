@@ -1,5 +1,5 @@
 # Copyright (c) 2026, QuACK team.
-"""Multi-rank correctness tests for the comm-object GEMM (quack/distributed/reduce_scatter.py):
+"""Multi-rank correctness tests for the distributed-operator GEMM (quack/distributed/reduce_scatter.py):
 GEMM + reduce-scatter, GEMM + all-reduce, and a reduce epi op running in the comm warps.
 
 Runs under torchrun (one rank per GPU); the pytest entry point spawns torchrun as a
@@ -20,8 +20,8 @@ TILE_M, TILE_N = 128, 256
 NUM_ITERS = 3  # back-to-back launches: flag reset, exit barrier, PDL ordering
 
 
-def _compile(gemm_cls, comm, epi_fake, dtype, has_c=False, own_d=False):
-    """The dense 2D GEMM of gemm_cls with the comm object, compiled on fake tensors."""
+def _compile(gemm_cls, dist_op, epi_fake, dtype, has_c=False, own_d=False):
+    """The dense 2D GEMM of gemm_cls with the distributed operator, compiled on fake tensors."""
     import cutlass
     import cutlass.cute as cute
 
@@ -30,9 +30,10 @@ def _compile(gemm_cls, comm, epi_fake, dtype, has_c=False, own_d=False):
         make_fake_scheduler_args,
         make_fake_varlen_args,
     )
+    from quack.tile_scheduler import RasterOrderOption
 
     gemm = gemm_cls(
-        cutlass.Float32, dtype, (TILE_M, TILE_N), (1, 1, 1), use_clc_persistence=False, comm=comm
+        cutlass.Float32, dtype, (TILE_M, TILE_N), (1, 1, 1), use_clc_persistence=False, dist_op=dist_op
     )
     gemm.b_transposed = gemm.a_transposed = gemm.cd_transposed = False
     gemm.cd_packed = None
@@ -48,9 +49,9 @@ def _compile(gemm_cls, comm, epi_fake, dtype, has_c=False, own_d=False):
 
     if has_c:  # its own shape: slab-shaped under RS, full under AR
         mC = own()
-    if own_d:  # the comm's wire has its own extent (lamport: 3 x world mirrors stacked along M)
+    if own_d:  # the operator's D has its own extent (lamport: 3 x world mirrors stacked along M)
         mD = own()
-    sched = make_fake_scheduler_args(False, False, l)
+    sched = make_fake_scheduler_args(False, False, l, raster_order=RasterOrderOption.AlongN)
     varlen = make_fake_varlen_args(False, False, False, None)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     return cute.compile(
@@ -65,7 +66,7 @@ def _compile(gemm_cls, comm, epi_fake, dtype, has_c=False, own_d=False):
         stream,
         None,
         None,
-        comm.fake_args(dtype),
+        dist_op.fake_args(dtype),
         options="--enable-tvm-ffi",
     )
 
@@ -81,7 +82,13 @@ def _run_rank():
         get_max_active_clusters,
         torch2cute_dtype_map,
     )
-    from quack.distributed.reduce_scatter import AllReduceRunner, ReduceScatterRunner
+    from quack.distributed.lamport import AllReduceLamport, make_lamport_buffers
+    from quack.distributed.reduce_scatter import (
+        AllReduce,
+        ReduceScatter,
+        make_all_reduce_buffers,
+        make_reduce_scatter_buffers,
+    )
     from quack.epilogue.frontend import gemm_epilogue
     from quack.epilogue.ops import RowVecReduce
     from quack.gemm_default_epi import GemmDefaultEpiMixin, GemmDefaultSm90, GemmDefaultSm100
@@ -137,60 +144,58 @@ def _run_rank():
         return out
 
     # --- reduce-scatter: each rank ends with its M slab of the full-K product ---
-    rs = ReduceScatterRunner(m, n, dtype, TILE_M, TILE_N, clusters)
-    fn = _compile(gemm_cls, rs.comm, epi_fake, cdtype)
+    d, out, args = make_reduce_scatter_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
+    fn = _compile(gemm_cls, ReduceScatter(rank, world),epi_fake, cdtype)
     for it in range(NUM_ITERS):
         torch.manual_seed(1000 + 10 * it + rank)
         a = torch.randn(m, k, dtype=dtype, device=device) / 8
         b = torch.randn(n, k, dtype=dtype, device=device) / 8
-        fn(a, b, rs.wire, None, epi_rt, sched_rt, None, None, None, rs.args())
+        fn(a, b, d, None, epi_rt, sched_rt, None, None, None, args)
         torch.cuda.synchronize(device)
         rows = slice(rank * slab, (rank + 1) * slab)
-        check(f"rs iter={it}", rs.out, full_ref(a, b)[rows], nccl_rs(a, b))
+        check(f"rs iter={it}", out, full_ref(a, b)[rows], nccl_rs(a, b))
 
     # --- all-reduce: every rank ends with the whole full-K product ---
-    ar = AllReduceRunner(m, n, dtype, TILE_M, TILE_N, clusters)
-    fn = _compile(gemm_cls, ar.comm, epi_fake, cdtype)
+    d, out, args = make_all_reduce_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
+    fn = _compile(gemm_cls, AllReduce(rank, world),epi_fake, cdtype)
     for it in range(NUM_ITERS):
         torch.manual_seed(2000 + 10 * it + rank)
         a = torch.randn(m, k, dtype=dtype, device=device) / 8
         b = torch.randn(n, k, dtype=dtype, device=device) / 8
-        fn(a, b, ar.wire, None, epi_rt, sched_rt, None, None, None, ar.args())
+        fn(a, b, d, None, epi_rt, sched_rt, None, None, None, args)
         torch.cuda.synchronize(device)
-        check(f"ar iter={it}", ar.out, full_ref(a, b), nccl_ar(a, b))
+        check(f"ar iter={it}", out, full_ref(a, b), nccl_ar(a, b))
 
     # --- C operand, applied after the reduce: RS adds this rank's slab residual, AR a replicated one ---
-    rs = ReduceScatterRunner(m, n, dtype, TILE_M, TILE_N, clusters)
-    fn = _compile(gemm_cls, rs.comm, epi_fake, cdtype, has_c=True)
+    d, out, args = make_reduce_scatter_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
+    fn = _compile(gemm_cls, ReduceScatter(rank, world),epi_fake, cdtype, has_c=True)
     for it in range(NUM_ITERS):
         torch.manual_seed(4000 + 10 * it + rank)
         a = torch.randn(m, k, dtype=dtype, device=device) / 8
         b = torch.randn(n, k, dtype=dtype, device=device) / 8
         c = torch.randn(slab, n, dtype=dtype, device=device)
-        fn(a, b, rs.wire, c, epi_rt, sched_rt, None, None, None, rs.args())
+        fn(a, b, d, c, epi_rt, sched_rt, None, None, None, args)
         torch.cuda.synchronize(device)
         rows = slice(rank * slab, (rank + 1) * slab)
-        check(f"rs+c iter={it}", rs.out, full_ref(a, b)[rows] + c.float(), nccl_rs(a, b) + c)
+        check(f"rs+c iter={it}", out, full_ref(a, b)[rows] + c.float(), nccl_rs(a, b) + c)
 
-    ar = AllReduceRunner(m, n, dtype, TILE_M, TILE_N, clusters)
-    fn = _compile(gemm_cls, ar.comm, epi_fake, cdtype, has_c=True)
+    d, out, args = make_all_reduce_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
+    fn = _compile(gemm_cls, AllReduce(rank, world),epi_fake, cdtype, has_c=True)
     for it in range(NUM_ITERS):
         torch.manual_seed(5000 + 10 * it + rank)
         a = torch.randn(m, k, dtype=dtype, device=device) / 8
         b = torch.randn(n, k, dtype=dtype, device=device) / 8
         torch.manual_seed(5000 + 10 * it)  # rank-invariant residual
         c = torch.randn(m, n, dtype=dtype, device=device)
-        fn(a, b, ar.wire, c, epi_rt, sched_rt, None, None, None, ar.args())
+        fn(a, b, d, c, epi_rt, sched_rt, None, None, None, args)
         torch.cuda.synchronize(device)
-        check(f"ar+c iter={it}", ar.out, full_ref(a, b) + c.float(), nccl_ar(a, b) + c)
+        check(f"ar+c iter={it}", out, full_ref(a, b) + c.float(), nccl_ar(a, b) + c)
 
     # --- one-shot Lamport all-reduce: no flags, the data is the flag; more launches than slots so the
     # 3-slot rotation and the re-arm are exercised ---
-    from quack.distributed.lamport import LamportRunner
-
     for has_c in (False, True):
-        lp = LamportRunner(m, n, dtype, TILE_M)
-        fn = _compile(gemm_cls, lp.comm, epi_fake, cdtype, has_c=has_c, own_d=True)
+        d, out, args = make_lamport_buffers(m, n, dtype, TILE_M)
+        fn = _compile(gemm_cls, AllReduceLamport(rank, world),epi_fake, cdtype, has_c=has_c, own_d=True)
         for it in range(max(NUM_ITERS, 5)):
             torch.manual_seed(6000 + 10 * it + rank)
             a = torch.randn(m, k, dtype=dtype, device=device) / 8
@@ -199,17 +204,18 @@ def _run_rank():
             if has_c:
                 torch.manual_seed(6000 + 10 * it)  # rank-invariant residual
                 c = torch.randn(m, n, dtype=dtype, device=device)
-            lp.before_launch()
-            fn(a, b, lp.wire, c, epi_rt, sched_rt, None, None, None, lp.args())
+            args.slot.add_(1)
+            fn(a, b, d, c, epi_rt, sched_rt, None, None, None, args)
             torch.cuda.synchronize(device)
             ref, base = full_ref(a, b), nccl_ar(a, b)
             if has_c:
                 ref, base = ref + c.float(), base + c
-            check(f"lamport{'+c' if has_c else ''} iter={it}", lp.out, ref, base)
+            check(f"lamport{'+c' if has_c else ''} iter={it}", out, ref, base)
 
-    # --- through an epilogue module: comm= / comm_args= on the torch-facing call ---
+    # --- through an epilogue module: dist_op= / dist_op_args= on the torch-facing call ---
     from quack.epilogue.library import identity_epi
     from quack.gemm_config import GemmConfig
+    from quack.tile_scheduler import RasterOrderOption
 
     cfg = GemmConfig(
         tile_m=TILE_M,
@@ -218,24 +224,30 @@ def _run_rank():
         is_dynamic_persistent=False,
         cluster_m=1,
         cluster_n=1,
+        raster_order=RasterOrderOption.AlongN,  # the reducers' measured raster (S2 schedule)
         device_capacity=capacity[0],
     )
-    rs = ReduceScatterRunner(m, n, dtype, TILE_M, TILE_N, clusters)
+    d, out, args = make_reduce_scatter_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
     for it in range(NUM_ITERS):
         torch.manual_seed(6000 + 10 * it + rank)
         a = torch.randn(m, k, dtype=dtype, device=device) / 8
         b = torch.randn(n, k, dtype=dtype, device=device) / 8
-        out = identity_epi(a, b.T, config=cfg, comm=rs)["D"]  # the runner's result, not its wire
+        identity_epi(
+            a, b.T, out={"D": d}, config=cfg, dist_op=ReduceScatter(rank, world), dist_op_args=args
+        )
         torch.cuda.synchronize(device)
         rows = slice(rank * slab, (rank + 1) * slab)
         check(f"mod rs iter={it}", out, full_ref(a, b)[rows], nccl_rs(a, b))
 
-    lp = LamportRunner(m, n, dtype, TILE_M)  # the wire's own extent passes the module path's checks
+    d, out, args = make_lamport_buffers(m, n, dtype, TILE_M)  # D's own extent passes the module path's checks
     for it in range(max(NUM_ITERS, 5)):
         torch.manual_seed(7000 + 10 * it + rank)
         a = torch.randn(m, k, dtype=dtype, device=device) / 8
         b = torch.randn(n, k, dtype=dtype, device=device) / 8
-        out = identity_epi(a, b.T, config=cfg, comm=lp)["D"]
+        args.slot.add_(1)
+        identity_epi(
+            a, b.T, out={"D": d}, config=cfg, dist_op=AllReduceLamport(rank, world), dist_op_args=args
+        )
         torch.cuda.synchronize(device)
         check(f"mod lamport iter={it}", out, full_ref(a, b), nccl_ar(a, b))
 
@@ -248,8 +260,8 @@ def _run_rank():
     colmax_fake = make_fake_tensor(
         Float32, (cute.sym_int(), cute.sym_int(), cute.sym_int()), leading_dim=2
     )
-    rs = ReduceScatterRunner(m, n, dtype, TILE_M, TILE_N, clusters)
-    fn = _compile(cls, rs.comm, cls.EpilogueArguments(colmax=colmax_fake), cdtype)
+    d, out, args = make_reduce_scatter_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
+    fn = _compile(cls, ReduceScatter(rank, world),cls.EpilogueArguments(colmax=colmax_fake), cdtype)
     stripe = TILE_M // world  # the comm warps' frame: one reduce row per stripe of the slab
     colmax = torch.zeros(1, m // TILE_M, n, dtype=torch.float32, device=device)
     for it in range(NUM_ITERS):
@@ -257,11 +269,11 @@ def _run_rank():
         a = torch.randn(m, k, dtype=dtype, device=device) / 8
         b = torch.randn(n, k, dtype=dtype, device=device) / 8
         epi = cls.EpilogueArguments(colmax=colmax)
-        fn(a, b, rs.wire, None, epi, sched_rt, None, None, None, rs.args())
+        fn(a, b, d, None, epi, sched_rt, None, None, None, args)
         torch.cuda.synchronize(device)
         rows = slice(rank * slab, (rank + 1) * slab)
         ref, base = full_ref(a, b)[rows], nccl_rs(a, b).float()
-        check(f"rs+rowmax D iter={it}", rs.out, ref, base)
+        check(f"rs+rowmax D iter={it}", out, ref, base)
         stripe_max = lambda x: x.view(m // TILE_M, stripe, n).abs().amax(1)
         check(f"rs+rowmax colmax iter={it}", colmax[0], stripe_max(ref), stripe_max(base))
 

@@ -23,7 +23,7 @@ from cutlass.utils import LayoutEnum, SmemPartition
 
 from quack import layout_utils
 from quack import pipeline_checks
-from quack.gemm_base import Comm, CommCtx, GemmTmaBase, NamedBarrierGemm, reinterpret_packed_fp6
+from quack.gemm_base import DistOp, DistOpCtx, GemmTmaBase, NamedBarrierGemm, reinterpret_packed_fp6
 from quack.gemm_config import SplitKMode
 from quack.operand_transform.transform import TransformAOperand
 from quack.tile_scheduler import TileSchedulerOptions
@@ -166,7 +166,7 @@ class GemmSm90(GemmTmaBase):
         split_k_mode: int = SplitKMode.SERIAL,
         mma_is_rs: bool = False,
         transform_a: Optional[Callable] = None,
-        comm: Optional[Comm] = None,
+        dist_op: Optional[DistOp] = None,
     ):
         """
         Initializes the configuration for a Hopper dense GEMM kernel.
@@ -296,9 +296,9 @@ class GemmSm90(GemmTmaBase):
         self.ab_load_warp_id = self.mma_warp_groups * 4
         # comm warps ride the producer warp group's spare warps (SM90 has no room for a 4th group):
         # up to 2 after the AB load warp
-        num_comm_warps = min(comm.num_warps, 2) if comm is not None else 0
+        num_comm_warps = min(dist_op.num_warps, 2) if dist_op is not None else 0
         first_comm = self.ab_load_warp_id + 1
-        self.comm_setup(comm, range(first_comm, first_comm + num_comm_warps))
+        self.dist_op_setup(dist_op, range(first_comm, first_comm + num_comm_warps))
         if num_comm_warps:
             assert not self.gather_A and not self.pingpong, (
                 "comm warps need the cooperative schedule's spare producer warps"
@@ -477,7 +477,7 @@ class GemmSm90(GemmTmaBase):
             self.c_dtype,
             epilogue_args,
             cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}")
-            - self.comm.smem_bytes(self),  # smem_capacity
+            - self.dist_op.smem_bytes(self),  # smem_capacity
             self.occupancy,
             self.epi_smem_warp_shape_mnk(),
             # layout-owning transform_a: A's smem bytes come from the
@@ -543,7 +543,7 @@ class GemmSm90(GemmTmaBase):
         # launch_gemm). Real scale factors are SM120-blockscaled only.
         mSFA: Optional[cute.Tensor] = None,
         mSFB: Optional[cute.Tensor] = None,
-        comm_args=None,  # the comm operator's bundle, opaque to the GEMM: handed to its hooks as is
+        dist_op_args=None,  # the operator's bundle, opaque to the GEMM: handed to its hooks as is
     ):
         """Execute the GEMM operation in steps:
         - Setup static attributes
@@ -590,7 +590,7 @@ class GemmSm90(GemmTmaBase):
             assert mAuxA is not None, "the transform's raw aux operand (e.g. seed) needs mA.sf"
         # the comm warps run the epilogue and read C themselves (per subtile, from gmem): the GEMM stages no C
         mC_comm = None
-        if const_expr(self.comm.finalizes_epilogue):
+        if const_expr(self.dist_op.finalizes_epilogue):
             mC_comm, mC = mC, None
         if const_expr(not a_owned):
             # Tensors arrive batch-first: rotate (l, x, y) -> (x, y, l) at trace time.
@@ -777,7 +777,7 @@ class GemmSm90(GemmTmaBase):
             tma_atom_c,
             tma_tensor_c,
         ) = self.make_tma_epilogue_atoms_and_tensors(mD, mC, epilogue_args, varlen_m)
-        if const_expr(self.comm.finalizes_epilogue):
+        if const_expr(self.dist_op.finalizes_epilogue):
             assert not any(op.is_tile_load() for op in getattr(self, "_epi_ops", ())), (
                 "finalizes_epilogue: TileLoad epilogue inputs are not staged for the comm warps"
             )
@@ -828,7 +828,7 @@ class GemmSm90(GemmTmaBase):
                 self.buffer_align_bytes,
             ]
             epi: self.epi_get_smem_struct(epilogue_params)
-            comm: self.comm.smem_struct(self)
+            dist_op: self.dist_op.smem_struct(self)
             sA: cute.struct.Align[
                 cute.struct.MemRange[self.a_smem_dtype, cute.cosize(self.a_smem_layout_staged)],
                 self.buffer_align_bytes,
@@ -883,7 +883,7 @@ class GemmSm90(GemmTmaBase):
             self.aux_a_smem_layout_staged,
             tile_sched_params,
             TileSchedulerCls,
-            comm_args,
+            dist_op_args,
             mC_comm,
         ).launch(
             grid=grid,
@@ -931,7 +931,7 @@ class GemmSm90(GemmTmaBase):
         aux_a_smem_layout: Optional[cute.Layout],
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
-        comm_args,
+        dist_op_args,
         mC_comm: Optional[cute.Tensor],
     ):
         """
@@ -1056,10 +1056,10 @@ class GemmSm90(GemmTmaBase):
             TileSchedulerCls.create, tile_sched_params, sched_data, sched_pipeline
         )
 
-        # what the comm's hooks see of this kernel, the same object at every call point
-        ctx = CommCtx(
-            comm_args,
-            storage.comm,
+        # what the operator's hooks see of this kernel, the same object at every call point
+        ctx = DistOpCtx(
+            dist_op_args,
+            storage.dist_op,
             tile_sched_params,
             TileSchedulerCls,
             epilogue_params,
@@ -1099,7 +1099,7 @@ class GemmSm90(GemmTmaBase):
                     is_scheduler_warp = is_scheduler_warp and cute.arch.block_idx_in_cluster() == 0
                 tile_scheduler = TileSchedulerCls()
                 work_tile = tile_scheduler.initial_work_tile_info()
-                gate = Int32(-1)  # the comm's wait_tile state (AllGather: its satisfied-gate cache)
+                gate = Int32(-1)  # the operator's wait_tile state (AllGather: its satisfied-gate cache)
                 ab_producer_state = make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.ab_stage
                 )
@@ -1107,9 +1107,9 @@ class GemmSm90(GemmTmaBase):
                     # (pid_m, pid_n, split_idx | None, batch_idx), decoded by the scheduler
                     tile_coord_mnkl = work_tile.tile_idx
                     batch_idx, split_idx = tile_coord_mnkl[3], tile_coord_mnkl[2]
-                    # the comm's gate before the tile's first TMA: only the load warp gates, the
+                    # the operator's gate before the tile's first TMA: only the load warp gates, the
                     # MMA/epilogue warps are downstream of the AB pipeline
-                    gate = self.comm.wait_tile(self, ctx, tile_coord_mnkl, gate)
+                    gate = self.dist_op.wait_tile(self, ctx, tile_coord_mnkl, gate)
                     iket.range_push("tma_load")
                     # Local_tile partition global tensors
                     copy_A, prefetch_A = None, None
@@ -1213,7 +1213,7 @@ class GemmSm90(GemmTmaBase):
                     if const_expr(self.use_pdl):
                         prims.griddepcontrol(prims.GridDepAction.WAIT)
                     comm_tidx, _, _ = cute.arch.thread_idx()
-                    self.comm.comm_warps(self, ctx, warp_idx, comm_tidx)
+                    self.dist_op.comm_warps(self, ctx, warp_idx, comm_tidx)
 
         if warp_idx < self.ab_load_warp_id:
             cute.arch.setmaxregister_increase(self.num_regs_mma)
@@ -1281,8 +1281,8 @@ class GemmSm90(GemmTmaBase):
             c_tile_cnt = cute.size(self.epi_tile_shape)
 
             ab_read_state = make_pipeline_state(pipeline.PipelineUserType.Consumer, self.ab_stage)
-            # the comm may drain the staged D subtile itself (per-row destinations): no TMA store then
-            drain = self.comm.store_drain(self, ctx, sD, self.epi_tile, tidx)
+            # the operator may drain the staged D subtile itself (per-row destinations): no TMA store then
+            drain = self.dist_op.store_drain(self, ctx, sD, self.epi_tile, tidx)
             epi_store_pipeline = None
             if const_expr(drain is None):
                 epi_store_pipeline = self.make_epi_store_pipeline()
@@ -1397,7 +1397,7 @@ class GemmSm90(GemmTmaBase):
                         self.cta_tile_shape_mnk[:2],
                         self.epi_tile,
                         sD,
-                        self.comm.store_coord(self, ctx, tile_coord_mnkl),
+                        self.dist_op.store_coord(self, ctx, tile_coord_mnkl),
                     )
 
                 copy_C = None
@@ -1482,8 +1482,8 @@ class GemmSm90(GemmTmaBase):
                     tidx,
                     is_tma_warp,
                 )
-                # the tile's epilogue is issued: the comm publishes it
-                self.comm.signal_tile(
+                # the tile's epilogue is issued: the operator publishes it
+                self.dist_op.signal_tile(
                     self, ctx, tile_coord_mnkl, epi_store_pipeline, is_tma_warp, tidx
                 )
 

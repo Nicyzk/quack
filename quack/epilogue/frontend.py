@@ -188,6 +188,7 @@ from quack.gemm_runtime.identity import (
     module_locator,
     register_local_epi_mod,
 )
+from quack.tile_scheduler import RasterOrderOption
 from quack.gemm_config import (
     SplitKMode,
     blockscaled_default_config,
@@ -199,21 +200,7 @@ from quack.gemm_sm80 import GemmSm80
 from quack.gemm_sm90 import GemmSm90
 from quack.gemm_sm100 import GemmSm100
 from quack.gemm_sm120 import GemmSm120
-from quack.gemm_base import CommRunner
 from quack.rounding import RoundingMode
-
-
-def _resolve_comm(comm, comm_args, D):
-    """comm= is the host runner (CommRunner: it supplies the wire as D, its per-launch bundle and the
-    kernel-side operator, and runs before_launch once) or the kernel-side Comm with explicit D / comm_args."""
-    if isinstance(comm, CommRunner):
-        if comm_args is not None or (D is not None and comm.wire is not None):
-            raise ValueError(
-                "a CommRunner supplies comm_args (and D, when it owns the wire) itself"
-            )
-        comm.before_launch()
-        return comm.comm, comm.args(), comm.wire if comm.wire is not None else D
-    return comm, comm_args, D
 
 
 _SM_BASE = {8: GemmSm80, 9: GemmSm90, 10: GemmSm100, 11: GemmSm100, 12: GemmSm120}
@@ -594,6 +581,7 @@ class EpiMod:
         persistent: bool = True,
         is_dynamic_persistent: bool = False,
         max_swizzle_size: int = 8,
+        raster_order: int = RasterOrderOption.Heuristic,  # the scheduler's raster (compile-time)
         tile_count_semaphore=None,
         cu_seqlens_m=None,
         A_idx=None,
@@ -615,11 +603,9 @@ class EpiMod:
         #                               (cp.reduce.async.bulk — no C load, half the
         #                               accumulate traffic of C=D). The fn still
         #                               returns the DELTA; requires C=None.
-        ag_args=None,  # AllGather+GEMM flags contract (see quack/distributed/)
-        comm=None,  # the distributed operator (quack/distributed/): a CommRunner (supplies D = its
-        #             wire and comm_args; the result is runner.out) or the kernel-side Comm with
-        #             D = its wire and comm_args; dense static-persistent only
-        comm_args=None,  # the comm's per-call bundle (kernel-side Comm only)
+        dist_op=None,  # the distributed operator (quack/distributed/, a DistOp): D is the tensor it stores
+        #                into (out={"D": d}), dist_op_args its bundle; dense persistent only
+        dist_op_args=None,  # the operator's per-call bundle
         # A-operand transform (SM90 RS / SM120 warp-MMA mainloop). Value
         # transforms leave the
         # call contract unchanged. Layout-owning (packed-weight) transforms
@@ -637,7 +623,6 @@ class EpiMod:
         #                        split-k self-resets); None = fresh per call
         _launch=True,  # False: resolve/compile only (EpiMod.plan) — no kernel launch
     ) -> GemmEpiPlan:
-        comm, comm_args, D = _resolve_comm(comm, comm_args, D)
         varlen_m = cu_seqlens_m is not None
         gather_A = A_idx is not None
         blockscaled = SFA is not None
@@ -652,7 +637,7 @@ class EpiMod:
             transform_a = as_transform_mod(transform_a)
             owned_fmt = transform_a.owned_fmt
             transform_key = transform_a.plan_key()
-            if varlen_m or gather_A or blockscaled or concat_key or ag_args is not None:
+            if varlen_m or gather_A or blockscaled or concat_key or dist_op is not None:
                 raise ValueError("transform_a: plain dense GEMM only")
             if swap_ab:
                 raise ValueError("transform_a + swap_ab: not supported")
@@ -697,8 +682,8 @@ class EpiMod:
                     "epilogue-mod GEMM does not support SplitKMode.SEPARATE (the separate "
                     "reduction kernel cannot run epi mods); use SERIAL or PARALLEL"
                 )
-            if varlen_m or gather_A or swap_ab or ag_args is not None:
-                raise ValueError("split_k requires a dense GEMM (no varlen/gather/swap_ab/ag)")
+            if varlen_m or gather_A or swap_ab:
+                raise ValueError("split_k requires a dense GEMM (no varlen/gather/swap_ab)")
             if rounding_mode != RoundingMode.RN:
                 raise ValueError("split_k does not support stochastic rounding")
             if D is None:
@@ -711,27 +696,26 @@ class EpiMod:
                 raise ValueError("swap_ab: dense non-blockscaled only")
             if self.mode != "element" or self.sinks:
                 raise ValueError("swap_ab supports element-mode sink-less epilogues only")
-            if ag_args is not None:
-                # With swapped slots kernel-A is the caller's B: the AG gate
-                # would gate the wrong operand (and the wrong M geometry).
-                raise ValueError("swap_ab does not support ag_args (AG shards kernel-A along M)")
-        comm_key = None
-        if comm is not None:
-            if comm_args is None:
-                raise ValueError("comm requires its comm_args bundle")
+        dist_op_key = None
+        if dist_op is not None:
+            if dist_op_args is None:
+                raise ValueError("dist_op requires its dist_op_args bundle")
             if D is None:
-                raise ValueError("comm requires the D output tensor (the comm's wire)")
-            if not persistent or is_dynamic_persistent:
-                raise ValueError("comm warps mirror the static schedule: persistent, no CLC")
-            if varlen_m or gather_A or blockscaled or concat_key or swap_ab or split_k > 1:
-                raise ValueError(
-                    "comm: dense GEMM only (no varlen/gather/blockscaled/concat/swap_ab/split_k)"
-                )
-            if ag_args is not None or transform_a is not None:
-                raise ValueError("comm composes with neither ag_args nor transform_a")
-            comm_key = comm.plan_key()
-        elif comm_args is not None:
-            raise ValueError("comm_args without a comm")
+                raise ValueError("dist_op requires D (the tensor the operator stores into)")
+            if not persistent:
+                raise ValueError("dist_op: persistent scheduler only")
+            if dist_op.num_warps and is_dynamic_persistent:
+                raise ValueError("comm warps mirror the static schedule: no CLC")
+            # swap_ab: kernel-A is the caller's B, so a gate on A would gate the wrong operand
+            if varlen_m or gather_A or concat_key or swap_ab or split_k > 1:
+                raise ValueError("dist_op: dense GEMM only (no varlen/gather/concat/swap_ab/split_k)")
+            if blockscaled and dist_op.num_warps:
+                raise ValueError("dist_op with comm warps: non-blockscaled GEMM only")
+            if transform_a is not None:
+                raise ValueError("dist_op does not compose with transform_a")
+            dist_op_key = dist_op.plan_key()
+        elif dist_op_args is not None:
+            raise ValueError("dist_op_args without a dist_op")
         # Warm fast path: probe the plan cache on raw-input metadata before any
         # validation or kind inference — a hit is exactly a replay of a
         # previously validated call (the key subsumes everything validation
@@ -753,6 +737,7 @@ class EpiMod:
             persistent,
             is_dynamic_persistent,
             max_swizzle_size,
+            raster_order,
             A.device,
             tensor_key(cu_seqlens_m),
             gather_A,
@@ -769,8 +754,7 @@ class EpiMod:
             split_k,
             int(split_k_mode),
             add_to_output,
-            ag_args is not None,
-            comm_key,
+            dist_op_key,
             transform_key,
             # one slot for the transform's sf-side tensor: the W4 SF strip
             # (owned) or the runtime-operand view (value mods with args)
@@ -802,8 +786,7 @@ class EpiMod:
                     D,
                     C,
                     epi_args,
-                    ag_args=ag_args,
-                    comm_args=comm_args,
+                    dist_op_args=dist_op_args,
                     tile_count_semaphore=tile_count_semaphore,
                     cu_seqlens_m=cu_seqlens_m,
                     A_idx=A_idx,
@@ -911,8 +894,8 @@ class EpiMod:
                 packed_form = "m"
         else:
             _require_shape("C", C, base_shape)
-            # a comm's D is its wire, whose extent the operator declares (lamport: stacked mirrors)
-            _require_shape("D", D, base_shape if comm is None else comm.wire_shape(base_shape))
+            # an operator's D has the extent it declares (lamport: stacked mirrors)
+            _require_shape("D", D, base_shape if dist_op is None else dist_op.d_shape(base_shape))
         for out_name in self.outputs:
             if out_name not in epi_args:
                 raise ValueError(f"missing epilogue output buffer '{out_name}'")
@@ -1140,6 +1123,7 @@ class EpiMod:
             persistent=persistent,
             is_dynamic_persistent=is_dynamic_persistent,
             max_swizzle_size=max_swizzle_size,
+            raster_order=raster_order,
             varlen_m=varlen_m,
             gather_A=gather_A,
             # slot-A relabels via a_transposed (swap_ab); owned transforms
@@ -1157,10 +1141,9 @@ class EpiMod:
             post_init_attrs=post_init_attrs,
             gemm_cls_ref=self._class_ref(mint_key),
             packed_cd=packed_form,
-            has_ag=ag_args is not None,
             split_k=split_k,
             split_k_mode=split_k_mode,
-            comm=comm,
+            dist_op=dist_op,
         )
         self._plan_cache[key] = plan
         if _launch:
@@ -1171,8 +1154,7 @@ class EpiMod:
                 D,
                 C,
                 epi_values,
-                ag_args=ag_args,
-                comm_args=comm_args,
+                dist_op_args=dist_op_args,
                 tile_count_semaphore=tile_count_semaphore,
                 cu_seqlens_m=cu_seqlens_m,
                 A_idx=A_idx,
@@ -1309,6 +1291,7 @@ class EpiMod:
             persistent=True,
             is_dynamic_persistent=dyn,
             max_swizzle_size=config.max_swizzle_size,
+            raster_order=config.raster_order,
             tile_count_semaphore=semaphore,
             cu_seqlens_m=ctx.get("cu_seqlens_m"),
             A_idx=ctx.get("A_idx"),
@@ -1325,8 +1308,8 @@ class EpiMod:
             transform_a=ctx.get("transform_a"),
             transform_sf=ctx.get("transform_sf"),
             add_to_output=ctx.get("add_to_output", False),
-            comm=ctx.get("comm"),
-            comm_args=ctx.get("comm_args"),
+            dist_op=ctx.get("dist_op"),
+            dist_op_args=ctx.get("dist_op_args"),
             _launch=_launch,
         )
         return config, dyn, plan, sink_bufs
@@ -1359,9 +1342,9 @@ class EpiMod:
         #                           the resolved config's tile_M/tile_K)
         add_to_output=False,  # D += result via the TMA reduce-add store atom (see
         #                       EpiMod.gemm); requires out={"D": buf} and C=None
-        comm=None,  # the distributed operator (see EpiMod.gemm): a CommRunner, whose result comes
-        #             back as "D"; or the kernel-side Comm with its wire as out={"D": d} + comm_args
-        comm_args=None,  # the comm's per-call bundle (kernel-side Comm only; the result lives there)
+        dist_op=None,  # the distributed operator (see EpiMod.gemm): a DistOp, with the tensor it stores
+        #                into as out={"D": d} and its bundle as dist_op_args
+        dist_op_args=None,  # the operator's per-call bundle
         **operands,  # epilogue operand tensors/scalars by fn-parameter name
     ):
         """Eager torch-facing call: resolve config (autotune via
@@ -1427,18 +1410,11 @@ class EpiMod:
                 raise ValueError("add_to_output accumulates onto D (no C operand); pass C=None")
             if not store_d or out is None or out.get("D") is None:
                 raise ValueError('add_to_output requires the accumulator as out={"D": buf}')
-        runner = comm if isinstance(comm, CommRunner) else None
-        if runner is not None:
-            if out is not None and out.get("D") is not None and runner.wire is not None:
-                raise ValueError("a CommRunner's D is its wire: do not pass out={'D': ...}")
-            comm, comm_args, wire = _resolve_comm(comm, comm_args, None)
-            if wire is not None:
-                out = {**(out or {}), "D": wire}
 
         if torch.compiler.is_compiling():
-            if dynamic_scheduler or epi_key_overrides is not None or comm is not None:
+            if dynamic_scheduler or epi_key_overrides is not None or dist_op is not None:
                 raise NotImplementedError(
-                    "dynamic_scheduler/epi_key_overrides/comm under torch.compile: not supported yet"
+                    "dynamic_scheduler/epi_key_overrides/dist_op under torch.compile: not supported yet"
                 )
             from quack.gemm_runtime.torch_op import compile_call
 
@@ -1507,7 +1483,7 @@ class EpiMod:
                 transform_key,
                 tensor_key(transform_sf),
                 add_to_output,
-                None if comm is None else comm.plan_key(),
+                None if dist_op is None else dist_op.plan_key(),
             )
             entry = self._call_cache.get(ck)
             if entry is not None:
@@ -1540,13 +1516,11 @@ class EpiMod:
                     A_idx=A_idx,
                     SFA=SFA,
                     SFB=SFB,
-                    comm_args=comm_args,
+                    dist_op_args=dist_op_args,
                 )
                 result = dict(outs) if store_d else {kk: v for kk, v in outs.items() if kk != "D"}
                 for name, buf in sink_bufs.items():
                     result[name] = self._finalize_sink(name, buf, cu_seqlens_m, plan)
-                if runner is not None and runner.out is not None:
-                    result["D"] = runner.out  # the operator's result, not its wire
                 return result
 
         varlen_m = cu_seqlens_m is not None
@@ -1568,7 +1542,7 @@ class EpiMod:
             and rounding_mode == RoundingMode.RN
             and epi_key_overrides is None
             and not add_to_output  # the reduce-add D mint is not swept
-            and comm is None  # comm buffers are sized per tile: explicit config only
+            and dist_op is None  # the operator's buffers are sized per tile: explicit config only
         )
         if use_tuner:
             from quack.gemm_runtime.autotune import sink_arg_shapes, tuned_mod_gemm
@@ -1640,8 +1614,8 @@ class EpiMod:
                 transform_a=transform_a,
                 transform_sf=transform_sf,
                 add_to_output=add_to_output,
-                comm=comm,
-                comm_args=comm_args,
+                dist_op=dist_op,
+                dist_op_args=dist_op_args,
             )
             if config is not None:
                 cfg = config
@@ -1680,8 +1654,6 @@ class EpiMod:
         result = dict(out) if store_d else {k: v for k, v in out.items() if k != "D"}
         for name, buf in sink_bufs.items():
             result[name] = self._finalize_sink(name, buf, cu_seqlens_m, plan_used)
-        if runner is not None and runner.out is not None:
-            result["D"] = runner.out  # the operator's result, not its wire
         return result
 
     def plan(
@@ -1960,6 +1932,7 @@ class StaticEpi:
             persistent=True,
             is_dynamic_persistent=dyn,
             max_swizzle_size=cfg.max_swizzle_size,
+            raster_order=cfg.raster_order,
             varlen_m=varlen_m,
             gather_A=gather_A,
             b_kn=b_kn,

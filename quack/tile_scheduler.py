@@ -120,105 +120,29 @@ class WorkTileInfo:
         )
 
 
-@cute.jit
-def ag_wait_m_tile(
-    params, pid_m: Int32, cluster_shape_m: cutlass.Constexpr[int], last_gate: Int32
-) -> Int32:
-    """AllGather+GEMM arrival gate — the pipeline's consumer_wait on the
-    fine-grained FULL flags (see quack/distributed/all_gather_gemm.py module
-    docstring for the full/empty mapping): spin until the M-chunk owning CTA
-    tile pid_m has been delivered into local HBM
-    (flags[shard * num_chunks + chunk] >= *epoch, modular).
-    num_chunks == 1 degenerates to shard-granular gating.
-
-    1-entry satisfied-gate cache: flags are monotonic within a launch, so a
-    gate that passed once stays passed; consecutive tiles overwhelmingly map
-    to the same (shard, chunk) (the schedule sweeps N fastest within a cid_m
-    group), so remembering the LAST passed gate index skips the sys-scope
-    flag load for most tiles. The gate index is recomputed per tile from its
-    coordinates; the cache update is the RETURN VALUE, which callers thread
-    back in as last_gate (init -1). Only worth anything at comm-bound
-    corners — the check already rides in producer_acquire slack when
-    compute-bound.
-
-    Called from the AB-load warp before the tile's first TMA issue. flags
-    are plain local gmem, remote-written by the owning rank's transport (a
-    4-byte CE copy of the device epoch after each chunk's data send); the
-    values are monotonically increasing per-call epochs, so there is no
-    reset (and no reset barrier).
-
-    RELAXED loads, deliberately: acquire-sys lowers to LDG.STRONG.SYS +
-    CCTL.IVALL — a full L1 invalidate on the issuing SM per tile, even when
-    the flag is long set. The ordering it would buy is unnecessary for this
-    consumer: the gated data is read by TMA, which fetches at the L2
-    coherence point where the CE writes already landed (they are
-    stream-ordered before the flag memset, and the memset itself is
-    L2-visible when this load observes it). L1 staleness cannot reach a TMA
-    read. NCCL's CE-collective flag waits use the same relaxed/volatile
-    pattern. If a SIMT (L1-cached) consumer of the gated bytes is ever added,
-    this needs an acquire (or proxy fence) on the spun path.
-    """
-    cid_m = pid_m // cluster_shape_m
-    shard = cid_m // params.ag.nclusters_m_per_shard
-    chunk = (cid_m - shard * params.ag.nclusters_m_per_shard) // params.ag.nclusters_m_per_chunk
-    gate = shard * params.ag.num_chunks + chunk
-    if gate != last_gate:
-        # The epoch is DEVICE-resident (a 1-element tensor the host bumps
-        # with a captured kernel) so the whole call is CUDA-graph-capturable
-        # — nothing host-baked. One L2-hot load per gate miss.
-        epoch = cute.arch.load(params.ag.epoch.iterator.llvm_ptr, Int32, sem="relaxed", scope="gpu")
-        ptr = params.ag.flags.iterator + gate
-        val = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="sys")
-        # Modular GEQ (TE's CHECK_IDS trick): satisfied iff (val - epoch) has
-        # the sign bit clear under wrapping int32 arithmetic — flags may run
-        # up to 2^31 ahead across wraps, so there is NO wraparound resync.
-        while (val - epoch) < 0:
-            val = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="sys")
-    return gate
-
-
 @mlir_namedtuple
 class AgSchedulerArguments(NamedTuple):
-    """AllGather+GEMM scheduler arguments — the kernel-side twin of
-    quack.gemm.AllGatherArguments, same field names (see
-    quack/distributed/all_gather_gemm.py). A's M dim is sharded across
-    num_shards ranks and delivered into local HBM by a transport that
-    publishes per-shard arrival flags. The scheduler decodes work ids
-    shard-major (ring-rotated by first_shard so the local shard's tiles are
-    issued first) with the usual L2 swizzle *inside* each shard, and the
-    load warp spins until flags[shard] >= *epoch before touching A."""
+    """AllGather+GEMM tile order (make_scheduler_args builds it from the AllGather operator's
+    AllGatherArguments bundle). A's M dim is sharded across num_shards ranks, delivered in ring
+    order: work ids decode shard-major, ring-rotated by first_shard so the local shard's tiles are
+    issued first, with the usual L2 swizzle *inside* each shard."""
 
-    # (num_shards * num_chunks,) Int32, monotonic epoch values; chunk-major
-    # within a shard (flag idx = shard * num_chunks + chunk).
-    flags: cute.Tensor
-    epoch: cute.Tensor  # (1,) Int32, device-resident, read through the pointer
     num_shards: Int32
     first_shard: Int32
-    # Sub-shard arrival granularity: shards are delivered (and flagged) in
-    # num_chunks equal M-slices, so a tile's gate releases when its CHUNK has
-    # landed rather than the whole shard. 1 = shard-granular (mirrors the
-    # host twin's default).
-    num_chunks: Int32 = Int32(1)
 
 
 @mlir_namedtuple
 class AgParams(NamedTuple):
-    """Decode-ready AllGather scheduler params: AgSchedulerArguments' gate
-    fields plus the derived per-shard/per-chunk cluster geometry. Work ids
-    decode shard-major with the L2 swizzle confined to one shard's
-    (nclusters_m_per_shard, ncluster_n) sub-problem — the group/serpentine
-    divmods in TileScheduler.Params are built on the SUB-shape when this is
-    set; problem_shape_ncluster_mnl stays the full problem (grid sizing and
-    validity)."""
+    """Decode-ready AllGather scheduler params: AgSchedulerArguments plus the derived
+    per-shard cluster geometry. Work ids decode shard-major with the L2 swizzle confined to one
+    shard's (nclusters_m_per_shard, ncluster_n) sub-problem — the group/serpentine divmods in
+    TileScheduler.Params are built on the SUB-shape when this is set; problem_shape_ncluster_mnl
+    stays the full problem (grid sizing and validity)."""
 
-    flags: cute.Tensor
-    epoch: cute.Tensor
     num_shards: Int32
     first_shard: Int32
-    num_chunks: Int32
     clusters_per_shard_fdd: FastDivmod
     nclusters_m_per_shard: Int32
-    nclusters_m_per_chunk: Int32
 
 
 # Grouping arguments together that should be passed to __call__
@@ -287,16 +211,12 @@ class TileScheduler:
             if const_expr(args.ag is not None):
                 ag_nclusters_m_per_shard = problem_shape_ncluster_mn[0] // args.ag.num_shards
                 ag_params = AgParams(
-                    flags=args.ag.flags,
-                    epoch=args.ag.epoch,
                     num_shards=args.ag.num_shards,
                     first_shard=args.ag.first_shard,
-                    num_chunks=args.ag.num_chunks,
                     clusters_per_shard_fdd=FastDivmod(
                         ag_nclusters_m_per_shard * problem_shape_ncluster_mn[1]
                     ),
                     nclusters_m_per_shard=ag_nclusters_m_per_shard,
-                    nclusters_m_per_chunk=ag_nclusters_m_per_shard // args.ag.num_chunks,
                 )
                 problem_shape_ncluster_mn_swz = (
                     ag_nclusters_m_per_shard,

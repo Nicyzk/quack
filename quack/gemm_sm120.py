@@ -50,7 +50,6 @@ from quack.pipeline import make_pipeline_state
 from quack import copy_utils
 from quack.gemm_sm90 import GemmSm90, NamedBarrierGemm
 from quack.gemm_config import SplitKMode
-from quack.tile_scheduler import ag_wait_m_tile
 from quack import sm80_utils
 import quack.sm90_utils as quack_sm90_utils
 
@@ -790,7 +789,7 @@ class GemmSm120(GemmSm90):
         aux_a_smem_layout: Optional[cute.Layout],
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
-        comm_args,  # the SM90-family __call__ passes it; no comm operator on SM120
+        dist_op_args,  # the SM90-family __call__ passes it; no distributed operator on SM120
     ):
         from cutlass.cute.experimental import iket
 
@@ -952,7 +951,6 @@ class GemmSm120(GemmSm90):
                     is_scheduler_warp = is_scheduler_warp and cute.arch.block_idx_in_cluster() == 0
                 tile_scheduler = TileSchedulerCls()
                 work_tile = tile_scheduler.initial_work_tile_info()
-                ag_last_gate = Int32(-1)  # 1-entry satisfied-gate cache (see ag_wait_m_tile)
                 ab_producer_state = make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.ab_stage
                 )
@@ -960,18 +958,6 @@ class GemmSm120(GemmSm90):
                     # (pid_m, pid_n, split_idx | None, batch_idx), decoded by the scheduler
                     tile_coord_mnkl = work_tile.tile_idx
                     batch_idx, split_idx = tile_coord_mnkl[3], tile_coord_mnkl[2]
-                    # AllGather+GEMM: block until this tile's M-shard of A has
-                    # been pushed into local HBM by the owner rank (see
-                    # gemm_sm90.py — same shared-code gate).
-                    if const_expr(getattr(tile_sched_params, "ag", None) is not None):
-                        iket.range_push("ag_wait")
-                        ag_last_gate = ag_wait_m_tile(
-                            tile_sched_params,
-                            tile_coord_mnkl[0],
-                            self.cluster_shape_mnk[0],
-                            ag_last_gate,
-                        )
-                        iket.range_pop()
                     iket.range_push("tma_load")
                     # Local_tile partition global tensors
                     copy_A, prefetch_A = None, None

@@ -1,16 +1,16 @@
-# GEMM + reduce-scatter as the GEMM's comm object (finalizes_epilogue: the GEMM's epilogue warps store raw
+# GEMM + reduce-scatter as the GEMM's distributed operator (finalizes_epilogue: the GEMM's epilogue warps store raw
 # partials, this operator's comm warps reduce them and run the epilogue). Every rank's epilogue warps store
-# their raw K-partial of each tile into their symmetric D (the d_dtype wire, epilogue(partial_only)) and release-add
+# their raw K-partial of each tile into their symmetric D (d_dtype, epilogue(partial_only)) and release-add
 # the flag of the rank whose M slab owns the tile. The comm warps step this CTA's static schedule: at
 # tile row pid_m = (stripe, pos) they reduce stripe `stripe` of owned tile `pos` (the cutlass RS remap:
 # the world's CTAs at one position share one owned tile, equal work, no slab walk), wait for the tile's
 # world partials, multimem ld_reduce the stripe from the multicast D view, run the GEMM's epilogue on
 # the sum (the epi ops, framed on the stripe) and store it into this rank's slab.
-# Usage: rs = ReduceScatterRunner(m, n, dtype, tile_m, tile_n, ctas); mod(a, b, config=cfg, comm=rs)["D"] is
-# this rank's slab (the runner supplies the wire as D and the comm_args). Direct: GemmSm100(..., comm=rs.comm),
-# launch with mD=rs.wire, comm_args=rs.args(); rs.out is the result.
+# Usage: d, out, args = make_reduce_scatter_buffers(m, n, dtype, tile_m, tile_n, ctas); mod(a, b, out={"D": d},
+# config=cfg, dist_op=ReduceScatter(rank, world), dist_op_args=args); out is this rank's slab. Direct:
+# GemmSm100(..., dist_op=ReduceScatter(rank, world)), launch with mD=d, dist_op_args=args.
 # AllReduce = the same reduce with a broadcast commit: the reduced stripe goes by multimem st into every
-# rank's symmetric out (two-shot AR); AllReduceRunner, out is the full result on every rank.
+# rank's symmetric out (two-shot AR); make_all_reduce_buffers, out is the full result on every rank.
 # A C operand (residual) is applied after the reduce: the epi-load warp stages it per comm subtile at
 # the result's coordinates, so C is slab-shaped (m // world, n) for RS and the full (m, n) for AR.
 import math
@@ -24,7 +24,7 @@ from cutlass import Int32, Int64
 from cutlass.cute.typing import AddressSpace
 from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import mlir_namedtuple
-from quack.gemm_base import Comm, CommRunner, EpiFrame
+from quack.gemm_base import DistOp, EpiFrame
 from quack.varlen_utils import VarlenManager
 
 COMM_WARPS = 4
@@ -33,11 +33,11 @@ SUBTILE_ATOMS = 8  # 16-byte atoms in flight per thread per reduce visit (the me
 
 @mlir_namedtuple
 class ReduceScatterArguments(NamedTuple):
-    """The comm warps' bundle (the GEMM's comm_args). flags (ntile_m, ntile_n) int32 is this rank's
+    """The comm warps' bundle (the GEMM's dist_op_args). flags (ntile_m, ntile_n) int32 is this rank's
     copy of the tile flags (every rank's producers add to the owner's copy, the owner's consumers
     consume); peer_flags (world,) int64 holds every rank's flags address."""
 
-    d_mc: cute.Tensor  # multicast view of the symmetric D (m, n): the partials wire
+    d_mc: cute.Tensor  # multicast view of the symmetric D (m, n): the partials
     out: cute.Tensor  # this rank's slab (m // world, n), the result
     flags: cute.Tensor
     peer_flags: cute.Tensor
@@ -161,9 +161,8 @@ def commit_subtile_broadcast(frgOut_mc: cute.Tensor, tRS_rD: cute.Tensor, epi_co
             )
 
 
-class ReduceScatter(Comm):
-    """GEMM + reduce-scatter over `world` ranks along M (slab = m // world rows per rank), d_dtype
-    wire."""
+class ReduceScatter(DistOp):
+    """GEMM + reduce-scatter over `world` ranks along M (slab = m // world rows per rank), d_dtype D."""
 
     num_warps = COMM_WARPS
     regs = None  # 12 warps at 168 each, as intra-sm ran it; a split must fit the released pool
@@ -206,21 +205,21 @@ class ReduceScatter(Comm):
     def signal_tile(self, gemm, ctx, tile_coord_mnkl, epi_store_pipeline, is_tma_warp, tidx: Int32):
         """Drain the partial's TMA stores, then one release add on the tile's flag, in every rank's copy
         (AR: every rank reduces a stripe of it) or the owner's (RS)."""
-        comm_args = ctx.args
+        dist_op_args = ctx.args
         if is_tma_warp:
             epi_store_pipeline.producer_tail()
-            flags = comm_args.flags
+            flags = dist_op_args.flags
             idx = cute.crd2idx((tile_coord_mnkl[0], tile_coord_mnkl[1]), flags.layout)
             with cute.arch.elect_one():
                 if cutlass.const_expr(self.broadcast):
                     utils.distributed.multimem_red_add1(
-                        lock_ptr=comm_args.flags_mc.iterator + idx, order="release", scope="gpu"
+                        lock_ptr=dist_op_args.flags_mc.iterator + idx, order="release", scope="gpu"
                     )
                 else:
                     owner = tile_coord_mnkl[0] // (flags.shape[0] // self.world)
                     flag = cute.make_ptr(
                         Int32,
-                        comm_args.peer_flags[owner] + Int64(idx) * Int64(4),
+                        dist_op_args.peer_flags[owner] + Int64(idx) * Int64(4),
                         AddressSpace.gmem,
                         assumed_align=4,
                     )
@@ -233,15 +232,15 @@ class ReduceScatter(Comm):
         # bound methods and ctx fields cross into the loop as locals; the gemm / comm / ctx objects
         # cannot (TYPE_DYNAMIC_EXPR_UNSUPPORTED)
         epilogue, comm_barrier = gemm.epilogue, gemm.comm_barrier
-        comm_args, TileSchedulerCls, varlen_manager = ctx.args, ctx.TileSchedulerCls, ctx.varlen
+        dist_op_args, TileSchedulerCls, varlen_manager = ctx.args, ctx.TileSchedulerCls, ctx.varlen
         epilogue_params, epi_smem_tensors, mC = ctx.epi_params, ctx.epi_smem_tensors, ctx.mC
         cta_m, cta_n = gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[1]
         slice_m, thr_shape, val_shape, chunk = self._stripe(gemm)
-        d_mc, flags = comm_args.d_mc, comm_args.flags
+        d_mc, flags = dist_op_args.d_mc, dist_op_args.flags
         if cutlass.const_expr(broadcast):
-            out, commit_subtile = comm_args.out_mc, commit_subtile_broadcast
+            out, commit_subtile = dist_op_args.out_mc, commit_subtile_broadcast
         else:
-            out, commit_subtile = comm_args.out, commit_subtile_local
+            out, commit_subtile = dist_op_args.out, commit_subtile_local
         tiles_per_rank = cute.ceil_div(varlen_manager.len_m(Int32(0)), cta_m) // world
         tiled_copy = cute.make_tiled_copy_tv(
             cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), d_mc.element_type),
@@ -337,9 +336,9 @@ class ReduceScatter(Comm):
                 gdx, gdy, _ = cute.arch.grid_dim()
                 slot = bidx + gdx * (bidy + gdy * bidz)
                 utils.distributed.multimem_red_add1(
-                    lock_ptr=comm_args.exit_flags_mc.iterator + slot, order="release", scope="gpu"
+                    lock_ptr=dist_op_args.exit_flags_mc.iterator + slot, order="release", scope="gpu"
                 )
-                exit_flag = comm_args.exit_flags.iterator + slot
+                exit_flag = dist_op_args.exit_flags.iterator + slot
                 utils.distributed.spin_lock_ld_lt_relaxed_wait(
                     lock_ptr=exit_flag, expected_val=Int32(world), scope="gpu"
                 )
@@ -379,7 +378,7 @@ def _symm(shape, torch_dtype, zero=False):
     return base, _wrap_device_ptr(hdl.multicast_ptr, tuple(shape), torch_dtype), hdl
 
 
-def _make_wire(m, n, torch_dtype, tile_m, tile_n, ctas):
+def _make_d(m, n, torch_dtype, tile_m, tile_n, ctas):
     """(d, d_mc, flags, flags_mc, peer_flags, exit_flags, exit_flags_mc): the symmetric D the GEMM stores
     its partials into, the tile flags with their multicast view and every rank's flags address, and the
     exit slots (ctas = the persistent grid's CTA count)."""
@@ -393,35 +392,27 @@ def _make_wire(m, n, torch_dtype, tile_m, tile_n, ctas):
     return d, d_mc, flags, flags_mc, peer_flags, exit_flags, exit_flags_mc
 
 
-class ReduceScatterRunner(CommRunner):
-    """GEMM + RS for an (m, n) output: wire = the symmetric D, out = this rank's (m // world, n) slab.
-    mod(a, b, config=cfg, comm=runner)["D"] is the slab; direct: mD=runner.wire, comm_args=runner.args()."""
+def make_reduce_scatter_buffers(m, n, torch_dtype, tile_m, tile_n, ctas):
+    """(d, out, args) for GEMM + RS of an (m, n) output: the symmetric D the GEMM stores partials into,
+    this rank's (m // world, n) slab, and the ReduceScatterArguments. The operator is ReduceScatter(rank,
+    world); the flags self-reset, so nothing runs between launches."""
+    import torch
+    import torch.distributed as dist
 
-    def __init__(self, m, n, torch_dtype, tile_m, tile_n, ctas):
-        import torch
-        import torch.distributed as dist
-
-        rank, world = dist.get_rank(), dist.get_world_size()
-        assert m % (world * tile_m) == 0, "RS: a whole number of tiles per slab"
-        self.comm = ReduceScatter(rank, world)
-        self.wire, d_mc, flags, _, *rest = _make_wire(m, n, torch_dtype, tile_m, tile_n, ctas)
-        self.out = torch.empty(m // world, n, dtype=torch_dtype, device="cuda")
-        self._args = ReduceScatterArguments(d_mc, self.out, flags, *rest)
-        torch.cuda.synchronize()
+    world = dist.get_world_size()
+    assert m % (world * tile_m) == 0, "RS: a whole number of tiles per slab"
+    d, d_mc, flags, _, *rest = _make_d(m, n, torch_dtype, tile_m, tile_n, ctas)
+    out = torch.empty(m // world, n, dtype=torch_dtype, device="cuda")
+    torch.cuda.synchronize()
+    return d, out, ReduceScatterArguments(d_mc, out, flags, *rest)
 
 
-class AllReduceRunner(CommRunner):
-    """GEMM + two-shot AR: wire = the symmetric D, out = this rank's copy of the full (m, n) result."""
+def make_all_reduce_buffers(m, n, torch_dtype, tile_m, tile_n, ctas):
+    """(d, out, args) for GEMM + two-shot AR: the symmetric D, this rank's copy of the full (m, n) result,
+    and the AllReduceArguments. The operator is AllReduce(rank, world)."""
+    import torch
 
-    def __init__(self, m, n, torch_dtype, tile_m, tile_n, ctas):
-        import torch
-        import torch.distributed as dist
-
-        rank, world = dist.get_rank(), dist.get_world_size()
-        self.comm = AllReduce(rank, world)
-        self.wire, d_mc, flags, flags_mc, _, *rest = _make_wire(
-            m, n, torch_dtype, tile_m, tile_n, ctas
-        )
-        self.out, out_mc, _ = _symm((m, n), torch_dtype)
-        self._args = AllReduceArguments(d_mc, out_mc, flags, flags_mc, *rest)
-        torch.cuda.synchronize()
+    d, d_mc, flags, flags_mc, _, *rest = _make_d(m, n, torch_dtype, tile_m, tile_n, ctas)
+    out, out_mc, _ = _symm((m, n), torch_dtype)
+    torch.cuda.synchronize()
+    return d, out, AllReduceArguments(d_mc, out_mc, flags, flags_mc, *rest)

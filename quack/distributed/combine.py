@@ -4,9 +4,9 @@
 # GEMM stages accumulator -> registers -> epi ops -> smem as always, the TMA store is replaced). D itself is
 # never written, nothing is waited on; completion is the kernel's end, then the caller barriers and reduces
 # every token's K slots (duckpond reduce_over_k). Slot id of row r = row_key[r] = rank * slots_per_rank + local.
-# Usage: cb = CombineRunner(tokens_local, k, hidden, dtype, group, max_rows); cb.route(row_key);
-# mod(a, w2, cu_seqlens_m=cu, config=cfg, comm=cb) ... or direct: GemmSm100(..., comm=cb.comm), mD=cb.wire,
-# comm_args=cb.args(); then barrier; the landed slots are cb.out (tokens_local, k, hidden).
+# Usage: d, slots, args = make_combine_buffers(tokens_local, k, hidden, dtype, group, max_rows); per call
+# GemmSm100(..., dist_op=CombineStore(hidden)), mD=d, dist_op_args=args(row_key); then barrier; the landed rows
+# are slots (tokens_local, k, hidden).
 from functools import partial
 from typing import NamedTuple
 
@@ -16,12 +16,12 @@ from cutlass import Int32, Int64
 from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import mlir_namedtuple
 from quack.distributed.ptx import st_weak_global_4xu32_at
-from quack.gemm_base import Comm, CommRunner
+from quack.gemm_base import DistOp
 
 
 @mlir_namedtuple
 class CombineArguments(NamedTuple):
-    """The drain's bundle (the GEMM's comm_args)."""
+    """The drain's bundle (the GEMM's dist_op_args)."""
 
     slot_base: cute.Tensor  # (world,) int64: every rank's slot buffer base address
     slots_per_rank: Int32  # tokens_local * k
@@ -35,7 +35,7 @@ def store_subtile(
     tSR_r: cute.Tensor,
     epi_tile,
     cta_tile_mn,
-    comm_args,
+    dist_op_args,
     row_bytes: Int32,
     lanes: cutlass.Constexpr[int],
     tokens_per_step: cutlass.Constexpr[int],
@@ -58,13 +58,13 @@ def store_subtile(
     len_m = varlen_manager.len_m(batch_idx)
     base_row = varlen_manager.params.cu_seqlens_m[batch_idx]
     lane_off = Int64((tidx % lanes) * 16)
-    slots_per_rank = comm_args.slots_per_rank
+    slots_per_rank = dist_op_args.slots_per_rank
     for step in cutlass.range_constexpr(epi_m // tokens_per_step):
         r = row0 + step * tokens_per_step + tidx // lanes
         if r < len_m:
-            slot = comm_args.row_key[base_row + r]
+            slot = dist_op_args.row_key[base_row + r]
             dst = (
-                comm_args.slot_base[slot // slots_per_rank]
+                dist_op_args.slot_base[slot // slots_per_rank]
                 + Int64(slot % slots_per_rank) * Int64(row_bytes)
                 + col_off
                 + lane_off
@@ -74,7 +74,7 @@ def store_subtile(
             st_weak_global_4xu32_at(dst, w0, w1, w2, w3)
 
 
-class CombineStore(Comm):
+class CombineStore(DistOp):
     """GEMM2 + combine: the epilogue's rows land in their origin ranks' slots (hidden = the D row width)."""
 
     def __init__(self, hidden: int):
@@ -90,7 +90,7 @@ class CombineStore(Comm):
     def store_drain(self, gemm, ctx, sD, epi_tile, tidx):
         """Thread -> (token row along M, lane along N), 16 B per lane over the D stage: a subtile row of
         epi_n elements is epi_n * width / 128 lanes, num_epi_warps * 32 / lanes tokens per step."""
-        comm_args = ctx.args
+        dist_op_args = ctx.args
         width = gemm.d_dtype.width
         epi_n = cute.size(epi_tile[1])
         lanes = epi_n * width // 128
@@ -112,7 +112,7 @@ class CombineStore(Comm):
             tSR_r,
             epi_tile,
             gemm.cta_tile_shape_mnk[:2],
-            comm_args,
+            dist_op_args,
             Int32(self.hidden * width // 8),
             lanes,
             tokens_per_step,
@@ -120,32 +120,20 @@ class CombineStore(Comm):
         )
 
 
-class CombineRunner(CommRunner):
-    """GEMM2 + combine for tokens_local tokens x k experts x hidden: owns the symmetric slots every peer's GEMM2
-    lands rows in, the slot base table and a D-shaped wire the kernel never writes. route(row_key) per call
-    (each D row's global slot id, from the routing); out = the slots, to reduce over k after a cross-rank
-    barrier."""
+def make_combine_buffers(tokens_local, k, hidden, torch_dtype, group, max_rows):
+    """(d, slots, args) for GEMM2 + combine of tokens_local tokens x k experts x hidden: a (max_rows, hidden) D
+    the drain never writes (the kernel's D shape), the symmetric slots every peer's GEMM2 lands rows in (reduce
+    over k after a cross-rank barrier), and args(row_key) -> CombineArguments for a call's routing (each D row's
+    global slot id). The operator is CombineStore(hidden)."""
+    import torch
+    import torch.distributed._symmetric_memory as symm_mem
 
-    def __init__(self, tokens_local, k, hidden, torch_dtype, group, max_rows):
-        import torch
-        import torch.distributed._symmetric_memory as symm_mem
-
-        dev = torch.cuda.current_device()
-        world = group.size()
-        self.comm = CombineStore(hidden)
-        self.out = symm_mem.empty(tokens_local, k, hidden, dtype=torch_dtype, device=dev)
-        hdl = symm_mem.rendezvous(self.out, group=group)
-        shape = (tokens_local, k, hidden)
-        bases = [hdl.get_buffer(q, shape, torch_dtype).data_ptr() for q in range(world)]
-        self.slot_base = torch.tensor(bases, dtype=torch.int64, device=dev)
-        self.slots_per_rank = tokens_local * k
-        # D's shape for the kernel (row count, dtype); the drain never writes it
-        self.wire = torch.empty(max_rows, hidden, dtype=torch_dtype, device=dev)
-        self.row_key = None
-
-    def route(self, row_key):
-        self.row_key = row_key
-
-    def args(self):
-        assert self.row_key is not None, "route(row_key) before the launch"
-        return CombineArguments(self.slot_base, self.slots_per_rank, self.row_key)
+    dev = torch.cuda.current_device()
+    world = group.size()
+    slots = symm_mem.empty(tokens_local, k, hidden, dtype=torch_dtype, device=dev)
+    hdl = symm_mem.rendezvous(slots, group=group)
+    shape = (tokens_local, k, hidden)
+    bases = [hdl.get_buffer(q, shape, torch_dtype).data_ptr() for q in range(world)]
+    slot_base = torch.tensor(bases, dtype=torch.int64, device=dev)
+    d = torch.empty(max_rows, hidden, dtype=torch_dtype, device=dev)
+    return d, slots, partial(CombineArguments, slot_base, tokens_local * k)

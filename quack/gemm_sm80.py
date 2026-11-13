@@ -148,7 +148,7 @@ class GemmSm80(GemmBase):
         # unified signature across archs; blockscaled is SM120-only
         mSFA: Optional[cute.Tensor] = None,
         mSFB: Optional[cute.Tensor] = None,
-        comm_args=None,  # unified arity; SM80 hosts no comm operator
+        dist_op_args=None,  # unified arity; SM80 hosts no distributed operator
     ):
         assert mSFA is None and mSFB is None, "mSFA/mSFB require a blockscaled GEMM"
         raise NotImplementedError("Gemm Sm80 is not implemented yet")

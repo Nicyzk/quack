@@ -52,8 +52,8 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
-from quack.distributed import AllGatherRunner
-from quack.gemm import AllGatherArguments, gemm as quack_gemm
+from quack.distributed import AllGather, AllGatherArguments, AllGatherRunner
+from quack.gemm import gemm as quack_gemm
 
 
 def bench_shape(m_total, n_local, k, dtype, rank, world_size, device, rounds, args):
@@ -98,7 +98,8 @@ def bench_shape(m_total, n_local, k, dtype, rank, world_size, device, rounds, ar
                 gemm_cfg["cluster_M"],
                 gemm_cfg["cluster_N"],
                 max_swizzle_size=args.swizzle,
-                ag_args=ag_args,
+                dist_op=AllGather(),
+                dist_op_args=ag_args,
             )
 
     def run_quack_ag():
@@ -138,7 +139,8 @@ def bench_shape(m_total, n_local, k, dtype, rank, world_size, device, rounds, ar
             gemm_cfg["cluster_M"],
             gemm_cfg["cluster_N"],
             max_swizzle_size=args.swizzle,
-            ag_args=AllGatherArguments(
+            dist_op=AllGather(),
+            dist_op_args=AllGatherArguments(
                 flags=preflags, epoch=pre_epoch, num_shards=world_size, first_shard=rank
             ),
         )

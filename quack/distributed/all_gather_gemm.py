@@ -7,12 +7,12 @@ separate design doc.
 Abstraction: from the GEMM kernel's perspective, AG-capability is exactly
 (a) the shard-major rotated scheduler decode and (b) one flag gate in the
 AB-load warp before a tile's first TMA — both in shared code, so ANY quack
-GEMM variant participates via one host-side ``ag_args`` kwarg. The driver
-half (:class:`AllGatherRunner`) owns buffers/flags/transport and wraps the
-GEMM(s) in a context::
+GEMM variant participates through the :class:`AllGather` operator. The
+driver half (:class:`AllGatherRunner`) owns buffers/flags/transport and
+wraps the GEMM(s) in a context::
 
     with runner.gather(a_shard) as (a_full, ag_args):
-        d = gemm(a_full, b, ..., ag_args=ag_args)  # any quack GEMM(s)
+        d = gemm(a_full, b, ..., dist_op=AllGather(), dist_op_args=ag_args)
 
 Contrast with the ecosystem: TransformerEngine's ub overlap lives INSIDE
 its own GEMM wrapper (cuBLAS can't gate mid-kernel, so TE must chunk the
@@ -128,7 +128,7 @@ consumer pipeline; sync objects map onto full/empty roles):
   ============================  =========================================
   arrival flags (+ epoch)       fine-grained FULL, per (shard, chunk);
                                 consumer_wait = the in-kernel load-warp
-                                gate (ag_wait_m_tile)
+                                gate (AllGather.wait_tile)
   ev_reuse[buffer]              collective EMPTY, one per buffer (EMPTY
                                 is a per-buffer property); waiting it =
                                 producer_acquire (staging + remote sends)
@@ -249,16 +249,21 @@ beyond WORLD, torch-library custom op for compile-compat.
 """
 
 from contextlib import contextmanager
+from typing import NamedTuple
 
+import cutlass.cute as cute
 import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 from cuda.bindings import runtime
+from cutlass import Int32
 
 from quack.blockscaled.operand import BlockScaledFormat, BlockScaledOperand
-from quack.gemm import AllGatherArguments
+from quack.compile_utils import make_fake_tensor
+from quack.cute_dsl_utils import mlir_namedtuple
+from quack.gemm_base import DistOp
 
-__all__ = ["AllGatherRunner", "BlockScaledAllGatherRunner"]
+__all__ = ["AllGather", "AllGatherArguments", "AllGatherRunner", "BlockScaledAllGatherRunner"]
 
 _SET_CAPTURE_DEPS = (
     runtime.cudaStreamUpdateCaptureDependenciesFlags.cudaStreamSetCaptureDependencies
@@ -270,6 +275,67 @@ def _check(err_ret):
     if int(err) != 0:
         raise RuntimeError(f"CUDA error {err}")
     return ret[0] if len(ret) == 1 else tuple(ret)
+
+
+@mlir_namedtuple
+class AllGatherArguments(NamedTuple):
+    """AllGather's bundle (the GEMM's dist_op_args; what gather() yields). The gate spins on the
+    flags; the frontends also read the shard geometry off it for the scheduler's `ag` bundle (the
+    shard-major rotated decode, validated against the tile config by validate_ag_geometry)."""
+
+    # (num_shards * num_chunks,) Int32, symmetric, chunk-major within a shard (flag idx =
+    # shard * num_chunks + chunk), each a copy of the call's device epoch once that chunk landed
+    flags: cute.Tensor
+    epoch: cute.Tensor  # (1,) Int32, 4B-aligned, device-resident epoch slot read through the pointer
+    num_shards: Int32  # world_size: shards along M
+    # Index of the shard whose tiles are scheduled FIRST; consumption walks
+    # the ring from there. Each rank passes its own rank — the local shard
+    # is resident immediately, remote shards arrive in ring order.
+    first_shard: Int32
+    num_chunks: Int32 = Int32(1)  # sub-shard arrival granularity (flags per shard)
+
+
+class AllGather(DistOp):
+    """AllGather + GEMM: the transport is the copy engine (AllGatherRunner below), so the operator
+    is only the load-warp gate on the shard / chunk arrival flags, under any tile order. No comm warps."""
+
+    def fake_args(self, d_dtype):
+        return AllGatherArguments(
+            make_fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=4),
+            # divisibility=1 elem => assumed_align=4 B: the runtime epoch is a 1-elem VIEW that may
+            # sit 4 bytes off its allocation base (parity-1 slot)
+            make_fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1),
+            Int32(0),
+            Int32(0),
+            Int32(0),
+        )
+
+    @cute.jit
+    def wait_tile(self, gemm, ctx, tile_coord_mnkl, gate: Int32) -> Int32:
+        """Spin until the (shard, chunk) of A owning this tile has landed: flags[gate] >= *epoch,
+        modular (TE's CHECK_IDS trick: flags may run up to 2^31 ahead across wraps, no resync).
+        gate is the 1-entry satisfied-gate cache: flags are monotonic within a launch and consecutive
+        tiles mostly share a (shard, chunk), so a repeated gate index skips the sys-scope load.
+
+        RELAXED loads, deliberately: acquire-sys lowers to LDG.STRONG.SYS + CCTL.IVALL, a full L1
+        invalidate per tile. Unnecessary here: the gated bytes are read by TMA at L2, where the CE
+        writes already landed (stream-ordered before the flag copy). A SIMT (L1-cached) consumer of
+        the gated bytes would need an acquire or proxy fence on the spun path."""
+        args = ctx.args
+        nclusters_m_per_shard = ctx.sched_params.problem_shape_ncluster_mnl[0] // args.num_shards
+        nclusters_m_per_chunk = nclusters_m_per_shard // args.num_chunks
+        cid_m = tile_coord_mnkl[0] // gemm.cluster_shape_mnk[0]
+        shard = cid_m // nclusters_m_per_shard
+        chunk = (cid_m - shard * nclusters_m_per_shard) // nclusters_m_per_chunk
+        new_gate = shard * args.num_chunks + chunk
+        if new_gate != gate:
+            # device-resident epoch (the host bumps it with a captured kernel): graph-capturable
+            epoch = cute.arch.load(ctx.args.epoch.iterator.llvm_ptr, Int32, sem="relaxed", scope="gpu")
+            ptr = ctx.args.flags.iterator + new_gate
+            val = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="sys")
+            while (val - epoch) < 0:
+                val = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="sys")
+        return new_gate
 
 
 class AllGatherRunner:
@@ -284,16 +350,16 @@ class AllGatherRunner:
       runner's end-of-iteration event and reuse barrier; multi-kernel gemms
       are fine),
     - reads A only from the yielded ``a_full`` buffer,
-    - forwards ``ag_args`` (a :class:`quack.gemm.AllGatherArguments`, or
-      None on the world_size == 1 fast path) verbatim to a persistent dense
-      quack GEMM — ``ag_args`` is a universal kwarg, any variant works
+    - forwards ``ag_args`` (an :class:`AllGatherArguments`, or None on the
+      world_size == 1 fast path) verbatim to a persistent dense quack GEMM as
+      ``dist_op=AllGather(), dist_op_args=ag_args`` — any variant works
       (plain, act/epilogue, blockscaled, ...).
 
     From the kernel's perspective AG-capability is exactly (a) the
-    shard-major rotated scheduler decode and (b) that one flag gate before a
-    tile's first TMA — both live in shared code (TileScheduler /
-    the arch base class), so enabling a new GEMM variant is one host-side
-    ``ag_args`` kwarg. The single geometry fact the two halves share —
+    shard-major rotated scheduler decode (TileScheduler's ``ag`` bundle) and
+    (b) that one flag gate before a tile's first TMA (the AllGather
+    operator's wait_tile) — both live in shared code, so enabling a new GEMM
+    variant is nothing. The single geometry fact the two halves share —
     shard and chunk boundaries must land on whole scheduler clusters
     (multiples of tile_M * cluster_M) — is asserted at every launch by the
     shared plan_scheduler_args choke point (validate_ag_geometry), which
@@ -354,7 +420,7 @@ class AllGatherRunner:
         # Arrival flags, chunk-major within a shard: flag[shard * chunks + c]
         # is set (a 4-byte copy of the call's device epoch) once chunk c of
         # that shard is in local HBM. The kernel gate releases per chunk
-        # (ag_wait_m_tile). Written REMOTELY (to the peer VA after each
+        # (AllGather.wait_tile). Written REMOTELY (to the peer VA after each
         # send) -> symmetric.
         self.flags = symm_mem.empty(
             self.world_size * arrival_chunks, dtype=torch.int32, device=self.device
@@ -643,7 +709,7 @@ class AllGatherRunner:
         """Overlapped all-gather around any GEMM(s) — the primary API::
 
             with runner.gather(a_shard) as (a_full, ag_args):
-                d = gemm(a_full, b, ..., ag_args=ag_args)
+                d = gemm(a_full, b, ..., dist_op=AllGather(), dist_op_args=ag_args)
 
         On ENTER: acquire the rotating buffer, stage the local shard, commit
         its arrival flags. a_full is NOT gathered yet — the body's GEMM
@@ -651,10 +717,10 @@ class AllGatherRunner:
 
         The BODY must enqueue every consumer of a_full on the current stream
         and forward ag_args (an AllGatherArguments; None on the
-        world_size == 1 fast path) to the quack GEMM(s) — ag_args is a
-        universal kwarg, any variant works. ("Gate" in this file always
-        means the AG flag gate in the AB-load warp, ag_wait_m_tile — not a
-        gated activation.) Several GEMMs may share one gather (e.g. q/k/v
+        world_size == 1 fast path) to the quack GEMM(s) as the AllGather
+        operator's dist_op_args — any variant works. ("Gate" in this file always
+        means the AG flag gate in the AB-load warp, AllGather.wait_tile — not
+        a gated activation.) Several GEMMs may share one gather (e.g. q/k/v
         projections) — they all wait on the same flags.
 
         On EXIT: record consumer_release, enqueue the CE sends and the reuse
@@ -832,7 +898,7 @@ class BlockScaledAllGatherRunner(AllGatherRunner):
             gemm(a_op.qdata, b_q, d, None, None, tm, tn, cm, cn,
                  SFA=a_op.scale, SFB=sfb, bs_format_a="mxfp8_e4m3",
                  bs_format_b="mxfp8_e5m2",  # B format independent, as in dense
-                 ag_args=ag_args)
+                 dist_op=AllGather(), dist_op_args=ag_args)
 
     Any number of blockscaled GEMMs may share the gather, exactly as with
     the parent. The operand is quack's canonical (qdata, scale, format)
@@ -844,7 +910,7 @@ class BlockScaledAllGatherRunner(AllGatherRunner):
     A blockscaled GEMM consumes two distributed tensors per shard — the
     qdata bytes and their per-block scale factors — but the AG gate
     contract is per-shard, not per-tensor: the AB-load warp's gate
-    (ag_wait_m_tile) precedes ALL of a tile's TMA loads, SFA included. So
+    (AllGather.wait_tile) precedes ALL of a tile's TMA loads, SFA included. So
     the ONLY missing piece is transport-side: get the shard's SFA bytes
     into a resident symmetric buffer before that shard's flag lands.
     Without this, callers pre-gather SFA with an exposed NCCL all-gather

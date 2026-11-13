@@ -34,7 +34,7 @@ def _run_rank():
         to_mx,
         to_mxfp4,
     )
-    from quack.distributed import BlockScaledAllGatherRunner
+    from quack.distributed import AllGather, BlockScaledAllGatherRunner
     from quack.gemm import gemm as quack_gemm
 
     rank = int(os.environ["RANK"])
@@ -99,7 +99,8 @@ def _run_rank():
                 SFB=sfb,
                 bs_format_a=fmt_a,
                 bs_format_b=fmt_b,
-                ag_args=ag_args,
+                dist_op=AllGather(),
+                dist_op_args=ag_args,
             )
         return a_op
 
@@ -213,7 +214,8 @@ def _run_rank():
             SFB=sfb,
             bs_format_a=fmt,
             bs_format_b=fmt,
-            ag_args=ag_args,
+            dist_op=AllGather(),
+            dist_op_args=ag_args,
         )
     torch.cuda.synchronize(device)
     dist.barrier()

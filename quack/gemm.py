@@ -13,9 +13,10 @@ from cutlass.cute.runtime import make_ptr
 from quack.cache import jit_cache
 from quack.split_k_reduce import split_k_reduce
 from quack.gemm_config import SplitKMode
+from quack.tile_scheduler import RasterOrderOption
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters, torch2cute_dtype_map
-from quack.gemm_base import AllGather
+from quack.distributed.all_gather_gemm import AllGather
 from quack.gemm_default_epi import (
     GemmDefaultEpiMixin,
     GemmDefaultSm80,
@@ -89,7 +90,9 @@ def _compile_gemm(
     sfd_col_dtype=None,
     a_mma_dtype=None,  # blockscaled: MMA element types when they differ from the
     b_mma_dtype=None,  # storage dtypes (packed fp6 crosses the boundary as bytes)
-    has_ag=False,
+    has_ag=False,  # AllGather+GEMM: ag scheduler fields in the compiled signature
+    dist_op=None,  # the distributed operator (quack.gemm_base.DistOp; picklable, its state is the key)
+    raster_order=RasterOrderOption.Heuristic,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -121,6 +124,16 @@ def _compile_gemm(
         # so it needs its own symbolic batch dim.
         mD = fake_batched(
             d_dtype, m, n, cute.sym_int(), 1 if d_major == "n" else 0, 128 // d_dtype.width
+        )
+    if dist_op is not None:
+        # the operator's D has its own M extent (d_shape): untie it from A's M in the signature
+        mD = fake_batched(
+            d_dtype,
+            cute.sym_int(),
+            n,
+            l if batched else None,
+            1 if d_major == "n" else 0,
+            128 // d_dtype.width,
         )
 
     def fake_scalar(mode, dtype=Float32):
@@ -179,6 +192,7 @@ def _compile_gemm(
         has_batch_idx_permute,
         l,
         has_ag=has_ag,
+        raster_order=raster_order,
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len)
@@ -220,7 +234,7 @@ def _compile_gemm(
         b_transposed=b_kn,
         a_mma_dtype=a_mma_dtype,
         b_mma_dtype=b_mma_dtype,
-        comm=AllGather() if has_ag else None,  # the ag bundle's gate is the AllGather operator
+        dist_op=dist_op,
     )
 
 
@@ -255,6 +269,7 @@ class _GemmPlan(NamedTuple):
     tile_N: int
     cluster_M: int
     cluster_N: int
+    has_ag: bool  # AllGather+GEMM: dist_op_args also feed the scheduler's ag bundle
 
 
 # (metadata key) -> _GemmPlan. Grows with distinct (shape, stride, dtype, flag)
@@ -359,24 +374,6 @@ def _reduce_staged_split_k(
     )
 
 
-class AllGatherArguments(NamedTuple):
-    """AllGather+GEMM scheduler arguments (see quack/distributed/): the typed
-    host-side mirror of the ag_* fields in TileSchedulerArguments — the
-    kernel-facing structure cute.jit consumes. flags[shard * num_chunks + c]
-    >= *epoch gates a tile's first TMA; num_shards/first_shard drive the
-    shard-major rotated decode; num_chunks is the sub-shard arrival
-    granularity."""
-
-    flags: Tensor  # (num_shards * num_chunks,) int32, symmetric
-    epoch: Tensor  # (1,) int32, 4B-aligned, device-resident epoch slot
-    num_shards: int  # world_size: shards along M
-    # Index of the shard whose tiles are scheduled FIRST; consumption walks
-    # the ring from there. Each rank passes its own rank — the local shard
-    # is resident immediately, remote shards arrive in ring order.
-    first_shard: int
-    num_chunks: int = 1  # sub-shard arrival granularity (flags per shard)
-
-
 def gemm(
     # (l, m, k), or (m, k) unbatched dense (SM90+; B/D/C must be 2D too), or (total_m, k)
     # if varlen_m or (m, total_k) if varlen_k or (whatever, k) if gather_A_varlen_m or
@@ -396,6 +393,7 @@ def gemm(
     persistent: bool = True,
     is_dynamic_persistent: bool = False,
     max_swizzle_size: int = 8,
+    raster_order: int = RasterOrderOption.Heuristic,  # the scheduler's raster (compile-time)
     rowvec_bias: Optional[Tensor] = None,  # (l, n)
     colvec_bias: Optional[Tensor] = None,  # (l, m), or (total_m,) if varlen_m
     alpha: float | Tensor = 1.0,
@@ -437,11 +435,11 @@ def gemm(
     # over (N, M), for backward consumers contracting over this output's M.
     # Mutually exclusive with SFD.
     SFDCol: Optional[Tensor] = None,
-    # AllGather+GEMM (SM90+, see quack/distributed/all_gather_gemm.py): A is the full
-    # gathered (M, K) buffer being filled by a copy stream; (flags, seq,
-    # num_shards, first_shard) drive the shard-major rotated schedule and the
-    # load-warp arrival gate.
-    ag_args: Optional[AllGatherArguments] = None,
+    # The distributed operator (quack/distributed/, a DistOp) and its per-call bundle. AllGather
+    # (SM90+): A is the full gathered (M, K) buffer being filled by a copy stream; the bundle's
+    # flags/epoch drive the load-warp arrival gate and its shard geometry the shard-major schedule.
+    dist_op=None,
+    dist_op_args=None,
 ) -> _GemmPlan:
     alpha_mode = scalar_mode(alpha)
     beta_mode = scalar_mode(beta)
@@ -453,11 +451,14 @@ def gemm(
     # strides subsume the majors, the validation asserts, and the fp4/SF shape
     # checks), so a cache hit is exactly a replay of a previously validated
     # call with different data pointers.
-    if ag_args is not None:
+    if (dist_op is None) != (dist_op_args is None):
+        raise ValueError("dist_op and dist_op_args go together")
+    has_ag = isinstance(dist_op, AllGather)
+    if has_ag:
         # Shard/chunk geometry (see validate_ag_geometry): enforced at launch
         # for every frontend via plan_scheduler_args; checked here too so a
         # bad-geometry cold call fails before the (expensive) compile.
-        validate_ag_geometry(A, ag_args, tile_M, cluster_M)
+        validate_ag_geometry(A, dist_op_args, tile_M, cluster_M)
     key = (
         tensor_key(A),
         tensor_key(B),
@@ -483,6 +484,7 @@ def gemm(
         persistent,
         is_dynamic_persistent,
         max_swizzle_size,
+        raster_order,
         add_to_output,
         rounding_mode,
         use_tma_gather,
@@ -496,7 +498,7 @@ def gemm(
         b_kn,
         bs_format_a,
         bs_format_b,
-        ag_args is not None,
+        dist_op.plan_key() if dist_op is not None else None,
         tensor_key(SFD),
         tensor_key(SFDCol),
         scalar_mode(sfd_norm_const) if sfd_norm_const is not None else 0,
@@ -519,6 +521,7 @@ def gemm(
             persistent=persistent,
             is_dynamic_persistent=is_dynamic_persistent,
             max_swizzle_size=max_swizzle_size,
+            raster_order=raster_order,
             rowvec_bias=rowvec_bias,
             colvec_bias=colvec_bias,
             cu_seqlens_m=cu_seqlens_m,
@@ -540,7 +543,8 @@ def gemm(
             b_kn=b_kn,
             bs_format_a=bs_format_a,
             bs_format_b=bs_format_b,
-            has_ag=ag_args is not None,
+            has_ag=has_ag,
+            dist_op=dist_op,
             SFD=SFD,
             sfd_norm_const=sfd_norm_const,
             SFDCol=SFDCol,
@@ -564,7 +568,7 @@ def gemm(
         batch_idx_permute=batch_idx_permute,
         SFA=SFA,
         SFB=SFB,
-        ag_args=ag_args,
+        dist_op_args=dist_op_args,
         SFD=SFD,
         sfd_norm_const=sfd_norm_const,
         SFDCol=SFDCol,
@@ -591,7 +595,7 @@ def run_gemm_plan(
     batch_idx_permute: Optional[Tensor] = None,
     SFA: Optional[Tensor] = None,
     SFB: Optional[Tensor] = None,
-    ag_args: Optional[AllGatherArguments] = None,
+    dist_op_args=None,  # the operator's per-call bundle (plans built with dist_op=)
     # Quantized-output tensors (validated at plan build; see _build_gemm_plan).
     SFD: Optional[Tensor] = None,
     sfd_norm_const: Optional[float | Tensor] = None,
@@ -650,11 +654,13 @@ def run_gemm_plan(
             mSFDCol=SFDCol,
         )
     scheduler_args = plan_scheduler_args(
-        plan, tile_count_semaphore, batch_idx_permute, ag_args, A=A
+        plan, tile_count_semaphore, batch_idx_permute, dist_op_args if plan.has_ag else None, A=A
     )
     varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx)
 
-    launch_gemm(plan, A, B, D_gemm, C_gemm, epi_args, scheduler_args, varlen_args, SFA, SFB)
+    launch_gemm(
+        plan, A, B, D_gemm, C_gemm, epi_args, scheduler_args, varlen_args, SFA, SFB, dist_op_args
+    )
 
     if staged_split_k:
         _reduce_staged_split_k(
@@ -687,6 +693,7 @@ def _build_gemm_plan(
     persistent,
     is_dynamic_persistent,
     max_swizzle_size,
+    raster_order,
     rowvec_bias,
     colvec_bias,
     cu_seqlens_m,
@@ -709,6 +716,7 @@ def _build_gemm_plan(
     bs_format_a=None,
     bs_format_b=None,
     has_ag=False,
+    dist_op=None,
     SFD=None,
     sfd_norm_const=None,
     SFDCol=None,
@@ -722,10 +730,10 @@ def _build_gemm_plan(
     if gather_A:
         assert varlen, "gather_A requires varlen"
         assert cluster_N == 1, "gather_A requires cluster_N=1"
-    if has_ag:
-        assert not varlen and not gather_A, "AllGather+GEMM requires a dense GEMM"
-        assert persistent, "AllGather+GEMM requires the persistent scheduler"
-        assert split_k == 1, "AllGather+GEMM does not support split_k yet"
+    if dist_op is not None:
+        assert not varlen and not gather_A, "dist_op requires a dense GEMM"
+        assert persistent, "dist_op requires the persistent scheduler"
+        assert split_k == 1, "dist_op does not support split_k"
     if add_to_output:
         assert not varlen_m, "Add to output not supported with varlen_m"
     assert split_k >= 1, "split_k must be >= 1"
@@ -755,10 +763,9 @@ def _build_gemm_plan(
     assert device_capacity[0] in [8, 9, 10, 11, 12], (
         "Only SM8x, SM90, SM100, SM110, and SM120 are supported"
     )
-    if has_ag:
-        # SM8x is the one arch without the load-warp gate (no specialized
-        # load warp in the cp.async kernel); every TMA arch supports AG.
-        assert device_capacity[0] >= 9, "AllGather+GEMM requires SM90+"
+    if dist_op is not None:
+        # SM8x has no specialized load warp (cp.async kernel) for the operator's hooks
+        assert device_capacity[0] >= 9, "dist_op requires SM90+"
     sf_dtype, sf_vec_size = None, None
     a_mma_dtype, b_mma_dtype = None, None
     if blockscaled:
@@ -957,6 +964,8 @@ def _build_gemm_plan(
         a_mma_dtype,
         b_mma_dtype,
         has_ag,
+        dist_op,
+        raster_order,
     )
 
     cluster_size = cluster_M * cluster_N * cluster_K
@@ -1013,4 +1022,5 @@ def _build_gemm_plan(
         tile_N=tile_N,
         cluster_M=cluster_M,
         cluster_N=cluster_N,
+        has_ag=has_ag,
     )

@@ -20,19 +20,22 @@ NUM_ITERS = 6  # exercises epoch monotonicity + double-buffer reuse
 
 def _ag_gemm(runner, a_shard, b, d=None):
     """Plain AG+GEMM (D = A_full @ B^T) through the gather() context."""
+    from quack.distributed import AllGather
     from quack.gemm import gemm as quack_gemm
 
     if d is None:
         d = torch.empty(runner.m_total, b.shape[0], dtype=runner.dtype, device=runner.device)
     with runner.gather(a_shard) as (a_full, ag_args):
-        quack_gemm(a_full, b, d, None, None, 128, 256, 2, 1, ag_args=ag_args)
+        # world_size == 1 yields no flags: a plain GEMM
+        dist_op = AllGather() if ag_args is not None else None
+        quack_gemm(a_full, b, d, None, None, 128, 256, 2, 1, dist_op=dist_op, dist_op_args=ag_args)
     return d
 
 
 def _run_rank():
     import torch.distributed as dist
 
-    from quack.distributed import AllGatherRunner
+    from quack.distributed import AllGather, AllGatherRunner
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
@@ -97,8 +100,8 @@ def _run_rank():
                 )
     # --- Abstraction check: AllGather + GEMM+SiLU epilogue via the
     # runner.gather() CONTEXT — proves any epilogue-mod GEMM overlaps by
-    # calling it inline in the with-body with ONE ag_args kwarg (same route
-    # serves rope etc.).
+    # calling it inline in the with-body with the AllGather operator (same
+    # route serves rope etc.).
     from quack.epilogue.library import linear_act_mod
 
     dtype, shard_m, n, k = torch.bfloat16, 1024, 2048, 4096
@@ -129,7 +132,8 @@ def _run_rank():
                 tile_N=256,
                 cluster_M=2,
                 cluster_N=1,
-                ag_args=ag_args,
+                dist_op=AllGather(),
+                dist_op_args=ag_args,
             )
         torch.cuda.synchronize(device)
         err = (postact.float() - ref).abs().max().item()

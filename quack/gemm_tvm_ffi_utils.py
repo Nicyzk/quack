@@ -13,7 +13,7 @@ from quack.compile_utils import make_fake_tensor as fake_tensor
 from quack.compile_utils import div_for_dtype, fake_batched  # noqa: F401  (re-exported)
 from quack.gemm_config import SplitKMode
 from quack.cute_dsl_utils import get_compile_target_capacity, torch2cute_dtype_map
-from quack.tile_scheduler import AgSchedulerArguments, TileSchedulerOptions
+from quack.tile_scheduler import AgSchedulerArguments, RasterOrderOption, TileSchedulerOptions
 from quack.varlen_utils import VarlenArguments
 
 
@@ -255,7 +255,7 @@ def make_scheduler_args(
     max_swizzle_size,
     tile_count_semaphore,
     batch_idx_permute=None,
-    ag_args=None,  # quack.gemm.AllGatherArguments or None
+    ag_args=None,  # the AllGather operator's AllGatherArguments bundle, or None
 ):
     return TileSchedulerOptions(
         max_active_clusters=Int32(max_active_clusters),
@@ -266,11 +266,7 @@ def make_scheduler_args(
         ),
         ag=(
             AgSchedulerArguments(
-                flags=ag_args.flags,
-                epoch=ag_args.epoch,
-                num_shards=Int32(ag_args.num_shards),
-                first_shard=Int32(ag_args.first_shard),
-                num_chunks=Int32(ag_args.num_chunks),
+                num_shards=Int32(ag_args.num_shards), first_shard=Int32(ag_args.first_shard)
             )
             if ag_args is not None
             else None
@@ -279,24 +275,22 @@ def make_scheduler_args(
     )
 
 
-def make_fake_scheduler_args(has_semaphore, has_batch_idx_permute, l_sym, has_ag=False):
+def make_fake_scheduler_args(
+    has_semaphore,
+    has_batch_idx_permute,
+    l_sym,
+    has_ag=False,
+    raster_order=RasterOrderOption.Heuristic,  # constexpr: baked here, the launch value is ignored
+):
     return TileSchedulerOptions(
         max_active_clusters=Int32(1),
+        raster_order=RasterOrderOption(raster_order),
         max_swizzle_size=Int32(8),
         tile_count_semaphore=(
             make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=4) if has_semaphore else None
         ),
         ag=(
-            AgSchedulerArguments(
-                flags=fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=4),
-                # divisibility=1 elem => assumed_align=4 B: the gate reads one
-                # scalar int32, and the runtime tensor is a 1-elem VIEW that
-                # may sit 4 bytes off its allocation base (parity-1 slot).
-                epoch=fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1),
-                num_shards=Int32(1),
-                first_shard=Int32(0),
-                num_chunks=Int32(1),
-            )
+            AgSchedulerArguments(num_shards=Int32(1), first_shard=Int32(0))
             if has_ag
             else None
         ),
@@ -457,13 +451,12 @@ def validate_ag_geometry(A, ag_args, tile_M, cluster_M):
     (plan_scheduler_args — the plan knows the exact tile config); gemm() also
     calls it pre-compile to fail fast on the cold path."""
     m_rows = A.shape[-2]
-    assert m_rows % ag_args.num_shards == 0, (
-        f"AG+GEMM: M ({m_rows}) must divide into num_shards ({ag_args.num_shards})"
-    )
-    shard_rows = m_rows // ag_args.num_shards
-    assert shard_rows % (tile_M * cluster_M * ag_args.num_chunks) == 0, (
+    num_shards, num_chunks = int(ag_args.num_shards), int(ag_args.num_chunks)
+    assert m_rows % num_shards == 0, f"AG+GEMM: M ({m_rows}) must divide into num_shards ({num_shards})"
+    shard_rows = m_rows // num_shards
+    assert shard_rows % (tile_M * cluster_M * num_chunks) == 0, (
         f"AG+GEMM: shard rows ({shard_rows}) must be a multiple of tile_M * cluster_M * "
-        f"arrival_chunks ({tile_M} * {cluster_M} * {ag_args.num_chunks}) so shard/chunk "
+        f"arrival_chunks ({tile_M} * {cluster_M} * {num_chunks}) so shard/chunk "
         f"boundaries land on whole scheduler clusters"
     )
 
@@ -495,16 +488,16 @@ def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None, ag_a
 
 
 def launch_gemm(
-    plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA=None, SFB=None, comm_args=None
+    plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA=None, SFB=None, dist_op_args=None
 ):
     """Invoke the compiled kernel. Kernel signatures uniformly take trailing
     (SFA, SFB) — None unless blockscaled — and the compiled TVM-FFI arg spec
     bakes the full declared arity, so they are always passed. A layout-owning
     transform's A is a TransformAOperand bundle — one slot, the host never
-    unpacks it. Every kernel also declares a trailing comm_args (None without a comm)."""
+    unpacks it. Every kernel also declares a trailing dist_op_args (None without an operator)."""
     if SFA is not None:
         _validate_tma_unpack_operands(A, B)
-    plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB, comm_args)
+    plan.compiled_fn(A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB, dist_op_args)
 
 
 def make_fake_gemm_tensors(
@@ -701,10 +694,12 @@ def compile_gemm_kernel(
     cd_packed=None,
     a_mma_dtype=None,
     b_mma_dtype=None,
-    comm=None,  # the distributed operator (quack.gemm_base.Comm): ctor kwarg + its comm_args fakes
+    dist_op=None,  # the distributed operator (quack.gemm_base.DistOp): ctor kwarg + its dist_op_args fakes
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
-    assert comm is None or device_capacity[0] in [9, 10, 11], "comm operators are SM90/SM100 only"
+    assert dist_op is None or device_capacity[0] in [9, 10, 11], (
+        "distributed operators are SM90/SM100 only"
+    )
     split_k_kwargs = {}
     if split_k != 1:
         assert device_capacity[0] in [9, 10, 11, 12], "split_k requires SM90/SM100/SM120"
@@ -738,8 +733,8 @@ def compile_gemm_kernel(
             split_k_kwargs["use_clc_persistence"] = (
                 is_dynamic_persistent and persistent and get_compile_target_capacity()[0] >= 10
             )
-        if comm is not None:
-            split_k_kwargs["comm"] = comm
+        if dist_op is not None:
+            split_k_kwargs["dist_op"] = dist_op
         GemmCls = partial(GemmCls, pingpong=pingpong, is_persistent=persistent, **split_k_kwargs)
     elif device_capacity[0] in [10, 11]:
         GemmCls = partial(
@@ -750,7 +745,7 @@ def compile_gemm_kernel(
             a_mma_dtype=a_mma_dtype,
             b_mma_dtype=b_mma_dtype,
             **split_k_kwargs,
-            **({"comm": comm} if comm is not None else {}),
+            **({"dist_op": dist_op} if dist_op is not None else {}),
         )
     gemm_obj = GemmCls(
         Float32,
@@ -775,9 +770,9 @@ def compile_gemm_kernel(
     # natively. The compiled TVM-FFI arg spec bakes the full declared arity
     # (defaults included), so they are always passed here and at launch.
     sf_args = (mSFA, mSFB)
-    # every kernel declares a trailing comm_args (defaults are baked into the arity): its fakes, or None
+    # every kernel declares a trailing dist_op_args (defaults are baked into the arity): its fakes, or None
     d_dtype = mD.element_type if mD is not None else None  # sink-only epilogues have no D
-    comm_args = (comm.fake_args(d_dtype) if comm is not None else None,)
+    dist_op_args = (dist_op.fake_args(d_dtype) if dist_op is not None else None,)
     return cute.compile(
         gemm_obj,
         mA,
@@ -789,6 +784,6 @@ def compile_gemm_kernel(
         varlen_args,
         stream,
         *sf_args,
-        *comm_args,
+        *dist_op_args,
         options="--enable-tvm-ffi",
     )
