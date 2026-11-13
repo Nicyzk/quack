@@ -2,7 +2,7 @@
 # D is the multicast view of 3 slots x world mirrors of (m, n), stacked along M; slot k = launch counter % 3.
 # Every rank's epilogue warps store their -0.0-scrubbed raw partial of each tile into slot k's mirror `rank`
 # (one TMA multicast store lands on every rank, the GEMM's partial-only epilogue through this operator's
-# store_coord / store_fixup), then re-arm last call's slot (k - 1) over that tile in every local mirror:
+# store_tile / scrub_partial), then re-arm last call's slot (k - 1) over that tile in every local mirror:
 # peers write that slot again only in call i + 2, after this rank's call i + 1 data, so nothing orders the
 # re-arm. The comm warps poll their local slot-k mirrors per 16 B atom until no word is the sentinel, sum in
 # f32, run the GEMM's epilogue on the whole tile and store this rank's plain out.
@@ -178,16 +178,15 @@ class AllReduceLamport(DistOp):
         warps_n = max(1, thr_n // cute.arch.WARP_SIZE)
         return (gemm.num_comm_warps // warps_n, warps_n, 1)
 
-    @cute.jit
-    def store_coord(self, gemm, ctx, tile_coord_mnkl):
-        """Slot k, mirror `rank`: the tile's row in the stacked mirrors."""
+    def store_tile(self, gemm, ctx, sD, epi_tile, tidx, tile_coord_mnkl, batch_idx, varlen_manager):
+        """The GEMM's TMA store into slot k, mirror `rank`: the tile's row in the stacked mirrors."""
         dist_op_args = ctx.args
         tiles_m = dist_op_args.out.shape[0] // gemm.cta_tile_shape_mnk[0]
         row = (_slot(dist_op_args.slot) * self.world + self.rank) * tiles_m + tile_coord_mnkl[0]
-        return (row, tile_coord_mnkl[1], tile_coord_mnkl[2], tile_coord_mnkl[3])
+        return (row, tile_coord_mnkl[1], tile_coord_mnkl[2], tile_coord_mnkl[3]), None
 
     @cute.jit
-    def store_fixup(self, frg):
+    def scrub_partial(self, frg):
         """x + 0.0 is bit-exact except -0.0 -> +0.0: scrub the sentinel from the partial."""
         vec = frg.load()
         frg.store(vec + cute.full_like(vec, 0.0))

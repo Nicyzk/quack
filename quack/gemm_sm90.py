@@ -1281,11 +1281,7 @@ class GemmSm90(GemmTmaBase):
             c_tile_cnt = cute.size(self.epi_tile_shape)
 
             ab_read_state = make_pipeline_state(pipeline.PipelineUserType.Consumer, self.ab_stage)
-            # the operator may drain the staged D subtile itself (per-row destinations): no TMA store then
-            drain = self.dist_op.store_drain(self, ctx, sD, self.epi_tile, tidx)
-            epi_store_pipeline = None
-            if const_expr(drain is None):
-                epi_store_pipeline = self.make_epi_store_pipeline()
+            epi_store_pipeline = self.make_epi_store_pipeline()
             epi_read_state = make_pipeline_state(
                 pipeline.PipelineUserType.Consumer, self.epi_c_stage
             )
@@ -1382,10 +1378,12 @@ class GemmSm90(GemmTmaBase):
                     self.pingpong_barrier_sync(warp_group_idx, "epi")
                 iket.range_push("epilogue")
 
-                copy_D = None
-                if const_expr(drain is not None):
-                    copy_D = partial(drain, varlen_manager, tile_coord_mnkl, batch_idx)
-                elif const_expr(has_D):
+                # the tile's store: the TMA store at a D tile coordinate, or the operator's own copy
+                coord_D, copy_D = self.dist_op.store_tile(
+                    self, ctx, sD, self.epi_tile, tidx, tile_coord_mnkl, batch_idx, varlen_manager
+                )
+                store_pipeline = epi_store_pipeline if const_expr(copy_D is None) else None
+                if const_expr(has_D and copy_D is None):
                     # Staged split-K: D is the f32 partials workspace, whose batch mode is the
                     # combined (l * split_k + split) index from the scheduler.
                     d_batch_idx = batch_idx
@@ -1397,7 +1395,7 @@ class GemmSm90(GemmTmaBase):
                         self.cta_tile_shape_mnk[:2],
                         self.epi_tile,
                         sD,
-                        self.dist_op.store_coord(self, ctx, tile_coord_mnkl),
+                        coord_D,
                     )
 
                 copy_C = None
@@ -1446,7 +1444,7 @@ class GemmSm90(GemmTmaBase):
                     epilogue_params,
                     epi_smem_tensors,
                     epi_pipeline,
-                    epi_store_pipeline,
+                    store_pipeline,
                     epi_read_state,
                     epi_producer_state,
                     self.epi_tile,
@@ -1476,7 +1474,7 @@ class GemmSm90(GemmTmaBase):
                     self.epi_tile,
                     epi_read_state,
                     epi_producer_state,
-                    epi_store_pipeline,
+                    store_pipeline,
                     tile_coord_mnkl,
                     self.epilogue_barrier,
                     tidx,
@@ -1484,7 +1482,7 @@ class GemmSm90(GemmTmaBase):
                 )
                 # the tile's epilogue is issued: the operator publishes it
                 self.dist_op.signal_tile(
-                    self, ctx, tile_coord_mnkl, epi_store_pipeline, is_tma_warp, tidx
+                    self, ctx, tile_coord_mnkl, store_pipeline, is_tma_warp, tidx
                 )
 
                 if const_expr(self.pingpong):
@@ -1540,7 +1538,7 @@ class GemmSm90(GemmTmaBase):
                 prims.griddepcontrol(prims.GridDepAction.LAUNCH_DEPENDENTS)
 
             # Wait for D store complete
-            if const_expr(not self.pingpong and epi_store_pipeline is not None):
+            if const_expr(not self.pingpong):
                 if is_tma_warp:
                     epi_store_pipeline.producer_tail()
 

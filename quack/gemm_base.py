@@ -77,8 +77,7 @@ class DistOp:
     """A distributed operator fused into the GEMM (GemmSmXX(..., dist_op=DistOp subclass)). It owns the
     per-tile gate (wait_tile) and publish (signal_tile), its comm warps (num_warps, regs = (epilogue,
     other, comm) or None, smem via smem_bytes / smem_struct as storage.dist_op) and the destination of the
-    GEMM's staged subtile (store_coord / store_drain / store_fixup, epi_warp_shape_mnk when it finalizes
-    the epilogue).
+    GEMM's staged subtile (store_tile / scrub_partial, epi_warp_shape_mnk when it finalizes the epilogue).
     The GEMM owns the mainloop, the epilogue and the staging of the store; every hook sees the kernel
     through one DistOpCtx. This base is the no-operator default."""
 
@@ -114,26 +113,19 @@ class DistOp:
         the frontend validates it from this one place)."""
         return shape
 
-    @cute.jit
-    def store_coord(self, gemm, ctx, tile_coord_mnkl):
-        """The tile coordinate in D the epilogue stores this schedule tile at (D is the operator's, not
-        the caller's output)."""
-        return tile_coord_mnkl
+    def store_tile(self, gemm, ctx, sD, epi_tile, tidx, tile_coord_mnkl, batch_idx, varlen_manager):
+        """Trace-time, in the epilogue warps, per schedule tile: where its staged subtiles go, as
+        (coord, copy) with one set. coord: a tile coordinate in D for the GEMM's TMA store (default this
+        tile; D is the operator's, not the caller's output). copy: the operator's own jit callable
+        (src_idx, dst_idx) every epilogue thread runs on smem stage src_idx (combine: each row's slice into
+        its origin rank's slot). The staging (accumulator -> registers -> epi ops -> smem) stays the GEMM's."""
+        return tile_coord_mnkl, None
 
     @cute.jit
-    def store_fixup(self, frg):
-        """runs_evt: in-place fixup of the converted (d_dtype) partial before it is staged for
-        the store; the store itself stays the GEMM's."""
-        # TODO: make this an epilogue node on the partial store path (post-convert), not a hook
+    def scrub_partial(self, frg):
+        """runs_evt: the operator's wire encoding of the converted (d_dtype) partial, in place, before it
+        is staged for the store (Lamport: no -0.0, the sentinel); the store itself stays the GEMM's."""
         return
-
-    def store_drain(self, gemm, ctx, sD, epi_tile, tidx):
-        """Trace-time, in the epilogue warps: the operator's own drain of the staged D subtile when the
-        destination is not a tile of D (combine: each row's slice into its origin rank's slot). None (the
-        GEMM's TMA store), or a jit callable (varlen_manager, tile_coord_mnkl, batch_idx, src_idx, dst_idx)
-        every epilogue thread runs on smem stage src_idx; the GEMM then builds no TMA store pipeline. The
-        staging (accumulator -> registers -> epi ops -> smem) stays the GEMM's."""
-        return None
 
     @cute.jit
     def wait_tile(self, gemm, ctx, tile_coord_mnkl, gate: Int32) -> Int32:
@@ -400,7 +392,7 @@ class GemmBase:
         # Register-direct C load per subtile, replacing the smem-staged C (a distributed operator's
         # warps read C from gmem themselves).
         load_C: Optional[Callable] = None,
-        # Store the raw accumulator as D (converted, the operator's store_fixup applied) and run no
+        # Store the raw accumulator as D (converted, the operator's scrub_partial applied) and run no
         # epi op, C load or aux output: the operator's warps run the epilogue on the reduced value.
         store_partial: cutlass.Constexpr[bool] = False,
         # The tile the epilogue is framed on: the CTA tile unless the caller runs it on a
@@ -611,7 +603,7 @@ class GemmBase:
                     )
                 )
             if const_expr(store_partial):
-                self.dist_op.store_fixup(store_frags_out[0])
+                self.dist_op.scrub_partial(store_frags_out[0])
             iket.range_push("epi_store_acq")
             if const_expr(use_tma_epi):
                 if is_tma_warp:
