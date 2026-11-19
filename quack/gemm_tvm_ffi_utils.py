@@ -302,14 +302,19 @@ def make_fake_scheduler_args(
     )
 
 
-def make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=None):
-    if cu_seqlens_m is None and cu_seqlens_k is None:
+def make_varlen_args(
+    cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=None, cu_seqlens_n=None, B_idx=None, cu_tiles_n=None
+):
+    if cu_seqlens_m is None and cu_seqlens_k is None and cu_seqlens_n is None:
         return None
     return VarlenArguments(
         mCuSeqlensM=cu_seqlens_m,
         mCuSeqlensK=cu_seqlens_k,
+        mCuSeqlensN=cu_seqlens_n,
         mAIdx=A_idx,
         mCuTilesM=cu_tiles_m,
+        mBIdx=B_idx,
+        mCuTilesN=cu_tiles_n,
     )
 
 
@@ -325,8 +330,11 @@ def compute_cu_tiles_m(cu_seqlens_m, tile_m_cta):
     return torch.cat([tiles.new_zeros(1), tiles.cumsum(0, dtype=torch.int32)])
 
 
-def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len, has_cu_tiles_m=False):
-    if not varlen_m and not varlen_k:
+def make_fake_varlen_args(
+    varlen_m, varlen_k, gather_A, aidx_len, has_cu_tiles_m=False, varlen_n=False, gather_B=False,
+    has_cu_tiles_n=False,
+):
+    if not varlen_m and not varlen_k and not varlen_n:
         return None
     num_seqlens = cute.sym_int()
     return VarlenArguments(
@@ -335,6 +343,19 @@ def make_fake_varlen_args(varlen_m, varlen_k, gather_A, aidx_len, has_cu_tiles_m
         ),
         mCuSeqlensK=(
             fake_tensor(Int32, (num_seqlens,), leading_dim=0, divisibility=4) if varlen_k else None
+        ),
+        mCuSeqlensN=(
+            fake_tensor(Int32, (num_seqlens,), leading_dim=0, divisibility=4) if varlen_n else None
+        ),
+        mBIdx=(
+            fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=4)
+            if gather_B
+            else None
+        ),
+        mCuTilesN=(
+            fake_tensor(Int32, (num_seqlens,), leading_dim=0, divisibility=4)
+            if has_cu_tiles_n
+            else None
         ),
         mAIdx=(
             fake_tensor(Int32, (aidx_len,), leading_dim=0, divisibility=4) if gather_A else None
@@ -521,11 +542,15 @@ def make_fake_gemm_tensors(
     packed_cd=None,
     a_mma_dtype=None,
     b_mma_dtype=None,
+    varlen_n=False,
+    gather_B=False,
 ):
     """Create fake tensors for mA, mB, mD, mC with shared sym_ints.
     Pass dtype=None to get None for that tensor (e.g. optional C).
     Returns (mA, mB, mD, mC, m, n, k, l).
     When varlen_m, m is total_m (flattened M of D/C). When varlen_k, k is total_k.
+    When varlen_n (the AB-swapped grouped GEMM), n is total_n: A is per-batch
+    (l, m, k), B the flattened (total_n, k) and D/C (m, total_n).
 
     ``packed_cd`` ("n" | "m", dgated packed-native): D/C cross in their RAW
     16-bit dtype with the packed extent DOUBLE the f32 view's — it gets its
@@ -546,10 +571,15 @@ def make_fake_gemm_tensors(
     storage dtypes - a width-6 MMA dtype marks a packed-fp6 operand whose
     storage tensor is raw bytes.
     """
-    assert batched or not (varlen_m or varlen_k), "varlen operands are 2D already"
-    assert not (b_kn and varlen_k), "b_kn does not support varlen_k"
-    assert not (swap_ab and (varlen_m or varlen_k or b_kn)), "swap_ab: dense, b_kn folded in"
-    assert packed_cd is None or (not swap_ab and not varlen_k), "packed_cd: dense/varlen_m only"
+    assert batched or not (varlen_m or varlen_k or varlen_n), "varlen operands are 2D already"
+    assert not (b_kn and (varlen_k or varlen_n)), "b_kn does not support varlen_k / varlen_n"
+    assert not (swap_ab and (varlen_m or varlen_k or varlen_n or b_kn)), (
+        "swap_ab: dense, b_kn folded in"
+    )
+    assert packed_cd is None or (not swap_ab and not varlen_k and not varlen_n), (
+        "packed_cd: dense/varlen_m only"
+    )
+    assert not (varlen_n and gather_A), "varlen_n does not support gather_A"
     assert packed_cd != "m" or not varlen_m, "varlen packed C/D is n-major"
     a_leading = 1 if a_major == "k" else 0
     b_leading = 1 if b_major == "k" else 0
@@ -603,6 +633,15 @@ def make_fake_gemm_tensors(
         dc_n = pd if packed_cd is not None else n  # "n" form only under varlen
         mD = fake_batched(d_dtype, m, dc_n, None, d_leading, div_d)
         mC = fake_batched(c_dtype, m, dc_n, None, c_leading, div_c)
+    elif varlen_n:
+        # n is total_n: the flattened N dimension of B/D/C; A is per-batch.
+        # gather_B: B is the row pool the indices point into, its own row count.
+        n = cute.sym_int()
+        b_n = cute.sym_int() if gather_B else n
+        mA = fake_batched(a_dtype, m, a_k_sym, l, a_leading, div_a)
+        mB = fake_batched(b_dtype, b_n, b_k_sym, None, b_leading, div_b)
+        mD = fake_batched(d_dtype, m, n, None, d_leading, div_d)
+        mC = fake_batched(c_dtype, m, n, None, c_leading, div_c)
     elif varlen_k:
         # k is total_k in this case: the flattened K dimension of A/B
         k = cute.sym_int()
@@ -698,8 +737,10 @@ def compile_gemm_kernel(
     a_mma_dtype=None,
     b_mma_dtype=None,
     dist_op=None,  # the distributed operator (quack.gemm_base.DistOp): ctor kwarg + its dist_op_args fakes
+    gather_B=False,  # varlen_n: B rows by index (SM100)
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
+    assert not gather_B or device_capacity[0] in [10, 11], "gather_B is SM100 only"
     assert dist_op is None or device_capacity[0] in [9, 10, 11], (
         "distributed operators are SM90/SM100 only"
     )
@@ -749,6 +790,7 @@ def compile_gemm_kernel(
             b_mma_dtype=b_mma_dtype,
             **split_k_kwargs,
             **({"dist_op": dist_op} if dist_op is not None else {}),
+            **({"gather_B": True} if gather_B else {}),
         )
     gemm_obj = GemmCls(
         Float32,

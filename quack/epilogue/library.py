@@ -202,7 +202,7 @@ def swiglu_mod(acc):
 
 
 @functools.lru_cache(maxsize=None)
-def gated_quant_mod(activation):
+def gated_quant_mod(activation, pair_dim="n"):
     """gemm + gated activation + QUANTIZED postact (the MoE FC1 fusion):
     ``postact`` is fp8 e4m3 or packed fp4 values (its dtype picks
     mxfp8/mxfp4/nvfp4 together with the SF dtype), ``postact_sf`` the blocked
@@ -210,7 +210,10 @@ def gated_quant_mod(activation):
     HALF-width postact N), and the optional ``sfd_norm_const`` scalar folds
     1/per_tensor_scale into the SFs (nvfp4). SM100 only. SF vectors live in
     accumulator space — one vector of ``vec`` postact values spans 2*vec acc
-    columns — see BlockScaleFactorStore(output=...)."""
+    columns — see BlockScaleFactorStore(output=...).
+    pair_dim "m" (the swap-AB fc1: weights on M, gate/up rows interleaved per
+    8): the postact is (I, tokens) m-major and its SF vectors run along I, the
+    next GEMM's K (column direction; mint with pair_dim="m")."""
     act = gate_fn_map[activation]
 
     @gemm_epilogue(
@@ -218,7 +221,10 @@ def gated_quant_mod(activation):
             TileStore(
                 "postact",
                 gated=True,
-                quant=BlockScaleFactorStore("postact_sf", output="postact"),
+                pair_dim=pair_dim,
+                quant=BlockScaleFactorStore(
+                    "postact_sf", output="postact", direction="row" if pair_dim == "n" else "col"
+                ),
             ),
         ),
         extra_ops=(Scalar("sfd_norm_const"),),

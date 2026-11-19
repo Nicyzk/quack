@@ -16,6 +16,8 @@ from quack.cute_dsl_utils import mlir_namedtuple
 class VarlenArguments(NamedTuple):
     mCuSeqlensM: Optional[cute.Tensor] = None
     mCuSeqlensK: Optional[cute.Tensor] = None
+    # Variable-length N (swap-AB grouped GEMM: the ragged token dim rides B and D's N).
+    mCuSeqlensN: Optional[cute.Tensor] = None
     mAIdx: Optional[cute.Tensor] = None
     # Per-sequence M-tile prefix (num_seqs + 1,): cumsum of
     # ceil(seqlen / cta_tile_M). Host-computed (device tensor) and only passed
@@ -23,6 +25,22 @@ class VarlenArguments(NamedTuple):
     # sinks); the tile scheduler's m index is sequence-local, so a batchless
     # per-M-tile buffer needs this offset to keep sequences' rows disjoint.
     mCuTilesM: Optional[cute.Tensor] = None
+    # varlen_n row gather (swap-AB tokens on B): B row of GEMM row i is mBIdx[i], (total_n,)
+    mBIdx: Optional[cute.Tensor] = None
+    # varlen_n blockscaled: per-sequence even-split block prefix (num_seqs + 1,), cumsum of
+    # ceil(seqlen / tile_n); block slot cu_tiles_n[b] + j owns B's SF atoms for block j of sequence b.
+    mCuTilesN: Optional[cute.Tensor] = None
+
+
+VARLEN_N_GRANULE = 16  # the varlen_n even-split row granule (gemm_sm100.varlen_n_granule); runtime N is 16-granular
+
+
+@cute.jit
+def varlen_n_block_rows(n: Int32, tile_n: cutlass.Constexpr[int], granule: cutlass.Constexpr[int]) -> Int32:
+    """varlen_n even split: n rows cut into ceil(n / tile_n) blocks of ceil(n / blocks) rows rounded up to
+    `granule`, so no block is a thin tail. Shared by the kernel, the tile scheduler's gates and the walks."""
+    num_blocks = cute.ceil_div(n, tile_n)
+    return cute.ceil_div(cute.ceil_div(n, num_blocks), granule) * granule
 
 
 class VarlenManager:
@@ -30,8 +48,11 @@ class VarlenManager:
     class Params:
         cu_seqlens_m: Optional[cute.Tensor] = None
         cu_seqlens_k: Optional[cute.Tensor] = None
+        cu_seqlens_n: Optional[cute.Tensor] = None
         mAIdx: Optional[cute.Tensor] = None
         cu_tiles_m: Optional[cute.Tensor] = None
+        mBIdx: Optional[cute.Tensor] = None
+        cu_tiles_n: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -39,8 +60,11 @@ class VarlenManager:
             return VarlenManager.Params(
                 cu_seqlens_m=args.mCuSeqlensM,
                 cu_seqlens_k=args.mCuSeqlensK,
+                cu_seqlens_n=args.mCuSeqlensN,
                 mAIdx=args.mAIdx,
                 cu_tiles_m=args.mCuTilesM,
+                mBIdx=args.mBIdx,
+                cu_tiles_n=args.mCuTilesN,
             )
 
     def __init__(
@@ -63,15 +87,22 @@ class VarlenManager:
         self._is_group_changed = is_group_changed
         self.varlen_m = const_expr(params.cu_seqlens_m is not None)
         self.varlen_k = const_expr(params.cu_seqlens_k is not None)
+        self.varlen_n = const_expr(params.cu_seqlens_n is not None)
         self.gather_A = const_expr(params.mAIdx is not None)
+        self.gather_B = const_expr(params.mBIdx is not None)
         self._loc = loc
         self._ip = ip
 
     @staticmethod
     def to_underlying_arguments(args: VarlenArguments, *, loc=None, ip=None) -> Params:
-        assert not (args.mCuSeqlensM is not None and args.mCuSeqlensK is not None), (
-            "Only support either varlen_m or varlen_k"
+        num_varlen = sum(
+            t is not None for t in (args.mCuSeqlensM, args.mCuSeqlensK, args.mCuSeqlensN)
         )
+        assert num_varlen <= 1, "Only support one of varlen_m, varlen_k, varlen_n"
+        assert not (args.mCuSeqlensN is not None and args.mAIdx is not None), (
+            "varlen_n does not support gather_A"
+        )
+        assert args.mBIdx is None or args.mCuSeqlensN is not None, "gather_B needs varlen_n"
         return VarlenManager.Params.create(args, loc=loc, ip=ip)
 
     @staticmethod
@@ -104,10 +135,49 @@ class VarlenManager:
         else:
             return self._len_k_static
 
-    def len_n(self) -> Int32:
-        # N is never variable-length (no varlen_n), so this is always the
-        # static problem N (from mB) the kernel passed at construction.
-        return self._len_n_static
+    def len_n(self, batch_idx: Optional[Int32] = None) -> Int32:
+        if const_expr(self.varlen_n):
+            assert batch_idx is not None, "varlen_n: len_n needs the batch index"
+            return self.params.cu_seqlens_n[batch_idx + 1] - self.params.cu_seqlens_n[batch_idx]
+        else:
+            return self._len_n_static
+
+    # varlen_n even split (varlen_n_block_rows): block j covers rows [j * b, min((j + 1) * b, n)).
+    def block_n_rows(self, batch_idx: Int32, tile_n: int, granule: int) -> Int32:
+        return varlen_n_block_rows(self.len_n(batch_idx), tile_n, granule)
+
+    def block_n_valid(self, batch_idx: Int32, pid_n: Int32, tile_n: int, granule: int) -> Int32:
+        """Rows of block pid_n (the last block may be shorter)."""
+        b = self.block_n_rows(batch_idx, tile_n, granule)
+        return cutlass.min(b, self.len_n(batch_idx) - pid_n * b)
+
+    def offset_block_B(
+        self,
+        mB_nkl: cute.Tensor,
+        batch_idx: Int32,
+        pid_n: Int32,
+        tile_n: int,
+        granule: int,
+        row_shift: Int32 = Int32(0),
+    ) -> cute.Tensor:
+        """B at block pid_n's first row (+ row_shift; rows past the block are the next
+        block's, masked at the stores)."""
+        b = self.block_n_rows(batch_idx, tile_n, granule)
+        offset = self.params.cu_seqlens_n[batch_idx] + pid_n * b + row_shift
+        return cute.domain_offset((offset, None), mB_nkl)
+
+    def offset_block_epi(
+        self, mD_mnl: cute.Tensor, batch_idx: Int32, pid_n: Int32, tile_n: int, granule: int
+    ) -> cute.Tensor:
+        """D ragged to block pid_n: the TMA store clips columns past the block's rows."""
+        b = self.block_n_rows(batch_idx, tile_n, granule)
+        offset = self.params.cu_seqlens_n[batch_idx] + pid_n * b
+        length = cutlass.min(b, self.len_n(batch_idx) - pid_n * b)
+        ragged_rank = const_expr(cute.rank(mD_mnl))
+        assert ragged_rank > 2, "varlen_n D must be a ragged TMA tensor"
+        return copy_utils.offset_ragged_tensor(
+            mD_mnl, offset, length, ragged_dim=1, ptr_shift=const_expr(ragged_rank == 3)
+        )
 
     def tile_m_offset(self, batch_idx: Int32) -> Int32:
         """This sequence's first row in a per-M-tile buffer (cu_tiles_m prefix)."""
@@ -156,6 +226,14 @@ class VarlenManager:
             mA_mk = mA_mkl[None, None, batch_idx]
         return mA_mk
 
+    def offset_block_BIdx(
+        self, batch_idx: Int32, pid_n: Int32, tile_n: int, granule: int, row_shift: Int32
+    ) -> cute.Tensor:
+        """mBIdx at block pid_n's first row + row_shift (a CTA's share of the block)."""
+        b = self.block_n_rows(batch_idx, tile_n, granule)
+        offset = self.params.cu_seqlens_n[batch_idx] + pid_n * b + row_shift
+        return cute.domain_offset((offset,), self.params.mBIdx)
+
     def offset_batch_AIdx(self, batch_idx: Int32) -> cute.Tensor:
         params = self.params
         if const_expr(self.varlen_m):
@@ -202,6 +280,15 @@ class VarlenManager:
             return cute.domain_offset((None, offset_atom_k, None), mSFB_chunks[None, None, None, 0])
         else:
             return mSFB_chunks[None, None, None, batch_idx]
+
+    def offset_block_SFB(
+        self, mSFB_chunks: cute.Tensor, batch_idx: Int32, pid_n: Int32, atoms_per_block: int
+    ) -> cute.Tensor:
+        """varlen_n: the (chunk, RK, RN) SFB chunk view at block pid_n's atoms. Every even-split block owns
+        atoms_per_block 128-row SF atoms (the MMA's SF window) at block slot cu_tiles_n[batch] + pid_n, so a
+        tile's window always starts at an atom boundary whatever the block's row offset."""
+        slot = self.params.cu_tiles_n[batch_idx] + pid_n
+        return cute.domain_offset((None, None, slot * atoms_per_block), mSFB_chunks[None, None, None, 0])
 
     def offset_batch_B(self, mB_nkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
         params = self.params
