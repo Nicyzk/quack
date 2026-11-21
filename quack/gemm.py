@@ -35,8 +35,10 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_gemm_tensors,
     make_fake_sf_tensor,
     compile_gemm_kernel,
+    compute_cu_tiles_m,
     resolve_blockscaled_formats,
     validate_blockscaled_sf,
+    varlen_n_block_atoms,
     tensor_key,
     scalar_mode,
     scalar_arg,
@@ -92,7 +94,6 @@ def _compile_gemm(
     dist_op=None,  # the distributed operator (quack.gemm_base.DistOp; picklable, its state is the key)
     raster_order=RasterOrderOption.Heuristic,
     varlen_n=False,
-    gather_B=False,
 ):
     sm_to_cls = {
         8: GemmDefaultSm80,
@@ -119,7 +120,6 @@ def _compile_gemm(
         a_mma_dtype=a_mma_dtype,
         b_mma_dtype=b_mma_dtype,
         varlen_n=varlen_n,
-        gather_B=gather_B,
     )
     if split_k > 1 and split_k_mode == SplitKMode.SEPARATE:
         # D is the f32 partials workspace; its batch extent is l * split_k, not l,
@@ -128,12 +128,12 @@ def _compile_gemm(
             d_dtype, m, n, cute.sym_int(), 1 if d_major == "n" else 0, 128 // d_dtype.width
         )
     if dist_op is not None:
-        # the operator's D has its own M extent (d_shape): untie it from A's M in the signature
+        # the operator's D has its own M extent (d_shape): untie it from A's M in the signature (varlen: 2-D)
         mD = fake_batched(
             d_dtype,
             cute.sym_int(),
             n,
-            l if batched else None,
+            l if batched and not (varlen_m or varlen_n) else None,
             1 if d_major == "n" else 0,
             128 // d_dtype.width,
         )
@@ -200,16 +200,22 @@ def _compile_gemm(
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(
-        varlen_m, varlen_k, gather_A, aidx_len, varlen_n=varlen_n, gather_B=gather_B
+        varlen_m,
+        varlen_k,
+        gather_A,
+        aidx_len,
+        varlen_n=varlen_n,
+        has_cu_tiles_n=varlen_n and sf_dtype is not None,
     )
     if sf_dtype is not None:
         # Padded SF buffers have a static batch dim of exactly 1 (not l): SFA for
         # varlen_m (M-padded) and varlen_k (K-padded); SFB is K-padded too for
-        # varlen_k but stays per-batch (l, rn, rk, ...) for varlen_m. Dense
-        # unbatched (5-D) SFs get the batch mode prepended at trace time.
+        # varlen_k but stays per-batch (l, rn, rk, ...) for varlen_m; varlen_n's SFB is the
+        # per-block atoms (batch 1). Dense unbatched (5-D) SFs get the batch mode prepended
+        # at trace time.
         dense_l = l if sf_batched else None
         mSFA = make_fake_sf_tensor(sf_dtype, 1 if (varlen_m or varlen_k) else dense_l)
-        mSFB = make_fake_sf_tensor(sf_dtype, 1 if varlen_k else dense_l)
+        mSFB = make_fake_sf_tensor(sf_dtype, 1 if (varlen_k or varlen_n) else dense_l)
     else:
         mSFA, mSFB = None, None
     return compile_gemm_kernel(
@@ -241,7 +247,6 @@ def _compile_gemm(
         a_mma_dtype=a_mma_dtype,
         b_mma_dtype=b_mma_dtype,
         dist_op=dist_op,
-        gather_B=gather_B,
     )
 
 
@@ -277,6 +282,8 @@ class _GemmPlan(NamedTuple):
     cluster_M: int
     cluster_N: int
     dist_op: object  # the operator: its make_scheduler_args(dist_op_args) is the per-call tile order
+    # varlen_n blockscaled: tile_n for the per-call cu_tiles_n prefix (None = not needed)
+    cu_tiles_tile_n: Optional[int] = None
 
 
 # (metadata key) -> _GemmPlan. Grows with distinct (shape, stride, dtype, flag)
@@ -448,10 +455,8 @@ def gemm(
     dist_op=None,
     dist_op_args=None,
     # varlen_n (the AB-swapped grouped GEMM): A is per-batch (l, m, k), B the flattened
-    # (total_n, k) and D (m, total_n) m-major; (l+1,) cumulative n. B_idx (total_n,): B's rows
-    # by index (gather_B, SM100).
+    # (total_n, k) and D (m, total_n) m-major; (l+1,) cumulative n.
     cu_seqlens_n: Optional[Tensor] = None,
-    B_idx: Optional[Tensor] = None,
 ) -> _GemmPlan:
     alpha_mode = scalar_mode(alpha)
     beta_mode = scalar_mode(beta)
@@ -478,7 +483,6 @@ def gemm(
         tensor_key(cu_seqlens_k),
         tensor_key(cu_seqlens_n),
         A_idx is not None,
-        B_idx is not None,
         batch_idx_permute is not None,
         tile_count_semaphore is not None,
         A.device,
@@ -556,7 +560,6 @@ def gemm(
             sfd_norm_const=sfd_norm_const,
             SFDCol=SFDCol,
             cu_seqlens_n=cu_seqlens_n,
-            B_idx=B_idx,
         )
         _gemm_plan_cache[key] = plan
     run_gemm_plan(
@@ -582,7 +585,6 @@ def gemm(
         sfd_norm_const=sfd_norm_const,
         SFDCol=SFDCol,
         cu_seqlens_n=cu_seqlens_n,
-        B_idx=B_idx,
     )
     return plan
 
@@ -612,7 +614,6 @@ def run_gemm_plan(
     sfd_norm_const: Optional[float | Tensor] = None,
     SFDCol: Optional[Tensor] = None,
     cu_seqlens_n: Optional[Tensor] = None,
-    B_idx: Optional[Tensor] = None,
 ) -> None:
     """Launch a resolved plan: only per-call pointers and scalar values here.
 
@@ -669,8 +670,17 @@ def run_gemm_plan(
     scheduler_args = plan_scheduler_args(
         plan, tile_count_semaphore, batch_idx_permute, dist_op_args, A=A
     )
+    cu_tiles_n = (
+        compute_cu_tiles_m(cu_seqlens_n, plan.cu_tiles_tile_n)
+        if plan.cu_tiles_tile_n is not None
+        else None
+    )
     varlen_args = make_varlen_args(
-        cu_seqlens_m, cu_seqlens_k, A_idx, cu_seqlens_n=cu_seqlens_n, B_idx=B_idx
+        cu_seqlens_m,
+        cu_seqlens_k,
+        A_idx,
+        cu_seqlens_n=cu_seqlens_n,
+        cu_tiles_n=cu_tiles_n,
     )
 
     launch_gemm(
@@ -735,14 +745,12 @@ def _build_gemm_plan(
     sfd_norm_const=None,
     SFDCol=None,
     cu_seqlens_n=None,
-    B_idx=None,
 ) -> _GemmPlan:
     varlen_m = cu_seqlens_m is not None
     varlen_k = cu_seqlens_k is not None
     varlen_n = cu_seqlens_n is not None
     varlen = varlen_m or varlen_k or varlen_n
     gather_A = A_idx is not None
-    gather_B = B_idx is not None
     blockscaled = SFA is not None
     assert varlen_m + varlen_k + varlen_n <= 1, "Only one of cu_seqlens_m / _k / _n"
     if varlen_n:
@@ -750,19 +758,19 @@ def _build_gemm_plan(
         assert B.ndim == 2 and B.stride(-1) == 1, "varlen_n requires B (total_n, k) k-major"
         assert D.ndim == 2 and D.stride(0) == 1, "varlen_n requires D (m, total_n) m-major"
         assert C is None, "varlen_n does not support C yet"
-        assert not (gather_A or blockscaled or add_to_output or concat_layout or b_kn), (
+        assert not (gather_A or add_to_output or concat_layout or b_kn), (
             "varlen_n supports the plain GEMM only"
         )
         assert rowvec_bias is None and colvec_bias is None, "varlen_n: no bias yet"
         assert SFD is None and SFDCol is None and split_k == 1
-    if gather_B:
-        assert varlen_n, "gather_B requires varlen_n"
-        assert cluster_N == 1, "gather_B requires cluster_N=1"
     if gather_A:
         assert varlen, "gather_A requires varlen"
         assert cluster_N == 1, "gather_A requires cluster_N=1"
     if dist_op is not None:
-        assert not varlen and not gather_A, "dist_op requires a dense GEMM"
+        ragged = "m" if varlen_m else "n" if varlen_n else None
+        assert ragged == dist_op.ragged_dim and not varlen_k, (
+            f"dist_op runs on ragged dim {dist_op.ragged_dim!r}, the call is {ragged!r}"
+        )
         assert persistent, "dist_op requires the persistent scheduler"
         assert split_k == 1, "dist_op does not support split_k"
         raster_order = dist_op_raster_order(dist_op, raster_order)
@@ -827,6 +835,8 @@ def _build_gemm_plan(
             b_kn=b_kn,
             fmt_a=fmt_a,
             fmt_b=fmt_b,
+            sfb_block_atoms=varlen_n_block_atoms(tile_N) if varlen_n else None,
+            total_n=B.shape[0] if varlen_n else None,
         )
     if split_k > 1 and device_capacity[0] not in [9, 10, 11, 12]:
         raise ValueError("split_k > 1 requires SM90, SM100, SM110, or SM120")
@@ -998,7 +1008,6 @@ def _build_gemm_plan(
         dist_op,
         raster_order,
         varlen_n,
-        gather_B,
     )
 
     cluster_size = cluster_M * cluster_N * cluster_K
@@ -1056,4 +1065,5 @@ def _build_gemm_plan(
         cluster_M=cluster_M,
         cluster_N=cluster_N,
         dist_op=dist_op,
+        cu_tiles_tile_n=tile_N if varlen_n and blockscaled else None,
     )

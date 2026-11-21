@@ -88,6 +88,9 @@ class DistOp:
     runs_evt = False
     # the tile raster the operator needs (RasterOrderOption); None: the caller's
     raster_order = None
+    # the ragged GEMM dim the operator runs on: None dense, "m" (cu_seqlens_m: rows are tokens), "n"
+    # (cu_seqlens_n: the swap-AB grouped GEMM); the host admits only a call of that shape
+    ragged_dim = None
 
     def smem_bytes(self, gemm) -> int:
         """Bytes off the A/B/epilogue stage budget (smem_struct's size)."""
@@ -984,15 +987,9 @@ class GemmBase:
                 None,
                 varlen_args.mCuSeqlensN.shape[0] - 1,
             )
-            # The ragged dim's rows bound the grid; under gather_B mB is the row pool, not the rows
-            total_n = (
-                varlen_args.mBIdx.shape[0]
-                if const_expr(varlen_args.mBIdx is not None)
-                else cute.size(mB, mode=[0])
-            )
             tile_sched_args = VarlenMTileSchedulerArguments(
                 problem_shape_ntile_mnl=problem_shape_ntile_mnl,
-                total_m=total_n,
+                total_m=cute.size(mB, mode=[0]),  # the ragged dim's rows bound the grid
                 cu_seqlens_m=varlen_args.mCuSeqlensN,
                 raster_order=scheduler_args.raster_order,
                 group_size=scheduler_args.max_swizzle_size,

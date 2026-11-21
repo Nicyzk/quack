@@ -202,7 +202,7 @@ def swiglu_mod(acc):
 
 
 @functools.lru_cache(maxsize=None)
-def gated_quant_mod(activation, pair_dim="n"):
+def gated_quant_mod(activation, pair_dim="n", has_alpha=False):
     """gemm + gated activation + QUANTIZED postact (the MoE FC1 fusion):
     ``postact`` is fp8 e4m3 or packed fp4 values (its dtype picks
     mxfp8/mxfp4/nvfp4 together with the SF dtype), ``postact_sf`` the blocked
@@ -213,10 +213,11 @@ def gated_quant_mod(activation, pair_dim="n"):
     columns — see BlockScaleFactorStore(output=...).
     pair_dim "m" (the swap-AB fc1: weights on M, gate/up rows interleaved per
     8): the postact is (I, tokens) m-major and its SF vectors run along I, the
-    next GEMM's K (column direction; mint with pair_dim="m")."""
+    next GEMM's K (column direction; mint with pair_dim="m").
+    has_alpha: the ``alpha`` scalar scales the accumulator before the
+    activation (nvfp4 inputs' per-tensor scales), as in linear_act_mod."""
     act = gate_fn_map[activation]
-
-    @gemm_epilogue(
+    decorate = gemm_epilogue(
         outputs=(
             TileStore(
                 "postact",
@@ -229,12 +230,21 @@ def gated_quant_mod(activation, pair_dim="n"):
         ),
         extra_ops=(Scalar("sfd_norm_const"),),
         mode="acc_pair",
+        ops={"alpha": Scalar("alpha")} if has_alpha else None,
     )
-    def gated_quant_epi(acc):
-        gate, up = unpack(acc)
-        return {"postact": act(gate, up)}
+    if has_alpha:
 
-    return gated_quant_epi
+        def gated_quant_epi(acc, alpha):
+            gate, up = unpack(acc * alpha)
+            return {"postact": act(gate, up)}
+
+    else:
+
+        def gated_quant_epi(acc):
+            gate, up = unpack(acc)
+            return {"postact": act(gate, up)}
+
+    return decorate(gated_quant_epi)
 
 
 swiglu_quant_mod = gated_quant_mod("swiglu")

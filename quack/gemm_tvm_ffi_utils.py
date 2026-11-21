@@ -67,8 +67,25 @@ def _validate_tma_unpack_operands(A, B):
             _validate_tma_unpack_alignment(name, tensor, str(tensor.dtype))
 
 
+def varlen_n_block_atoms(tile_n):
+    """Host twin of GemmSm100.sfb_window_atoms: 128-row SF atoms per varlen_n even-split block."""
+    return -(-tile_n // 128)
+
+
 def validate_blockscaled_sf(
-    A, B, SFA, SFB, device_capacity, num_batches=None, varlen_k=False, b_kn=False, *, fmt_a, fmt_b
+    A,
+    B,
+    SFA,
+    SFB,
+    device_capacity,
+    num_batches=None,
+    varlen_k=False,
+    b_kn=False,
+    *,
+    fmt_a,
+    fmt_b,
+    sfb_block_atoms=None,  # varlen_n: SFB holds this many atoms per even-split block
+    total_n=None,  # varlen_n: the GEMM's N (B's rows)
 ):
     """Validate blockscaled scale factors against kernel-layout operands.
 
@@ -103,6 +120,11 @@ def validate_blockscaled_sf(
     never consumed: the mma loop skips the MMA instructions for pad k-blocks
     (one instruction per SF block for mxfp8; see GemmSm100.mma), so the pad
     may be arbitrary bytes — torch.empty buffers are fine.
+
+    When sfb_block_atoms is set (varlen_n), A is (num_seqs, m, k) with a per-batch
+    SFA, and SFB holds B's scales in per-block atoms, (1, slots * atoms, rk, 32, 4, 4):
+    even-split block j of sequence b owns slot cu_tiles_n[b] + j. The slot count is
+    device-side (cumsum of ceil(seqlen / tile_n)), so only its lower bound is checked.
     Returns (sf_dtype, sf_vec_size) as (cutlass dtype, int).
     """
     varlen_m = num_batches is not None and not varlen_k
@@ -198,6 +220,21 @@ def validate_blockscaled_sf(
             f"SFA padded rm {SFA.shape[1]} < ceil(total_m/128) + (L-1) = {min_rm}"
         )
         shapes = [("SFB", SFB, (num_batches, (B.shape[-2] + 127) // 128, rk, 32, 4, 4))]
+    elif sfb_block_atoms is not None:
+        assert A.ndim == 3, f"varlen_n expects A as (num_seqs, m, k), got shape {tuple(A.shape)}"
+        l, atoms = A.shape[0], sfb_block_atoms
+        # slots >= num_seqs and >= ceil(total_n / tile_n) >= ceil(total_n / (128 * atoms))
+        min_atoms = atoms * max(l, -(-total_n // (128 * atoms)))
+        assert (
+            SFB.ndim == 6
+            and SFB.shape[0] == 1
+            and SFB.shape[1] % atoms == 0
+            and tuple(SFB.shape[2:]) == (rk, 32, 4, 4)
+        ), f"varlen_n SFB shape {tuple(SFB.shape)} != (1, slots * {atoms}, {rk}, 32, 4, 4)"
+        assert SFB.shape[1] >= min_atoms, (
+            f"varlen_n SFB atoms {SFB.shape[1]} < {min_atoms} (the per-block slots cannot fit)"
+        )
+        shapes = [("SFA", SFA, (l, (A.shape[-2] + 127) // 128, rk, 32, 4, 4))]
     else:
         # Dense: 2D operands may carry unbatched 5-D SFs (the kernel prepends
         # the trivial batch mode at trace time) or single-batch 6-D ones.
@@ -303,7 +340,7 @@ def make_fake_scheduler_args(
 
 
 def make_varlen_args(
-    cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=None, cu_seqlens_n=None, B_idx=None, cu_tiles_n=None
+    cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=None, cu_seqlens_n=None, cu_tiles_n=None
 ):
     if cu_seqlens_m is None and cu_seqlens_k is None and cu_seqlens_n is None:
         return None
@@ -313,7 +350,6 @@ def make_varlen_args(
         mCuSeqlensN=cu_seqlens_n,
         mAIdx=A_idx,
         mCuTilesM=cu_tiles_m,
-        mBIdx=B_idx,
         mCuTilesN=cu_tiles_n,
     )
 
@@ -321,6 +357,7 @@ def make_varlen_args(
 def compute_cu_tiles_m(cu_seqlens_m, tile_m_cta):
     """Per-sequence M-tile prefix for varlen M-fold reduce sinks:
     cumsum of ceil(seqlen / tile_m_cta), zero-padded, (num_seqs + 1,) int32.
+    The same prefix over N (cu_seqlens_n, tile_n) is varlen_n blockscaled's cu_tiles_n.
     Device-only ops (graph-safe); recomputed per launch from the live
     cu_seqlens values."""
     import torch
@@ -331,8 +368,7 @@ def compute_cu_tiles_m(cu_seqlens_m, tile_m_cta):
 
 
 def make_fake_varlen_args(
-    varlen_m, varlen_k, gather_A, aidx_len, has_cu_tiles_m=False, varlen_n=False, gather_B=False,
-    has_cu_tiles_n=False,
+    varlen_m, varlen_k, gather_A, aidx_len, has_cu_tiles_m=False, varlen_n=False, has_cu_tiles_n=False
 ):
     if not varlen_m and not varlen_k and not varlen_n:
         return None
@@ -346,11 +382,6 @@ def make_fake_varlen_args(
         ),
         mCuSeqlensN=(
             fake_tensor(Int32, (num_seqlens,), leading_dim=0, divisibility=4) if varlen_n else None
-        ),
-        mBIdx=(
-            fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=4)
-            if gather_B
-            else None
         ),
         mCuTilesN=(
             fake_tensor(Int32, (num_seqlens,), leading_dim=0, divisibility=4)
@@ -543,7 +574,6 @@ def make_fake_gemm_tensors(
     a_mma_dtype=None,
     b_mma_dtype=None,
     varlen_n=False,
-    gather_B=False,
 ):
     """Create fake tensors for mA, mB, mD, mC with shared sym_ints.
     Pass dtype=None to get None for that tensor (e.g. optional C).
@@ -635,11 +665,9 @@ def make_fake_gemm_tensors(
         mC = fake_batched(c_dtype, m, dc_n, None, c_leading, div_c)
     elif varlen_n:
         # n is total_n: the flattened N dimension of B/D/C; A is per-batch.
-        # gather_B: B is the row pool the indices point into, its own row count.
         n = cute.sym_int()
-        b_n = cute.sym_int() if gather_B else n
         mA = fake_batched(a_dtype, m, a_k_sym, l, a_leading, div_a)
-        mB = fake_batched(b_dtype, b_n, b_k_sym, None, b_leading, div_b)
+        mB = fake_batched(b_dtype, n, b_k_sym, None, b_leading, div_b)
         mD = fake_batched(d_dtype, m, n, None, d_leading, div_d)
         mC = fake_batched(c_dtype, m, n, None, c_leading, div_c)
     elif varlen_k:
@@ -737,10 +765,8 @@ def compile_gemm_kernel(
     a_mma_dtype=None,
     b_mma_dtype=None,
     dist_op=None,  # the distributed operator (quack.gemm_base.DistOp): ctor kwarg + its dist_op_args fakes
-    gather_B=False,  # varlen_n: B rows by index (SM100)
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
-    assert not gather_B or device_capacity[0] in [10, 11], "gather_B is SM100 only"
     assert dist_op is None or device_capacity[0] in [9, 10, 11], (
         "distributed operators are SM90/SM100 only"
     )
@@ -790,7 +816,6 @@ def compile_gemm_kernel(
             b_mma_dtype=b_mma_dtype,
             **split_k_kwargs,
             **({"dist_op": dist_op} if dist_op is not None else {}),
-            **({"gather_B": True} if gather_B else {}),
         )
     gemm_obj = GemmCls(
         Float32,

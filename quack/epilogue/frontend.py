@@ -70,7 +70,11 @@ guesses about vectorization.
   statistics must see is explicit duplicate math in fn2 — by design.
 * VARLEN: pass ``cu_seqlens_m`` (and ``A_idx`` for gather); operands/outputs
   are (total_m, ...) shaped, colvecs rank-1. No prepass or TileLoad under
-  varlen yet.
+  varlen yet. ``cu_seqlens_n`` is the swap-AB grouped GEMM:
+  A (num_seqs, m, k) per-sequence weights, B (total_n, k) the flattened rows,
+  D / tile outputs (m, total_n) m-major, a gated mod pairs over M rows; scalar
+  operands only (SM100). Blockscaled: SFA per sequence, SFB in per-block atoms
+  (``validate_blockscaled_sf``), the ``cu_tiles_n`` prefix is built at launch.
 
 Value ports (how new ops join the fn dataflow)
 ----------------------------------------------
@@ -598,6 +602,7 @@ class EpiMod:
         tile_count_semaphore=None,
         cu_seqlens_m=None,
         A_idx=None,
+        cu_seqlens_n=None,  # the swap-AB grouped GEMM (see VARLEN in the module docstring)
         rounding_mode: int = RoundingMode.RN,
         epi_key_overrides=None,  # {op_name: key} when the caller owns the key rule (scalar modes)
         b_kn: bool = False,  # B passed (k, n) / (l, k, n), relabeled at trace time (dense SM90+)
@@ -617,7 +622,7 @@ class EpiMod:
         #                               accumulate traffic of C=D). The fn still
         #                               returns the DELTA; requires C=None.
         dist_op=None,  # the distributed operator (quack/distributed/, a DistOp): D is the tensor it stores
-        #                into (out={"D": d}), dist_op_args its bundle; dense persistent only
+        #                into (out={"D": d}), dist_op_args its bundle; persistent, on its ragged_dim
         dist_op_args=None,  # the operator's per-call bundle
         # A-operand transform (SM90 RS / SM120 warp-MMA mainloop). Value
         # transforms leave the
@@ -638,6 +643,7 @@ class EpiMod:
     ) -> GemmEpiPlan:
         varlen_m = cu_seqlens_m is not None
         gather_A = A_idx is not None
+        varlen_n = cu_seqlens_n is not None
         blockscaled = SFA is not None
         concat_key = tuple(sorted(concat_layout)) if concat_layout else ()
         owned_fmt = None
@@ -713,17 +719,20 @@ class EpiMod:
         if dist_op is not None:
             if dist_op_args is None:
                 raise ValueError("dist_op requires its dist_op_args bundle")
-            if D is None:
-                raise ValueError("dist_op requires D (the tensor the operator stores into)")
+            if D is None and dist_op.runs_evt:
+                raise ValueError("dist_op: the partial the operator reduces is staged into D, pass D")
             if not persistent:
                 raise ValueError("dist_op: persistent scheduler only")
             if dist_op.num_warps and is_dynamic_persistent:
                 raise ValueError("comm warps mirror the static schedule: no CLC")
+            ragged = "m" if varlen_m else "n" if varlen_n else None
+            if ragged != dist_op.ragged_dim:
+                raise ValueError(
+                    f"dist_op runs on ragged dim {dist_op.ragged_dim!r}, the call is {ragged!r}"
+                )
             # swap_ab: kernel-A is the caller's B, so a gate on A would gate the wrong operand
-            if varlen_m or gather_A or concat_key or swap_ab or split_k > 1:
-                raise ValueError("dist_op: dense GEMM only (no varlen/gather/concat/swap_ab/split_k)")
-            if blockscaled and dist_op.num_warps:
-                raise ValueError("dist_op with comm warps: non-blockscaled GEMM only")
+            if concat_key or swap_ab or split_k > 1:
+                raise ValueError("dist_op: no concat_layout / swap_ab / split_k")
             if transform_a is not None:
                 raise ValueError("dist_op does not compose with transform_a")
             dist_op_key = dist_op.plan_key()
@@ -754,6 +763,7 @@ class EpiMod:
             A.device,
             tensor_key(cu_seqlens_m),
             gather_A,
+            tensor_key(cu_seqlens_n),
             rounding_mode,
             b_kn,
             use_tma_gather,
@@ -803,11 +813,31 @@ class EpiMod:
                     tile_count_semaphore=tile_count_semaphore,
                     cu_seqlens_m=cu_seqlens_m,
                     A_idx=A_idx,
+                    cu_seqlens_n=cu_seqlens_n,
                     SFA=SFA,
                     SFB=SFB,
                     split_k_buffers=split_k_buffers,
                 )
             return plan
+        if varlen_n:
+            num_seqs = cu_seqlens_n.shape[0] - 1
+            if varlen_m or gather_A or concat_key or swap_ab or b_kn or split_k > 1:
+                raise ValueError(
+                    "varlen_n: the plain or gated swap-AB GEMM only (no varlen_m / gather_A / "
+                    "concat_layout / swap_ab / b_kn / split_k through this path)"
+                )
+            if not persistent:
+                raise ValueError("varlen_n requires persistent=True")
+            if A.ndim != 3 or A.shape[0] != num_seqs or A.stride(-1) != 1:
+                raise ValueError(f"varlen_n: A is (num_seqs={num_seqs}, m, k), k-major")
+            if B.ndim != 2 or B.stride(-1) != 1:
+                raise ValueError("varlen_n: B is (total_n, k), k-major")
+            if D is not None and (D.ndim != 2 or D.stride(0) != 1):
+                raise ValueError("varlen_n: D is (m, total_n), m-major")
+            if C is not None or add_to_output or self.prepass is not None or self.sinks:
+                raise ValueError("varlen_n: no C, add_to_output, prepass or sinks yet")
+            if any(not isinstance(self.ops.get(name), Scalar) for name in self.operand_names):
+                raise ValueError("varlen_n: scalar epilogue operands only (no vec / tile loads)")
         if blockscaled:
             if varlen_m or gather_A:
                 raise ValueError("blockscaled GEMM does not support varlen/gather yet")
@@ -844,7 +874,8 @@ class EpiMod:
         # kernel coords.
         paired_acc = self.mode == "acc_pair"
         packed_c = self.mode == "packed_cd_b16x2"
-        if paired_acc and (n_gemm % 2 or tile_N % 2):
+        pair_dim = "m" if varlen_n else "n"  # swap-AB gated: the acc pairs over M rows, outputs m-major
+        if paired_acc and pair_dim == "n" and (n_gemm % 2 or tile_N % 2):
             raise ValueError("acc_pair mode requires even GEMM N and tile_N")
         post_init_attrs = tuple(post_init_attrs)
         packed_form = None
@@ -876,6 +907,8 @@ class EpiMod:
             m = ref_t.shape[0]
         else:
             m = A.shape[-2]
+        if paired_acc and pair_dim == "m" and (m % 2 or tile_M % 2):
+            raise ValueError("acc_pair over M requires even GEMM M and tile_M")
         # Inference/vec-check dims in kernel coords; base_shape (D/C/outputs)
         # stays caller-oriented (swap-at-trace transposes those at trace).
         m_i, n_i = (n_gemm, m) if (swap_ab or owned_fmt is not None) else (m, n_gemm)
@@ -915,10 +948,18 @@ class EpiMod:
             import torch
 
             aux = epi_args[out_name]
-            out_n = n_gemm // 2 if paired_acc else n_gemm
-            if aux.dtype == torch.float4_e2m1fn_x2:
-                out_n //= 2  # fp4 values are stored packed, two per byte
-            _require_shape(out_name, aux, _tile_shape(batch, m, out_n, varlen_m))
+            out_m, out_n = m, n_gemm
+            if paired_acc:
+                if pair_dim == "m":
+                    out_m //= 2
+                else:
+                    out_n //= 2
+            if aux.dtype == torch.float4_e2m1fn_x2:  # fp4 values are stored packed, two per byte
+                if pair_dim == "m":  # along the contiguous dim: M for the M-paired (m-major) aux
+                    out_m //= 2
+                else:
+                    out_n //= 2
+            _require_shape(out_name, aux, _tile_shape(batch, out_m, out_n, varlen_m))
             if paired_acc:
                 # fp8/fp4 gated aux = quantized postact (SM100-only; the
                 # TileStore op asserts the arch at trace time).
@@ -928,8 +969,11 @@ class EpiMod:
                     torch.float4_e2m1fn_x2,
                 ):
                     raise TypeError("acc_pair auxiliary output must be 16-bit (or fp8/fp4)")
-                if aux.stride(-1) != 1 or (D is not None and D.stride(-1) != 1):
-                    raise ValueError("acc_pair auxiliary output and D must be N-major")
+                lead = 0 if pair_dim == "m" else -1
+                if aux.stride(lead) != 1 or (D is not None and D.stride(lead) != 1):
+                    raise ValueError(
+                        f"acc_pair auxiliary output and D must be {pair_dim.upper()}-major"
+                    )
         # Swap-at-trace relabels pinned vec pins into KERNEL coordinates: a
         # caller colvec is the swapped kernel's rowvec (and vice versa), so the
         # pin's class flips for this call. Other orientation-sensitive vec pins
@@ -1074,13 +1118,23 @@ class EpiMod:
             from quack.gemm_tvm_ffi_utils import (
                 resolve_blockscaled_formats,
                 validate_blockscaled_sf,
+                varlen_n_block_atoms,
             )
 
             fmt_a, fmt_b = resolve_blockscaled_formats(bs_format_a, bs_format_b)
             a_mma_dtype = fmt_a.to_cutlass_dtype()
             b_mma_dtype = fmt_b.to_cutlass_dtype()
             sf_dtype, sf_vec_size = validate_blockscaled_sf(
-                A, B, SFA, SFB, device_capacity, b_kn=b_kn, fmt_a=fmt_a, fmt_b=fmt_b
+                A,
+                B,
+                SFA,
+                SFB,
+                device_capacity,
+                b_kn=b_kn,
+                fmt_a=fmt_a,
+                fmt_b=fmt_b,
+                sfb_block_atoms=varlen_n_block_atoms(tile_N) if varlen_n else None,
+                total_n=n_gemm if varlen_n else None,
             )
         # Re-map pinned ops' kind for the device loop: explicit pins still
         # need a fragment kind; VecLoads present as their dim.
@@ -1116,6 +1170,7 @@ class EpiMod:
             rounding_mode,
             arg_forms,
             add_to_output,
+            pair_dim,
         )
         GemmCls = self._mint(*mint_key)
         plan = build_gemm_epi_plan(
@@ -1139,6 +1194,7 @@ class EpiMod:
             raster_order=raster_order,
             varlen_m=varlen_m,
             gather_A=gather_A,
+            varlen_n=varlen_n,
             # slot-A relabels via a_transposed (swap_ab); owned transforms
             # pass B (= caller A activations) natively (n, k)
             b_kn=b_kn and not swap_ab and owned_fmt is None,
@@ -1171,6 +1227,7 @@ class EpiMod:
                 tile_count_semaphore=tile_count_semaphore,
                 cu_seqlens_m=cu_seqlens_m,
                 A_idx=A_idx,
+                cu_seqlens_n=cu_seqlens_n,
                 SFA=SFA,
                 SFB=SFB,
                 split_k_buffers=split_k_buffers,

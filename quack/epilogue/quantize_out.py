@@ -242,10 +242,11 @@ class BlockScaleFactorStore(EpiOp):
 
     def host_fake_arg(self, key, fctx):
         # Blocked (L, rm, rk, 32, 4, 4) fake; varlen_m SFD is one M-padded
-        # buffer with a static batch dim of 1 (same convention as input SFA).
+        # buffer with a static batch dim of 1 (same convention as input SFA),
+        # varlen_n's is the consumer's per-block atoms (batch 1 as well).
         dtype, ndim = key
         assert ndim == 6, f"SFD expects a 6-D blocked scale tensor, got ndim {ndim}"
-        return make_fake_sf_tensor(dtype, 1 if fctx.varlen_m else fctx.l)
+        return make_fake_sf_tensor(dtype, 1 if (fctx.varlen_m or fctx.varlen_n) else fctx.l)
 
     def _vec_attr(self):
         return f"_sf_vec_{self.name}"
@@ -380,17 +381,18 @@ class BlockScaleFactorStore(EpiOp):
                 f"epi tile M ({epi_m}) must cover whole SF vectors of {vec} rows"
             )
         if self._aux_col():
-            assert gemm.arch == 100 and vec == 32, "M-paired aux quantization: SM100, 32-row (mx) vectors"
+            assert gemm.arch == 100 and vec in (16, 32), "M-paired aux quantization: SM100, 16/32-row vectors"
             # Host-side ints for the device: the epi tile's layouts are host-region values, so
             # neither cute.size nor .shape on them may run inside the kernel.
             epi_n = cute.size(gemm.epi_tile[1])
             assert isinstance(epi_n, int) and epi_n % 8 == 0, epi_n
             setattr(gemm, self._epi_n_attr(), epi_n)
-            setattr(
-                gemm,
-                self._xw_shape_attr(),
-                (gemm.cta_tile_shape_mnk[0] // 2 // vec, epi_n, gemm.epi_smem_warp_shape_mnk()[0], 2),
-            )
+            if vec == 32:  # a 32-row vector spans a warp pair (16 postact rows per warp); 16 is warp-local
+                setattr(
+                    gemm,
+                    self._xw_shape_attr(),
+                    (gemm.cta_tile_shape_mnk[0] // 2 // vec, epi_n, gemm.epi_smem_warp_shape_mnk()[0], 2),
+                )
         setattr(gemm, self._vec_attr(), vec)
         setattr(gemm, self._sf_dtype_attr(), sf_dtype)
         setattr(gemm, self._val_dtype_attr(), val_dtype)
@@ -440,8 +442,9 @@ class BlockScaleFactorStore(EpiOp):
         if warp_shape_mnk is None:
             return False
         if self._aux_col():
-            # M-paired aux: a 32-row vector spans a warp pair (16 postact rows per warp).
-            return True
+            # M-paired aux: a 32-row vector spans a warp pair (16 postact rows per warp), a 16-row one
+            # (nvfp4) is warp-local; vec_eff carries the aux doubling
+            return vec_eff > 32
         if self.direction == "col":
             # Slot-machinery col only (SM120 warp MMA: 16-row warp M stripes
             # vs the 32-row vector). SM100's dedicated redux path needs no
@@ -475,7 +478,7 @@ class BlockScaleFactorStore(EpiOp):
         exchange is not needed — the shared guard of the two smem hooks (the
         exact geometry, unlike smem_bytes' conservative budget)."""
         if self._aux_col():
-            return getattr(gemm, self._xw_shape_attr())  # host-computed (see _to_params_col)
+            return getattr(gemm, self._xw_shape_attr(), None)  # host-computed (see _to_params_col)
         vec_acc = getattr(gemm, self._vec_attr())
         run = getattr(gemm, "mma_n_warp_run", 16)
         warp_shape = gemm.epi_smem_warp_shape_mnk()
@@ -685,7 +688,8 @@ class BlockScaleFactorStore(EpiOp):
         thread t of epilogue warp w holding rows 16w + t/4 and 16w + 8 + t/4, so a 32-row SF vector is a warp
         pair (see sfd_quantize_subtile_aux_m). The SF view's N origin is the block's atoms under varlen_n (the
         consumer GEMM's offset_block_SFB), else the tile's columns."""
-        assert smem_tensor is not None, "M-paired aux quantization needs its exchange smem"
+        if const_expr(getattr(gemm, self._vec_attr()) == 32):
+            assert smem_tensor is not None, "M-paired aux quantization needs its exchange smem"
         tile_M_aux, tile_N = ctx.tile_M // 2, ctx.tile_N
         vm = ctx.varlen_manager
         if const_expr(vm.varlen_n):
@@ -713,9 +717,12 @@ class BlockScaleFactorStore(EpiOp):
             # The aux subtile is (tile_M / 2, epi_n) at column epi_coord[1] * epi_n of the block; the
             # exchange buffer alternates with the subtile's parity (one barrier per subtile).
             epi_n = getattr(gemm, self._epi_n_attr())
+            sExch_cur = None
+            if const_expr(state.sExch is not None):
+                sExch_cur = state.sExch[None, None, None, epi_coord[1] % 2]
             return _SfdAuxColLoopState(
                 cute.domain_offset((0, epi_coord[1] * epi_n), state.gSFD),
-                state.sExch[None, None, None, epi_coord[1] % 2],
+                sExch_cur,
                 state.limit_n - epi_coord[1] * epi_n,
                 state.norm_const,
                 state.barrier,
@@ -799,6 +806,7 @@ class BlockScaleFactorStore(EpiOp):
                 loop_state.warp,
                 loop_state.lane,
                 getattr(gemm, self._epi_n_attr()),
+                getattr(gemm, self._vec_attr()),
                 norm_const=loop_state.norm_const,
                 value_dtype=value_dtype,
             )
@@ -1112,13 +1120,15 @@ def sfd_quantize_subtile_col(
 
 @cute.jit
 def sfd_quantize_subtile_aux_m(
-    gemm, gSFD_cur, sExch_cur, limit_n, frag, barrier, warp, lane, epi_n, norm_const=None, value_dtype=None
+    gemm, gSFD_cur, sExch_cur, limit_n, frag, barrier, warp, lane, epi_n, vec, norm_const=None, value_dtype=None
 ):
     """Column-direction quantize of the M-paired gated aux subtile (TileStore pair_dim "m", SM100): thread t of
     epilogue warp w holds postact rows 16w + 8 m2 + t/4 (m2 = 0, 1) at columns 8g + 2 (t % 4) + j, registers in
-    (j, g, m2) order. A column's 32-row SF vector is warps 2q and 2q + 1: the thread's two rows' max, a butterfly
-    over the 8 lanes of stride 4, then the pair's partials through sExch_cur[q, column, warp] (one epilogue
-    barrier); every lane rescales its values in place and the even warp's lanes 0-3 store the vector's byte."""
+    (j, g, m2) order. A column's SF vector: the thread's two rows' max, a butterfly over the 8 lanes of stride 4
+    (the warp's 16 rows = a 16-row vector, nvfp4), and for 32-row vectors (mx) the pair of warps 2q, 2q + 1 meets
+    through sExch_cur[q, column, warp] (one epilogue barrier); every lane rescales its values in place and the
+    vector's first warp's lanes 0-3 store its byte."""
+    warp_pair = const_expr(vec == 32)
     if const_expr(value_dtype is None):
         value_dtype = gemm.d_dtype
     rcp_dmax = 1.0 / QUANT_DTYPE_MAX[value_dtype]
@@ -1135,22 +1145,32 @@ def sfd_quantize_subtile_aux_m(
     tScratch_e8 = cute.recast_tensor(tScratchB, cutlass.Float8E8M0FNU)
     t4, c4 = lane // 4, lane % 4
     q, member = warp // 2, warp % 2
+    amaxes = cute.make_rmem_tensor(cute.make_layout(2 * groups), Float32)  # the warp's 16-row maxima
     for g in cutlass.range_constexpr(groups):
         for j in cutlass.range_constexpr(2):
             i0 = j + 2 * g  # m2 = 0; m2 = 1 at i0 + 2 * groups
             amax = cute.arch.fmax(cute.math.absf(frag[i0]), cute.math.absf(frag[i0 + 2 * groups]))
             for off in cutlass.range_constexpr(3):
                 amax = cute.arch.fmax(amax, cute.arch.shuffle_sync_bfly(amax, offset=4 << off))
-            sExch_cur[q, 8 * g + 2 * c4 + j, warp] = amax
-    barrier.arrive_and_wait()
+            amaxes[i0] = amax
+            if const_expr(warp_pair):
+                sExch_cur[q, 8 * g + 2 * c4 + j, warp] = amax
+    if const_expr(warp_pair):
+        barrier.arrive_and_wait()
     for g in cutlass.range_constexpr(groups):
         for j in cutlass.range_constexpr(2):
             i0 = j + 2 * g
             col = 8 * g + 2 * c4 + j
-            amax = cute.arch.fmax(sExch_cur[q, col, warp], sExch_cur[q, col, warp ^ 1])
+            amax = amaxes[i0]
+            owner = t4 == 0
+            row = 16 * warp
+            if const_expr(warp_pair):
+                amax = cute.arch.fmax(sExch_cur[q, col, warp], sExch_cur[q, col, warp ^ 1])
+                owner = owner & (member == 0)
+                row = 32 * q
             tScratch_sf[0] = sf_dtype(amax * norm_scaled)
-            if (t4 == 0) and (member == 0) and (col < limit_n):
-                gSFD_cur[32 * q, col] = tScratch_sf[0]
+            if owner and (col < limit_n):
+                gSFD_cur[row, col] = tScratch_sf[0]
             if const_expr(is_e8m0):
                 tScratchB[0] = cutlass.Uint8((254 - tScratchB[0]) & 0xFF)
                 acc_scale = tScratch_e8[0].to(Float32)

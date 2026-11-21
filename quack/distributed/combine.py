@@ -1,12 +1,12 @@
-# MoE GEMM2 + combine as the GEMM's distributed operator: no gate, no publish, no comm warps. The grouped GEMM's
-# D rows are tokens (varlen-M, rows packed per expert); the operator drains each staged D subtile straight into
-# the origin rank's slot for that (token, k) pair, 16 B per lane, at the row's hidden offset (store_tile's own
-# copy: the GEMM stages accumulator -> registers -> epi ops -> smem as always, the TMA store is replaced). D is
-# never written, nothing is waited on; completion is the kernel's end, then the caller barriers and reduces
-# every token's K slots (duckpond reduce_over_k). Slot id of row r = row_key[r] = rank * slots_per_rank + local.
-# Usage: d, slots, args = make_combine_buffers(tokens_local, k, hidden, dtype, group, max_rows); per call
-# GemmSm100(..., dist_op=CombineStore(hidden)), mD=d, dist_op_args=args(row_key); then barrier; the landed rows
-# are slots (tokens_local, k, hidden).
+# MoE GEMM2 + combine as the GEMM's distributed operator: no gate, no publish, no comm warps. The swap-AB grouped
+# GEMM's D columns are tokens (varlen_n, D = y.T (hidden, total_n) m-major, columns packed per expert); the operator
+# drains each staged D subtile straight into the origin rank's slot for that (token, k) pair, 16 B per lane along
+# hidden (store_tile's own copy: the GEMM stages accumulator -> registers -> epi ops -> smem as always, the TMA store
+# is replaced). D is never written, nothing is waited on; completion is the kernel's end, then the caller barriers
+# and reduces every token's K slots (duckpond reduce_over_k). Slot id of token column c = row_key[c] = rank *
+# slots_per_rank + local. Usage: d, slots, args = make_combine_buffers(tokens_local, k, hidden, dtype, group,
+# max_rows); per call gemm(w2, act, d.T, ..., cu_seqlens_n=cu, dist_op=CombineStore(hidden),
+# dist_op_args=args(row_key)); then barrier; the landed rows are slots (tokens_local, k, hidden).
 from functools import partial
 from typing import NamedTuple
 
@@ -25,7 +25,7 @@ class CombineArguments(NamedTuple):
 
     slot_base: cute.Tensor  # (world,) int64: every rank's slot buffer base address
     slots_per_rank: Int32  # tokens_local * k
-    row_key: cute.Tensor  # (rows,) int32: each D row's global slot id
+    row_key: cute.Tensor  # (total_n,) int32: each token column's global slot id
 
 
 @cute.jit
@@ -39,6 +39,7 @@ def store_subtile(
     row_bytes: Int32,
     lanes: cutlass.Constexpr[int],
     tokens_per_step: cutlass.Constexpr[int],
+    granule: cutlass.Constexpr[int],
     tidx: Int32,
     varlen_manager,
     tile_coord_mnkl,
@@ -47,35 +48,38 @@ def store_subtile(
     dst_idx,
 ):
     """The drain (the epilogue's copy_D, every epilogue thread): the subtile in smem stage src_idx at subtile
-    coordinate dst_idx goes into the origins' slots, each token's slice at the same hidden offset in its slot
-    row; rows past the batch are skipped."""
+    coordinate dst_idx goes into the origins' slots, each token column's slice of epi_m hidden values at the same
+    hidden offset in its slot row; columns past the block's rows are skipped. The slot addresses are fetched before
+    the smem copy so their latency overlaps it (an address chain per step was ~45 % of the kernel's stalls)."""
     epi_m, epi_n = cute.size(epi_tile[0]), cute.size(epi_tile[1])
     elem_bytes = tSR_r.element_type.width // 8
-    cute.copy(tiled_copy, tSR_s[None, None, None, src_idx], tSR_r)
-    words = cute.recast_tensor(tSR_r, Int32)  # ((4, 1), steps, 1): 16 B per step's row
-    row0 = tile_coord_mnkl[0] * cta_tile_mn[0] + dst_idx[0] * epi_m
-    col_off = Int64((tile_coord_mnkl[1] * cta_tile_mn[1] + dst_idx[1] * epi_n) * elem_bytes)
-    len_m = varlen_manager.len_m(batch_idx)
-    base_row = varlen_manager.params.cu_seqlens_m[batch_idx]
-    lane_off = Int64((tidx % lanes) * 16)
+    elems = 16 // elem_bytes
+    STEPS = epi_n // tokens_per_step
+    pid_n, tile_n = tile_coord_mnkl[1], cta_tile_mn[1]
+    b = varlen_manager.block_n_rows(batch_idx, tile_n, granule)
+    base_col = varlen_manager.params.cu_seqlens_n[batch_idx] + pid_n * b
+    n_valid = varlen_manager.block_n_valid(batch_idx, pid_n, tile_n, granule)
+    col0 = dst_idx[1] * epi_n + tidx // lanes
     slots_per_rank = dist_op_args.slots_per_rank
-    for step in cutlass.range_constexpr(epi_m // tokens_per_step):
-        r = row0 + step * tokens_per_step + tidx // lanes
-        if r < len_m:
-            slot = dist_op_args.row_key[base_row + r]
-            dst = (
-                dist_op_args.slot_base[slot // slots_per_rank]
-                + Int64(slot % slots_per_rank) * Int64(row_bytes)
-                + col_off
-                + lane_off
-            )
-            w0, w1 = words[(0, 0), step, 0], words[(1, 0), step, 0]
-            w2, w3 = words[(2, 0), step, 0], words[(3, 0), step, 0]
-            st_weak_global_4xu32_at(dst, w0, w1, w2, w3)
+    addr = cute.make_rmem_tensor(cute.make_layout(STEPS), Int64)
+    for step in cutlass.range_constexpr(STEPS):
+        c = cutlass.min(col0 + step * tokens_per_step, n_valid - Int32(1))  # clamped: the load is unconditional
+        slot = dist_op_args.row_key[base_col + c]
+        addr[step] = dist_op_args.slot_base[slot // slots_per_rank] + Int64(slot % slots_per_rank) * Int64(row_bytes)
+    h_off = Int64((tile_coord_mnkl[0] * cta_tile_mn[0] + dst_idx[0] * epi_m + (tidx % lanes) * elems) * elem_bytes)
+    cute.copy(tiled_copy, tSR_s[None, None, None, src_idx], tSR_r)
+    words = cute.recast_tensor(tSR_r, Int32)  # ((4, 1), 1, steps): the lane's 16 B per step
+    for step in cutlass.range_constexpr(STEPS):
+        if col0 + step * tokens_per_step < n_valid:
+            w0, w1 = words[(0, 0), 0, step], words[(1, 0), 0, step]
+            w2, w3 = words[(2, 0), 0, step], words[(3, 0), 0, step]
+            st_weak_global_4xu32_at(addr[step] + h_off, w0, w1, w2, w3)
 
 
 class CombineStore(DistOp):
-    """GEMM2 + combine: the epilogue's rows land in their origin ranks' slots (hidden = the D row width)."""
+    """GEMM2 + combine: the epilogue's token columns land in their origin ranks' slots (hidden = D's M extent)."""
+
+    ragged_dim = "n"  # D columns are the expert-grouped tokens (the swap-AB GEMM, cu_seqlens_n)
 
     def __init__(self, hidden: int):
         self.hidden = hidden
@@ -88,21 +92,20 @@ class CombineStore(DistOp):
         )
 
     def store_tile(self, gemm, ctx, sD, epi_tile, tidx, tile_coord_mnkl, batch_idx, varlen_manager):
-        """The operator's own copy. Thread -> (token row along M, lane along N), 16 B per lane over the D
-        stage: a subtile row of epi_n elements is epi_n * width / 128 lanes, num_epi_warps * 32 / lanes
-        tokens per step."""
-        dist_op_args = ctx.args
+        """The operator's own copy. Thread -> (lane along M, token column along N), 16 B per lane over the
+        m-major D stage: a token's subtile slice of epi_m elements is epi_m * width / 128 lanes,
+        num_epi_warps * 32 / lanes tokens per step."""
         width = gemm.d_dtype.width
-        epi_n = cute.size(epi_tile[1])
-        lanes = epi_n * width // 128
-        assert lanes * 128 == epi_n * width, "a token's subtile slice is whole 16 B lanes"
+        epi_m = cute.size(epi_tile[0])
+        lanes = epi_m * width // 128
+        assert lanes * 128 == epi_m * width, "a token's subtile slice is whole 16 B lanes"
         elems = 128 // width
         tokens_per_step = gemm.num_epi_warps * cute.arch.WARP_SIZE // lanes
-        assert cute.size(epi_tile[0]) % tokens_per_step == 0, "the subtile's rows are whole steps"
+        assert cute.size(epi_tile[1]) % tokens_per_step == 0, "the subtile's columns are whole steps"
         op = cute.nvgpu.CopyUniversalOp()
         atom = cute.make_copy_atom(op, gemm.d_dtype, num_bits_per_copy=128)
-        thr = cute.make_layout((tokens_per_step, lanes), stride=(lanes, 1))
-        val = cute.make_layout((1, elems), stride=(elems, 1))
+        thr = cute.make_layout((lanes, tokens_per_step), stride=(1, lanes))
+        val = cute.make_layout((elems, 1), stride=(1, elems))
         tiled_copy = cute.make_tiled_copy_tv(atom, thr, val)
         tSR_s = tiled_copy.get_slice(tidx).partition_S(sD)
         tSR_r = cute.make_rmem_tensor(tSR_s[None, None, None, 0].shape, gemm.d_dtype)
@@ -113,10 +116,11 @@ class CombineStore(DistOp):
             tSR_r,
             epi_tile,
             gemm.cta_tile_shape_mnk[:2],
-            dist_op_args,
+            ctx.args,
             Int32(self.hidden * width // 8),
             lanes,
             tokens_per_step,
+            gemm.varlen_n_granule,
             tidx,
             varlen_manager,
             tile_coord_mnkl,

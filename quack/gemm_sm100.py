@@ -223,7 +223,6 @@ class GemmSm100(GemmTmaBase):
         sf_vec_size: Optional[int] = None,
         gather_A: bool = False,
         use_tma_gather: bool = False,
-        gather_B: bool = False,  # varlen_n: B rows by index (mBIdx), TMA gather4
         use_clc_persistence: bool = True,
         concat_layout: tuple | None = None,
         use_pdl: bool = True,
@@ -287,12 +286,8 @@ class GemmSm100(GemmTmaBase):
             assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather A "
         if use_tma_gather:
             assert gather_A, "TMA gather requires gather_A=True"
-        self.gather_B = gather_B
-        if gather_B:
-            assert not gather_A, "gather_A and gather_B are exclusive"
-            assert cluster_shape_mnk[1] == 1, "Cluster shape N must be 1 for gather B"
-        # Either gather: 4 load warps and an index-prefetch warp
-        self.has_idx_prefetch = gather_A or gather_B
+        # gather_A: 4 load warps and an index-prefetch warp
+        self.has_idx_prefetch = gather_A
         self._init_split_k(split_k, split_k_mode)
         if split_k > 1 and self.blockscaled:
             # Block-scaled composes with the finalizer-only split-K device path as-is:
@@ -317,7 +312,7 @@ class GemmSm100(GemmTmaBase):
         self.ab_load_warp_id = self.mma_warp_id + 1
         self.epi_load_warp_id = self.ab_load_warp_id + self.num_ab_load_warps
         self.scheduler_warp_id = self.epi_load_warp_id + 1
-        # For gather_A / gather_B: separate index prefetch warp (was the empty warp)
+        # For gather_A: separate index prefetch warp (was the empty warp)
         self.a_prefetch_warp_id = self.scheduler_warp_id + 1 if self.has_idx_prefetch else None
         # Comm warps: a new group after every other role (they join no GEMM pipeline)
         first_comm = (
@@ -696,17 +691,6 @@ class GemmSm100(GemmTmaBase):
         self.b_smem_layout_staged = sm100_utils.make_smem_layout_b(
             self.tiled_mma, self.mma_tiler, self.b_smem_dtype, self.ab_stage
         )
-        self.b_smem_load_layout_staged = self.b_smem_layout_staged
-        self.gather_b_rows = 0
-        if const_expr(self.gather_B):
-            self.b_smem_load_layout_staged = quack_sm100_utils.make_smem_layout_tma_gather_b(
-                self.tiled_mma, self.mma_tiler, self.b_dtype, self.ab_stage
-            )
-            # This CTA's B rows per stage; the index smem is sized by _compute_stages as tile_M ints
-            self.gather_b_rows = self.mma_tiler[1] // (2 if self.use_2cta_instrs else 1)
-            assert self.gather_b_rows <= self.cta_tile_shape_mnk[0], (
-                "gather_B index smem is sized for <= tile_M rows per CTA"
-            )
         self.epi_smem_layout_staged = None
         if const_expr(self.d_dtype is not None):
             self.epi_smem_layout_staged = sm100_utils.make_smem_layout_epi(
@@ -884,7 +868,6 @@ class GemmSm100(GemmTmaBase):
         if const_expr(varlen_args is None):
             varlen_args = VarlenArguments()
         assert (varlen_args.mAIdx is not None) == self.gather_A
-        assert (varlen_args.mBIdx is not None) == self.gather_B
         varlen_m = varlen_args.mCuSeqlensM is not None
         varlen_k = varlen_args.mCuSeqlensK is not None
         varlen_n = varlen_args.mCuSeqlensN is not None
@@ -902,8 +885,6 @@ class GemmSm100(GemmTmaBase):
                 and getattr(op, "quant_output", "D") == "D"  # an aux's quantize codec offsets by block itself
                 for op in getattr(type(self), "_epi_ops", ())
             ), "varlen_n supports only tile-store epilogue ops, scalars and their quantize codecs"
-        if const_expr(self.gather_B):
-            assert varlen_n, "gather_B needs varlen_n"
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes(epilogue_args, varlen_args)
@@ -993,36 +974,20 @@ class GemmSm100(GemmTmaBase):
             )
         # block_copy takes compiler-driven multicast metadata at the copy site,
         # so the TMA atom itself must stay the non-multicast variant here.
-        if const_expr(not self.gather_B):
-            b_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
-            tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
-                b_op,
-                copy_utils.create_ragged_tensor_for_tma(mB, ragged_dim=1) if varlen_k else mB,
-                b_smem_layout,
-                self.mma_tiler,
-                self.tiled_mma,
-                self.cluster_layout_vmnk.shape,
-                internal_type=(
-                    cutlass.Uint8
-                    if const_expr(self.b_unpack)
-                    else (cutlass.TFloat32 if mB.element_type is Float32 else None)
-                ),
-            )
-        else:
-            # gather4 descriptor, box (1, tile_K): B rows by index (the A gather above, on B)
-            b_op = sm100_utils.cluster_shape_to_tma_atom_B(
-                self.cluster_shape_mnk, self.tiled_mma.thr_id
-            )
-            tma_smem_layout = quack_sm100_utils.make_smem_layout_atom_tma_gather_b(
-                self.tiled_mma, self.mma_tiler, self.b_dtype, gather_size=1
-            )
-            tma_atom_b, tma_tensor_b = cpasync.make_tiled_tma_atom(
-                b_op,
-                mB,
-                tma_smem_layout,
-                tma_smem_layout.shape,
-                internal_type=(cutlass.TFloat32 if mB.element_type is Float32 else None),
-            )
+        b_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
+        tma_atom_b, tma_tensor_b = cute.nvgpu.make_tiled_tma_atom_B(
+            b_op,
+            copy_utils.create_ragged_tensor_for_tma(mB, ragged_dim=1) if varlen_k else mB,
+            b_smem_layout,
+            self.mma_tiler,
+            self.tiled_mma,
+            self.cluster_layout_vmnk.shape,
+            internal_type=(
+                cutlass.Uint8
+                if const_expr(self.b_unpack)
+                else (cutlass.TFloat32 if mB.element_type is Float32 else None)
+            ),
+        )
 
         tma_atom_sfa, tma_tensor_sfa = None, None
         tma_atom_sfb, tma_tensor_sfb = None, None
@@ -1147,9 +1112,7 @@ class GemmSm100(GemmTmaBase):
         a_idx_smem_size = 0
         if const_expr(self.has_idx_prefetch):
             a_idx_smem_size = self.a_prefetch_stage * (
-                self.gather_b_rows
-                if self.gather_B
-                else (self.cta_tile_shape_mnk[0] if varlen_m else self.cta_tile_shape_mnk[2])
+                self.cta_tile_shape_mnk[0] if varlen_m else self.cta_tile_shape_mnk[2]
             )
 
         # Define shared storage for kernel. sched_data lives in the RESERVED
@@ -1233,7 +1196,6 @@ class GemmSm100(GemmTmaBase):
             self.a_smem_layout_staged,
             self.a_smem_load_layout_staged,
             self.b_smem_layout_staged,
-            self.b_smem_load_layout_staged,
             self.sfa_smem_layout_staged,
             self.sfb_smem_layout_staged,
             self.epi_smem_layout_staged,
@@ -1276,7 +1238,6 @@ class GemmSm100(GemmTmaBase):
         a_smem_layout: cute.ComposedLayout,
         a_smem_load_layout: cute.ComposedLayout,
         b_smem_layout: cute.ComposedLayout,
-        b_smem_load_layout: cute.ComposedLayout,
         sfa_smem_layout: Optional[cute.Layout],
         sfb_smem_layout: Optional[cute.Layout],
         epi_smem_layout: Union[cute.Layout, cute.ComposedLayout, None],
@@ -1297,8 +1258,6 @@ class GemmSm100(GemmTmaBase):
         assert not (varlen_params.cu_seqlens_n is not None and (varlen_m or varlen_k))
         if const_expr(self.gather_A):
             assert varlen_m or varlen_k
-        if const_expr(self.gather_B):
-            assert varlen_params.cu_seqlens_n is not None
         has_D = const_expr(mD_mnl is not None)
         has_C = const_expr(mC_mnl is not None)
         has_epi_load = const_expr(self.epi_c_stage > 0)
@@ -1372,19 +1331,9 @@ class GemmSm100(GemmTmaBase):
         sA = storage.sA.get_tensor(a_smem_load_layout.outer, swizzle=a_smem_load_layout.inner)
         # (MMA, MMA_N, MMA_K, STAGE)
         sB = storage.sB.get_tensor(b_smem_layout.outer, swizzle=b_smem_layout.inner)
-        sB_load = sB  # gather_B: the same bytes in the gather4 (4-row atom) layout
-        if const_expr(self.gather_B):
-            sB_load = storage.sB.get_tensor(
-                b_smem_load_layout.outer, swizzle=b_smem_load_layout.inner
-            )
         sAIdx = None
         if const_expr(self.has_idx_prefetch):
-            if const_expr(self.gather_B):
-                a_idx_smem_dim = self.gather_b_rows
-            else:
-                a_idx_smem_dim = (
-                    self.cta_tile_shape_mnk[0] if varlen_m else self.cta_tile_shape_mnk[2]
-                )
+            a_idx_smem_dim = self.cta_tile_shape_mnk[0] if varlen_m else self.cta_tile_shape_mnk[2]
             a_idx_smem_layout = cute.make_layout((a_idx_smem_dim, self.a_prefetch_stage))
             sAIdx = storage.sAIdx.get_tensor(a_idx_smem_layout)
         sSFA, sSFB, sSFB_chunks = None, None, None
@@ -1526,9 +1475,7 @@ class GemmSm100(GemmTmaBase):
                     )
                 # (bN, bK, RestK)
                 gB_nk = None
-                if const_expr(self.gather_B):
-                    pass  # B rows come by index (gather4 below), no tile of mB
-                elif const_expr(varlen_manager.varlen_n):
+                if const_expr(varlen_manager.varlen_n):
                     # Even split: the tile starts at its block's first row (see VarlenManager).
                     # A 2-CTA MMA of N rows takes B rows [0, N/2) from CTA 0 and [N/2, N) from
                     # CTA 1, but partition_B slices the pair at tile_n/2: shift CTA 1's origin
@@ -1650,25 +1597,12 @@ class GemmSm100(GemmTmaBase):
                 if const_expr(self.blockscaled):
                     # (MMA, MMA_M, MMA_K)
                     tCgSFA = thr_mma.partition_A(gSFA_mkl)
-                if const_expr(not self.gather_B):
-                    # (MMA, MMA_N, MMA_K, RestK)
-                    tCgB = thr_mma.partition_B(gB_nk)
-                    # TMA load B partition_S/D
-                    copy_B = copy_utils.tma_get_block_copy_fn(
-                        tma_atom_b, src_tensor=tCgB, dst_tensor=sB, tma_multicast=b_tma_multicast
-                    )
-                else:
-                    # This tile's B row indices, one prefetch stage per tile
-                    a_prefetch_pipeline.consumer_wait(a_prefetch_consumer_state)
-                    copy_B = self._make_gather_B_copy(
-                        mB_nkl,
-                        sB_load,
-                        sAIdx[None, a_prefetch_consumer_state.index],
-                        tma_atom_b,
-                        warp_idx,
-                    )
-                    a_prefetch_pipeline.consumer_release(a_prefetch_consumer_state)
-                    a_prefetch_consumer_state.advance()
+                # (MMA, MMA_N, MMA_K, RestK)
+                tCgB = thr_mma.partition_B(gB_nk)
+                # TMA load B partition_S/D
+                copy_B = copy_utils.tma_get_block_copy_fn(
+                    tma_atom_b, src_tensor=tCgB, dst_tensor=sB, tma_multicast=b_tma_multicast
+                )
                 copy_SFA, copy_SFB = None, None
                 if const_expr(self.blockscaled):
                     #  TMA load SFA partition_S/D
@@ -1691,17 +1625,7 @@ class GemmSm100(GemmTmaBase):
                     k_tile_total, split_idx
                 )
                 iket.range_push("tma_load")
-                if const_expr(self.gather_B):
-                    ab_producer_state, a_prefetch_consumer_state = self.load_AB_tma_gather(
-                        ab_pipeline,
-                        ab_producer_state,
-                        a_prefetch_consumer_state,
-                        copy_B,
-                        None,
-                        copy_A,
-                        k_tile_cnt,
-                    )
-                elif const_expr(not self.gather_A):
+                if const_expr(not self.gather_A):
                     ab_producer_state = self.load_tma(
                         ab_pipeline,
                         ab_producer_state,
@@ -1779,16 +1703,13 @@ class GemmSm100(GemmTmaBase):
                     # AI/clc_spurious_invalid_investigation.md.
                     tile_scheduler.cancel_pending_tail()
 
-        # Specialized index prefetch warp (gather_A / gather_B)
+        # Specialized index prefetch warp (gather_A)
         if const_expr(self.has_idx_prefetch):
             if warp_idx == self.a_prefetch_warp_id:
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
                 tile_M = self.cta_tile_shape_mnk[0]
                 tile_K = self.cta_tile_shape_mnk[2]
-                if const_expr(self.gather_B):
-                    idx_rows = self.gather_b_rows
-                else:
-                    idx_rows = tile_M if varlen_m else tile_K
+                idx_rows = tile_M if varlen_m else tile_K
                 tiled_copy_AIdx = copy_utils.tiled_copy_1d(Int32, num_threads=32, is_async=True)
                 thr_copy_AIdx = tiled_copy_AIdx.get_slice(cute.arch.lane_idx())
                 tAsAIdx = thr_copy_AIdx.partition_D(sAIdx)
@@ -1802,44 +1723,7 @@ class GemmSm100(GemmTmaBase):
                 while work_tile.is_valid_tile:
                     tile_coord_mnkl = work_tile.tile_idx
                     batch_idx = tile_coord_mnkl[3]
-                    if const_expr(self.gather_B):
-                        # This CTA's rows of the N block: CTA 1 of a pair starts at n_inst/2, as
-                        # the plain varlen_n load does; rows past the block's valid ones are not
-                        # loaded (stale indices, their columns are never stored).
-                        tile_N = self.cta_tile_shape_mnk[1]
-                        n_valid = varlen_manager.block_n_valid(
-                            batch_idx, tile_coord_mnkl[1], tile_N, self.varlen_n_granule
-                        )
-                        n_inst = self.varlen_n_inst(n_valid)
-                        cta_shift = Int32(0)
-                        if const_expr(use_2cta_instrs):
-                            cta_shift = mma_tile_coord_v * n_inst // 2
-                        gBIdx = cute.local_tile(
-                            varlen_manager.offset_block_BIdx(
-                                batch_idx,
-                                tile_coord_mnkl[1],
-                                tile_N,
-                                self.varlen_n_granule,
-                                cta_shift,
-                            ),
-                            (idx_rows,),
-                            (0,),
-                        )
-                        tAgAIdx = thr_copy_AIdx.partition_S(gBIdx)
-                        row_limit = n_valid - cta_shift
-                        tApAIdx_m = cute.make_rmem_tensor((1, tAsAIdx.shape[1]), Boolean)
-                        for m in cutlass.range(tAsAIdx.shape[1], unroll_full=True):
-                            tApAIdx_m[0, m] = tAcAIdx[0, m] < row_limit
-                        a_prefetch_pipeline.producer_acquire(a_prefetch_producer_state)
-                        cute.copy(
-                            thr_copy_AIdx,
-                            tAgAIdx,
-                            tAsAIdx[None, None, a_prefetch_producer_state.index],
-                            pred=tApAIdx_m,
-                        )
-                        a_prefetch_pipeline.producer_commit(a_prefetch_producer_state)
-                        a_prefetch_producer_state.advance()
-                    elif const_expr(varlen_m):
+                    if const_expr(varlen_m):
                         mAIdx_mk = varlen_manager.offset_batch_AIdx(batch_idx)
                         # (tile_M,)
                         gAIdx = cute.local_tile(mAIdx_mk, (tile_M,), (tile_coord_mnkl[0],))
@@ -2429,25 +2313,6 @@ class GemmSm100(GemmTmaBase):
                 )
         return copy_A, prefetch_A
 
-    def _make_gather_B_copy(
-        self,
-        mB_nkl: cute.Tensor,
-        sB_load: cute.Tensor,
-        sBIdx: cute.Tensor,  # this tile's stage of the prefetched B row indices
-        tma_atom_b: cute.CopyAtom,
-        warp_idx: Int32,
-    ):
-        """copy_B for gather_B: TMA gather4 of this CTA's B rows by the prefetched indices."""
-        return copy_utils.gather_m_get_tma_copy_fn(
-            tma_atom_b,
-            mB_nkl,
-            sB_load,
-            sBIdx,
-            warp_idx - self.ab_load_warp_id,
-            num_warps=self.num_ab_load_warps,
-            num_cta=2 if self.use_2cta_instrs else 1,
-        )
-
     @cute.jit
     def load_AB_gather_A(
         self,
@@ -2517,8 +2382,8 @@ class GemmSm100(GemmTmaBase):
         copy_tma: Callable,
         k_tile_cnt: Int32,
     ) -> Tuple[cutlass.pipeline.PipelineState, Optional[cutlass.pipeline.PipelineState]]:
-        """Unified TMA gather loading loop: the gathered operand (A for gather_A, B for
-        gather_B) is issued by every load warp, the other operand by the rotating TMA warp.
+        """TMA gather loading loop: the gathered A is issued by every load warp, B by the
+        rotating TMA warp.
 
         For varlen_m / varlen_n: a_prefetch_pipeline is None, copy_gather receives k_tile as src_idx.
         For varlen_k: a_prefetch_pipeline is set, copy_gather receives the prefetch stage index,

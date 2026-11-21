@@ -66,6 +66,7 @@ class FakeArgCtx(NamedTuple):
     batched: bool
     varlen_m: bool
     swapped: bool = False
+    varlen_n: bool = False  # the swap-AB grouped GEMM: n is total_n, outputs 2-D (m, n)
 
 
 def _ops_by_name(GemmCls):
@@ -130,6 +131,7 @@ def _compile_gemm_epi(
     transform_dims=None,
     dist_op=None,  # SM100 DistOp object (picklable; its state is in the key)
     raster_order=RasterOrderOption.Heuristic,
+    varlen_n=False,
 ):
     """Compile one epilogue-GEMM variant against fake symbolic tensors.
 
@@ -183,15 +185,16 @@ def _compile_gemm_epi(
             packed_cd=packed_cd,
             a_mma_dtype=a_mma_dtype,
             b_mma_dtype=b_mma_dtype,
+            varlen_n=varlen_n,
         )
-        if dist_op is not None:
+        if dist_op is not None and d_dtype is not None:
             # the operator's D is its wire with its own M extent (a Lamport wire stacks mirrors
-            # along M): untie it from A's M in the compiled signature
+            # along M): untie it from A's M in the compiled signature (varlen: 2-D)
             mD = fake_batched(
                 d_dtype,
                 cute.sym_int(),
                 n,
-                l if batched else None,
+                l if batched and not (varlen_m or varlen_n) else None,
                 1 if d_major == "n" else 0,
                 div_for_dtype(d_dtype),
             )
@@ -204,7 +207,7 @@ def _compile_gemm_epi(
             mA = transform_mod.fake_bundle(
                 mA, a_dtype, tile_shape_mn[0], tile_shape_mn[2] if len(tile_shape_mn) == 3 else None
             )
-    fctx = FakeArgCtx(m, n, k, l, batched, varlen_m, swap_ab or owned_fmt is not None)
+    fctx = FakeArgCtx(m, n, k, l, batched, varlen_m, swap_ab or owned_fmt is not None, varlen_n)
     ops = _ops_by_name(GemmCls)
     fields = {}
     for name, key in epi_keys:
@@ -240,9 +243,12 @@ def _compile_gemm_epi(
         gather_A,
         m if varlen_m else None,
         has_cu_tiles_m=varlen_m and _has_m_fold_sink(ops, epi_keys),
+        varlen_n=varlen_n,
+        has_cu_tiles_n=varlen_n and sf_dtype is not None,
     )
     mSFA = make_fake_sf_tensor(sf_dtype, l if sf_batched else None) if sf_dtype else None
-    mSFB = make_fake_sf_tensor(sf_dtype, l if sf_batched else None) if sf_dtype else None
+    # varlen_n: SFB is the per-block atoms, batch 1
+    mSFB = make_fake_sf_tensor(sf_dtype, 1 if varlen_n else l if sf_batched else None) if sf_dtype else None
     post_init = None
     if post_init_attrs:
 
@@ -328,6 +334,8 @@ class GemmEpiPlan(NamedTuple):
     # cu_tiles_m prefix at launch (None = no prefix needed). Also consumed by
     # the interface layer's per-sequence finalize.
     cu_tiles_tile_m: Optional[int] = None
+    # varlen_n blockscaled: tile_n for the cu_tiles_n prefix (B's per-block SF atom slots)
+    cu_tiles_tile_n: Optional[int] = None
 
 
 def _get_major(t, m_label, n_label):
@@ -375,7 +383,8 @@ def build_gemm_epi_plan(
     # operand_transform.host.w4_operand_views (blob view + optional strip);
     # the ctor a_dtype comes from the format's mma_dtype.
     transform_a=None,
-    dist_op=None,  # DistOp object (see quack/distributed/): dense persistent only
+    dist_op=None,  # DistOp object (see quack/distributed/): persistent, on its ragged_dim
+    varlen_n=False,  # the swap-AB grouped GEMM: A (l, m, k), B (total_n, k), D (m, total_n)
 ) -> GemmEpiPlan:
     """Derive majors/dtypes/epi keys from tensor metadata and compile (or hit
     the jit cache). Variant wrappers call this after their validation asserts."""
@@ -482,6 +491,7 @@ def build_gemm_epi_plan(
         transform_dims=transform_dims,
         dist_op=dist_op,
         raster_order=raster_order,
+        varlen_n=varlen_n,
     )
 
     max_active_clusters = get_max_active_clusters(cluster_M * cluster_N) if persistent else 0
@@ -528,6 +538,7 @@ def build_gemm_epi_plan(
             if varlen_m and _has_m_fold_sink(plan_ops, epi_keys)
             else None
         ),
+        cu_tiles_tile_n=tile_N if varlen_n and sf_dtype is not None else None,
         dist_op=dist_op,
     )
 
@@ -549,6 +560,7 @@ def run_gemm_epi_plan(
     split_k_buffers=None,  # (sem, ws) raw from _split_k_buffers: reuse across
     # calls when the kernel leaves them reusable (serial self-resets)
     dist_op_args=None,  # the operator's per-call bundle (plans compiled with dist_op=)
+    cu_seqlens_n=None,
 ) -> None:
     """Launch a resolved plan: only per-call pointers and scalar values here.
 
@@ -591,7 +603,19 @@ def run_gemm_epi_plan(
         if cu_seqlens_m is not None and plan.cu_tiles_tile_m is not None
         else None
     )
-    varlen_args = make_varlen_args(cu_seqlens_m, cu_seqlens_k, A_idx, cu_tiles_m=cu_tiles_m)
+    cu_tiles_n = (
+        compute_cu_tiles_m(cu_seqlens_n, plan.cu_tiles_tile_n)
+        if plan.cu_tiles_tile_n is not None
+        else None
+    )
+    varlen_args = make_varlen_args(
+        cu_seqlens_m,
+        cu_seqlens_k,
+        A_idx,
+        cu_tiles_m=cu_tiles_m,
+        cu_seqlens_n=cu_seqlens_n,
+        cu_tiles_n=cu_tiles_n,
+    )
     launch_gemm(
         plan, A, B, D, C, epi_args, scheduler_args, varlen_args, SFA, SFB, dist_op_args=dist_op_args
     )

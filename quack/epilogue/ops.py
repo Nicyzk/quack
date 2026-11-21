@@ -936,7 +936,7 @@ class TileStore(EpiOp):
         else:
             n = fctx.n
         leading = 1 if (major == "n" or self.epi_tile_fn is not None) else 0
-        batch = fctx.l if (fctx.batched and not fctx.varlen_m) else None
+        batch = fctx.l if (fctx.batched and not (fctx.varlen_m or fctx.varlen_n)) else None
         if self.gated and self.pair_dim == "m":
             # (half the GEMM M, n), m-major: a fresh M sym, M contiguous
             m = cute.sym_int(divisibility=div_for_dtype(dtype))
@@ -974,8 +974,8 @@ class TileStore(EpiOp):
                 gemm.arch in (100, 120) and tensor.element_type.width in (4, 8)
             ), "gated aux output must be 16-bit (or fp8/fp4 on SM100/SM120)"
             if self.pair_dim == "m":
-                assert gemm.arch == 100 and tensor.element_type.width in (8, 16), (
-                    "M-paired gated aux: SM100, 16-bit or fp8 (quantized)"
+                assert gemm.arch == 100 and tensor.element_type.width in (4, 8, 16), (
+                    "M-paired gated aux: SM100, 16-bit or fp8 / fp4 (quantized)"
                 )
                 assert layout.is_m_major_c(), "M-paired gated aux must be m-major"
             else:
@@ -1106,13 +1106,22 @@ class TileStore(EpiOp):
             )
             half_m = cta_m // 2
             epi_n = cute.size(getattr(params, self._epi_tile_key())[1])
+            dtype = getattr(gemm, self._dtype_gemm_attr())
+            if dtype.width == 4:
+                # fp4 packs the row pair (2p, 2p + 1), held by lanes t and t ^ 4, into one byte: both lanes
+                # form it (store_convert), so the lane parity has stride 0 and the value mode leads with the
+                # pair; one byte per copy
+                layout_tv = cute.make_layout(
+                    ((4, 2, 4, num_warps), (2, (2, epi_n // 8), 2, 1)),
+                    stride=((2 * half_m, 0, 2, 16), (1, (half_m, 8 * half_m), 8, 0)),
+                )
+                atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), dtype, num_bits_per_copy=8)
+                return cute.make_tiled_copy(atom, layout_tv, (half_m, epi_n))
             layout_tv = cute.make_layout(
                 ((4, 8, num_warps), ((2, epi_n // 8), 2, 1)),
                 stride=((2 * half_m, 1, 16), ((half_m, 8 * half_m), 8, 0)),
             )
-            atom = cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), getattr(gemm, self._dtype_gemm_attr())
-            )
+            atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), dtype)
             return cute.make_tiled_copy(atom, layout_tv, (half_m, epi_n))
         if self.gated and gemm.arch == 100:
             # Gated aux is half of D's N, but make_tiled_copy_S inherits D's full-N
@@ -1196,6 +1205,21 @@ class TileStore(EpiOp):
         dtype (per-op rounding), plus the gated STSM register permute."""
         dtype = getattr(gemm, self._dtype_gemm_attr())
         rounding = self.rounding if self.rounding is not None else gemm.rounding_mode
+        if const_expr(self.gated and self.pair_dim == "m" and dtype.width == 4):
+            # M-packed fp4: rows 2p and 2p + 1 live in lanes t and t ^ 4. Exchange the f32 values and let
+            # both lanes convert the (even row, odd row) pair, so each holds the same byte per value.
+            n = cute.size(tRS_rAuxOut)
+            odd = (tidx // 4) % 2 == 1
+            pairs = cute.make_rmem_tensor(cute.make_layout((2, n)), Float32)
+            for i in cutlass.range_constexpr(n):
+                mine = tRS_rAuxOut[i]
+                other = cute.arch.shuffle_sync_bfly(mine, offset=4)
+                lo, hi = mine, other
+                if odd:
+                    lo, hi = other, mine
+                pairs[0, i] = lo
+                pairs[1, i] = hi
+            return pairs.to(dtype)
         stsm_gated = const_expr(self.gated and self.pair_dim == "n" and gemm.arch in (90, 120))
         if const_expr(stsm_gated and dtype.width < 16):
             # The store TV follows the 16-bit STSM C-atom contract (see

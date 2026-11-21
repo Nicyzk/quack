@@ -21,6 +21,7 @@ from quack.blockscaled.quantize import nvfp4_per_tensor_scale, to_mx, unpack_sca
 from quack.compile_utils import make_fake_stream
 from quack.cute_dsl_utils import get_device_capacity, get_max_active_clusters
 from quack.epilogue.library import gated_quant_mod, linear_act_mod
+from quack.gemm import gemm
 from quack.gemm_default_epi import GemmDefaultSm100
 from quack.gemm_runtime.host import FakeArgCtx
 from quack.gemm_tvm_ffi_utils import (
@@ -30,6 +31,7 @@ from quack.gemm_tvm_ffi_utils import (
     make_fake_varlen_args,
     make_scheduler_args,
     make_varlen_args,
+    varlen_n_block_atoms,
 )
 from quack.rounding import RoundingMode
 from quack.varlen_utils import VARLEN_N_GRANULE
@@ -45,6 +47,8 @@ FORMATS = {
     "mxfp8": (cutlass.Float8E4M3FN, cutlass.Float8E8M0FNU, torch.float8_e8m0fnu, 32),
     "nvfp4": (cutlass.Float4E2M1FN, cutlass.Float8E4M3FN, torch.float8_e4m3fn, 16),
 }
+BS_NAME = {"mxfp8": "mxfp8_e4m3", "nvfp4": "nvfp4"}  # the host entries' BlockScaledFormat names
+E2M1 = torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])  # fp4 magnitudes by the 3 low bits
 H, I = 1024, 512
 COUNTS = [300, 520, 64, 700, 5]  # thin, one-block, multi-block experts; ragged last blocks
 
@@ -81,7 +85,7 @@ def unblock_sf(sf6):
 
 def even_split(counts, tile_n, granule=VARLEN_N_GRANULE):
     """Host twin of varlen_n_block_rows: (blocks per expert, rows per block)."""
-    num_blocks = ((counts + tile_n - 1) // tile_n).clamp(min=1)
+    num_blocks = (counts + tile_n - 1) // tile_n
     b = ((counts + num_blocks - 1) // num_blocks + granule - 1) // granule * granule
     return num_blocks, b
 
@@ -130,41 +134,58 @@ def stack_sf(scales):
     return torch.stack([blocked_sf(s).view(torch.uint8) for s in scales]).view(scales.dtype)
 
 
-def mint_fc1(fmt, quant=False):
-    """The fc1 class: SwiGLU gated, pairs over M rows; nvfp4 takes the per-tensor scales as alpha."""
-    if quant:
-        mod = gated_quant_mod("swiglu", "m")
-    else:
-        mod = linear_act_mod(
-            "swiglu",
-            gated=True,
-            has_c=False,
-            has_rowvec=False,
-            has_colvec=False,
-            has_alpha=fmt == "nvfp4",
-        )
+def fc1_mod(fmt):
+    """SwiGLU gated fc1; nvfp4 takes the per-tensor scales as alpha."""
+    return linear_act_mod(
+        "swiglu",
+        gated=True,
+        has_c=False,
+        has_rowvec=False,
+        has_colvec=False,
+        has_alpha=fmt == "nvfp4",
+    )
+
+
+def sf_kwargs(p, sfa, b_scales, tile_n):
+    """The host entries' blockscaled kwargs: A's per-expert atoms, B's per-block atoms (bf16: none)."""
+    if sfa is None:
+        return {}
+    sfb = block_sf_atoms(p, b_scales, varlen_n_block_atoms(tile_n))
+    return dict(SFA=sfa, SFB=sfb, bs_format_a=BS_NAME[p.fmt], bs_format_b=BS_NAME[p.fmt])
+
+
+def quant_values(q):
+    """A quantized (rows, K) tensor's values as fp32: fp8 directly, fp4x2 bytes unpacked along K (low nibble
+    first, the kernel's packing along its contiguous dim)."""
+    if q.dtype != FP4X2:
+        return q.float()
+    u8 = q.view(torch.uint8)
+    nib = torch.stack([u8 & 0xF, u8 >> 4], dim=-1).reshape(q.shape[0], -1)
+    mag = E2M1.to(q.device)[(nib & 0x7).long()]
+    return torch.where(nib & 0x8 != 0, -mag, mag)
+
+
+def mint_fc1(fmt):
+    """The fc1 class: SwiGLU gated, pairs over M rows."""
+    mod = fc1_mod(fmt)
     scalars = (("alpha", "scalar"),) if fmt == "nvfp4" else ()
     return mod._mint(scalars, 10, True, False, (), RoundingMode.RN, (), False, pair_dim="m")
 
 
-def compile_varlen_n(
-    Cls, fmt, tile_n, epi_fake, d_dtype=None, d_major="n", use_clc=False, gather_B=False
-):
+def compile_varlen_n(Cls, fmt, tile_n, epi_fake, d_dtype=None, d_major="n", use_clc=False):
     """Compile Cls on the varlen_n fakes; epi_fake(Cls, ctx) builds the fake EpilogueArguments."""
     ab, sf, _, vec = FORMATS[fmt]
     kw = {} if sf is None else dict(sf_vec_size=vec)
-    gemm = Cls(
-        Float32, ab, (256, tile_n), (2, 1, 1), use_clc_persistence=use_clc, gather_B=gather_B, **kw
-    )
+    gemm = Cls(Float32, ab, (256, tile_n), (2, 1, 1), use_clc_persistence=use_clc, **kw)
     gemm.b_transposed = gemm.a_transposed = gemm.cd_transposed = False
     gemm.cd_packed = None
     mA, mB, mD, mC, m, n, k, l = make_fake_gemm_tensors(
-        ab, ab, d_dtype, None, "k", "k", d_major, "n", varlen_n=True, gather_B=gather_B
+        ab, ab, d_dtype, None, "k", "k", d_major, "n", varlen_n=True
     )
     epi = epi_fake(Cls, FakeArgCtx(m, n, k, l, False, False))
     sched = make_fake_scheduler_args(False, False, l)
     varlen = make_fake_varlen_args(
-        False, False, False, None, varlen_n=True, gather_B=gather_B, has_cu_tiles_n=sf is not None
+        False, False, False, None, varlen_n=True, has_cu_tiles_n=sf is not None
     )
     sfs = (
         () if sf is None else (make_fake_sf_tensor(sf, l), make_fake_sf_tensor(sf, cute.sym_int()))
@@ -194,8 +215,8 @@ def aux_fake(dtype, fmt):
     return fake
 
 
-def make_problem(fmt, tile_n, device, gather_B=False, pool_frac=1.0):
-    """Experts' counts, gate/up weights and tokens in fmt; the token pool when gather_B."""
+def make_problem(fmt, tile_n, device):
+    """Experts' counts, gate/up weights and tokens in fmt."""
     p = SimpleNamespace(fmt=fmt, E=len(COUNTS), counts=torch.tensor(COUNTS))
     p.total = int(p.counts.sum())
     p.cu = cumsum0(p.counts).to(device)
@@ -206,21 +227,8 @@ def make_problem(fmt, tile_n, device, gather_B=False, pool_frac=1.0):
     p.w1_q_il = interleave_gate_up(w1_q)
     p.sfa = None if w1_s is None else stack_sf(interleave_gate_up(w1_s))
     tokens = torch.randn(p.total, H, device=device, dtype=torch.bfloat16)
-    p.B_idx = None
-    if gather_B:  # GEMM row i reads pool row B_idx[i]; with duplicates the last write wins
-        assert fmt == "bf16"
-        pool_rows = int(p.total * pool_frac)
-        if pool_frac >= 1:
-            B_idx = torch.randperm(pool_rows, device=device)[: p.total]
-        else:
-            B_idx = torch.randint(0, pool_rows, (p.total,), device=device)
-        pool = torch.randn(pool_rows, H, device=device, dtype=torch.bfloat16)
-        pool[B_idx] = tokens
-        tokens, p.B_idx = pool[B_idx], B_idx.to(torch.int32)
-        p.B = pool
     p.tok_q, p.tok_s, p.pts_tok, p.tok_dq = quantize(tokens, fmt)
-    if not gather_B:
-        p.B = p.tok_q
+    p.B = p.tok_q
     return p
 
 
@@ -228,7 +236,7 @@ def launch_args(p, device):
     clusters = get_max_active_clusters(2, get_device_capacity(device))
     return (
         make_scheduler_args(clusters, 8, None),
-        make_varlen_args(None, None, None, cu_seqlens_n=p.cu, B_idx=p.B_idx, cu_tiles_n=p.cu_tiles),
+        make_varlen_args(None, None, None, cu_seqlens_n=p.cu, cu_tiles_n=p.cu_tiles),
     )
 
 
@@ -246,33 +254,24 @@ def ref_fc1(p, e):
 
 @sm100_only
 @pytest.mark.parametrize(
-    "fmt, tile_n, use_clc, gather_B, pool_frac",
-    # pool_frac 0.5: fewer pool rows than GEMM rows (duplicate indices) — the grid bound must come
-    # from the index tensor, not the pool (tail tiles were unscheduled, 2026-10-05)
+    "fmt, tile_n, use_clc",
     [
-        ("bf16", 256, True, False, 1.0),
-        ("bf16", 256, False, False, 1.0),
-        ("bf16", 256, True, True, 2.0),
-        ("bf16", 256, True, True, 0.5),
-        ("mxfp8", 192, False, False, 1.0),
-        ("mxfp8", 256, False, False, 1.0),
-        ("nvfp4", 192, False, False, 1.0),
-        ("nvfp4", 256, False, False, 1.0),
+        ("bf16", 256, True),
+        ("bf16", 256, False),
+        ("mxfp8", 192, False),
+        ("mxfp8", 256, False),
+        ("nvfp4", 192, False),
+        ("nvfp4", 256, False),
     ],
 )
-def test_fc1_gated(fmt, tile_n, use_clc, gather_B, pool_frac):
+def test_fc1_gated(fmt, tile_n, use_clc):
     """fc1: aux (I, total_n) m-major = SwiGLU(gate) * up in bf16."""
     device = torch.device("cuda")
     torch.random.manual_seed(0)
     fn, gemm = compile_varlen_n(
-        mint_fc1(fmt),
-        fmt,
-        tile_n,
-        aux_fake(cutlass.BFloat16, fmt),
-        use_clc=use_clc,
-        gather_B=gather_B,
+        mint_fc1(fmt), fmt, tile_n, aux_fake(cutlass.BFloat16, fmt), use_clc=use_clc
     )
-    p = make_problem(fmt, tile_n, device, gather_B, pool_frac)
+    p = make_problem(fmt, tile_n, device)
     postact = torch.empty(p.total, I, device=device, dtype=torch.bfloat16)
     epi_kw = {"alpha": Float32(float(p.pts_w * p.pts_tok))} if fmt == "nvfp4" else {}
     sfs = () if p.sfa is None else (p.sfa, block_sf_atoms(p, p.tok_s, gemm.sfb_window_atoms))
@@ -289,6 +288,58 @@ def test_fc1_gated(fmt, tile_n, use_clc, gather_B, pool_frac):
     torch.cuda.synchronize()
     for e in range(p.E):
         assert_bf16_close(postact[p.cu[e] : p.cu[e + 1]], ref_fc1(p, e), f"expert {e}")
+
+
+@sm100_only
+@pytest.mark.parametrize(
+    "fmt, tile_n", [("bf16", 256), ("mxfp8", 192), ("mxfp8", 256), ("nvfp4", 256)]
+)
+def test_fc1_gated_mod(fmt, tile_n):
+    """fc1 through the epilogue module path: cu_seqlens_n on mod.gemm, the gated mod paired over M; blockscaled
+    passes SFA / SFB and the host builds cu_tiles_n."""
+    device = torch.device("cuda")
+    torch.random.manual_seed(0)
+    p = make_problem(fmt, tile_n, device)
+    postact = torch.empty(p.total, I, device=device, dtype=torch.bfloat16)
+    epi_args = {"mAuxOut": postact.T}
+    if fmt == "nvfp4":
+        epi_args["alpha"] = float(p.pts_w * p.pts_tok)
+    fc1_mod(fmt).gemm(
+        p.w1_q_il,
+        p.B,
+        None,
+        None,
+        epi_args=epi_args,
+        tile_M=256,
+        tile_N=tile_n,
+        cluster_M=2,
+        cluster_N=1,
+        cu_seqlens_n=p.cu,
+        **sf_kwargs(p, p.sfa, p.tok_s, tile_n),
+    )
+    torch.cuda.synchronize()
+    for e in range(p.E):
+        assert_bf16_close(postact[p.cu[e] : p.cu[e + 1]], ref_fc1(p, e), f"expert {e}")
+
+
+@sm100_only
+@pytest.mark.parametrize("fmt", ["bf16", "mxfp8"])
+def test_fc2_plain_d_gemm(fmt):
+    """fc2 through quack.gemm.gemm: cu_seqlens_n with y.T as the m-major D; mxfp8 passes the scales."""
+    device = torch.device("cuda")
+    torch.random.manual_seed(1)
+    p = make_problem(fmt, 256, device)
+    w2 = torch.randn(p.E, H, I, device=device, dtype=torch.bfloat16) * 0.05
+    act = torch.randn(p.total, I, device=device, dtype=torch.bfloat16)
+    w2_q, w2_s, _, w2_dq = quantize(w2, fmt)
+    act_q, act_s, _, act_dq = quantize(act, fmt)
+    y = torch.empty(p.total, H, device=device, dtype=torch.bfloat16)
+    sfs = sf_kwargs(p, None if w2_s is None else stack_sf(w2_s), act_s, 256)
+    gemm(w2_q, act_q, y.T, None, None, 256, 256, 2, 1, cu_seqlens_n=p.cu, **sfs)
+    torch.cuda.synchronize()
+    for e in range(p.E):
+        ref = act_dq[p.cu[e] : p.cu[e + 1]] @ w2_dq[e].T
+        assert_bf16_close(y[p.cu[e] : p.cu[e + 1]], ref, f"expert {e}")
 
 
 @sm100_only
@@ -314,68 +365,88 @@ def test_fc2_plain_d(use_clc):
 
 
 @sm100_only
-@pytest.mark.parametrize("fmt, tile_n", [("mxfp8", 192), ("mxfp8", 256)])
+@pytest.mark.parametrize("fmt, tile_n", [("mxfp8", 192), ("mxfp8", 256), ("nvfp4", 256)])
 def test_fc1_quant_postact_fc2(fmt, tile_n):
-    """fc1 quantizes its postact in the epilogue (values (I, total_n) m-major, scales per 32 along I into
-    the per-block atoms, column-direction SFD) and fc2 consumes them as its B."""
+    """fc1 quantizes its postact in the epilogue (values (I, total_n) m-major, scales per vec along I into
+    the per-block atoms, column-direction SFD; nvfp4 packs fp4 pairs along I and folds the per-tensor scale
+    in through sfd_norm_const) and fc2 consumes them as its B; both through the host entries, the SF
+    output's fake has the slots' batch of 1."""
     device = torch.device("cuda")
     torch.random.manual_seed(0)
-    ab, sf, sf_torch, vec = FORMATS[fmt]
-
-    def quant_fake(Cls, ctx):
-        ops = {op.name: op for op in Cls._epi_ops}
-        # per-block SF atoms: batch extent 1, not the experts (host_fake_arg's batched default)
-        return Cls.EpilogueArguments(
-            postact=ops["postact"].host_fake_arg((ab, "m"), ctx),
-            postact_sf=make_fake_sf_tensor(sf, cute.sym_int()),
-        )
-
-    fn1, gemm1 = compile_varlen_n(mint_fc1(fmt, quant=True), fmt, tile_n, quant_fake)
+    _, _, sf_torch, vec = FORMATS[fmt]
     p = make_problem(fmt, tile_n, device)
-    atoms = gemm1.sfb_window_atoms
+    atoms = varlen_n_block_atoms(tile_n)
     slots = int(p.cu_tiles[-1])
-    postact = torch.zeros(p.total, I, device=device, dtype=torch.float8_e4m3fn)
-    postact_sf = torch.zeros(1, slots * atoms, I // 128, 32, 4, 4, dtype=sf_torch, device=device)
-    sched, varlen = launch_args(p, device)
-    Cls = type(gemm1)
-    fn1(
+    refs = [ref_fc1(p, e) for e in range(p.E)]
+    nvfp4 = fmt == "nvfp4"
+    pts_act = float(torch.cat(refs).abs().amax() / (448.0 * 6.0)) if nvfp4 else 1.0
+    val_dtype, val_cols = (FP4X2, I // 2) if nvfp4 else (torch.float8_e4m3fn, I)
+    postact = torch.zeros(p.total, val_cols, device=device, dtype=torch.uint8).view(val_dtype)
+    postact_sf = torch.zeros(
+        1, slots * atoms, I // (4 * vec), 32, 4, 4, dtype=sf_torch, device=device
+    )
+    epi_args = {"postact": postact.T, "postact_sf": postact_sf}
+    if nvfp4:  # the inputs' per-tensor scales on the accumulator, the postact's folded into its SFs
+        epi_args["alpha"] = float(p.pts_w * p.pts_tok)
+        epi_args["sfd_norm_const"] = 1.0 / pts_act
+    gated_quant_mod("swiglu", "m", has_alpha=nvfp4).gemm(
         p.w1_q_il,
         p.B,
         None,
         None,
-        Cls.EpilogueArguments(postact=postact.T, postact_sf=postact_sf),
-        sched,
-        varlen,
-        p.sfa,
-        block_sf_atoms(p, p.tok_s, atoms),
+        epi_args=epi_args,
+        tile_M=256,
+        tile_N=tile_n,
+        cluster_M=2,
+        cluster_N=1,
+        cu_seqlens_n=p.cu,
+        **sf_kwargs(p, p.sfa, p.tok_s, tile_n),
     )
     torch.cuda.synchronize()
 
-    # The dequantized postact against the fp32 reference: per block along I, within e4m3's half ulp of
-    # the block's amax (2^-4) plus the block-scale rounding (one more bit)
+    # The dequantized postact against the fp32 reference: per block along I, within e4m3's half ulp of the
+    # block's amax (2^-4) plus the block-scale rounding (one more bit); nvfp4: within one scale step (its
+    # top-binade ulp is 2 of 6)
     act_sf = unblock_sf(postact_sf[0])
     act_dq = torch.empty(p.total, I, device=device, dtype=torch.float32)
+    scale = torch.empty_like(act_dq)
     for _, lo, hi, slot in block_spans(p):
         s0 = slot * atoms * 128
-        act_dq[lo:hi] = postact[lo:hi].float() * act_sf[
-            s0 : s0 + hi - lo
-        ].float().repeat_interleave(vec, dim=1)
-    for e in range(p.E):
-        ref = ref_fc1(p, e)
-        err = (act_dq[p.cu[e] : p.cu[e + 1]] - ref).abs().view(-1, I // vec, vec).amax(dim=-1)
-        amax = ref.abs().view(-1, I // vec, vec).amax(dim=-1)
-        assert (err <= amax * (2.0**-4 + 2.0**-5) + 1e-3).all(), (
-            f"expert {e}: postact quantization off"
-        )
+        scale[lo:hi] = act_sf[s0 : s0 + hi - lo].float().repeat_interleave(vec, dim=1) * pts_act
+        act_dq[lo:hi] = quant_values(postact[lo:hi]) * scale[lo:hi]
+    for e, ref in enumerate(refs):
+        rows = slice(int(p.cu[e]), int(p.cu[e + 1]))
+        err = (act_dq[rows] - ref).abs()
+        if nvfp4:
+            bound = scale[rows] * 1.05 + 1e-3
+        else:
+            amax = ref.abs().view(-1, I // vec, vec).amax(dim=-1, keepdim=True)
+            bound = (amax * (2.0**-4 + 2.0**-5) + 1e-3).expand(-1, -1, vec).reshape(-1, I)
+        assert (err <= bound).all(), f"expert {e}: postact quantization off"
 
-    # fc2 on the quantized postact: y = postact @ w2[e].T per expert
-    plain = lambda Cls, ctx: Cls.EpilogueArguments(add_to_output=None, rounding_mode=None)
-    fn2, _ = compile_varlen_n(GemmDefaultSm100, fmt, tile_n, plain, cutlass.BFloat16, "m")
+    # fc2 on the quantized postact: y = postact @ w2[e].T per expert, the SF atoms passed on as SFB
     w2 = torch.randn(p.E, H, I, device=device, dtype=torch.bfloat16) * 0.05
-    w2_q, w2_s, _, w2_dq = quantize(w2, fmt)
-    sfa2 = stack_sf(w2_s)
+    w2_q, w2_s, pts_w2, w2_dq = quantize(w2, fmt)
     y = torch.zeros(p.total, H, device=device, dtype=torch.bfloat16)
-    fn2(w2_q, postact, y.T, None, plain(GemmDefaultSm100, None), sched, varlen, sfa2, postact_sf)
+    name = BS_NAME[fmt]
+    alpha = {"alpha": float(pts_w2 * pts_act)} if nvfp4 else {}
+    gemm(
+        w2_q,
+        postact,
+        y.T,
+        None,
+        None,
+        256,
+        tile_n,
+        2,
+        1,
+        cu_seqlens_n=p.cu,
+        SFA=stack_sf(w2_s),
+        SFB=postact_sf,
+        bs_format_a=name,
+        bs_format_b=name,
+        **alpha,
+    )
     torch.cuda.synchronize()
     for e in range(p.E):
         ref = act_dq[p.cu[e] : p.cu[e + 1]] @ w2_dq[e].T
