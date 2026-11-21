@@ -25,6 +25,7 @@ from quack.tile_scheduler import (
 )
 from quack.utils import warp_prefix_sum
 
+from quack.gemm_tvm_ffi_utils import varlen_n_block_rows_host
 from quack.varlen_utils import VARLEN_N_GRANULE, varlen_n_block_rows
 
 GROUP_THREADS = 128  # threads per walk CTA
@@ -406,17 +407,11 @@ class DispatchWalk:
 # --- host ------------------------------------------------------------------------------------------------------------
 
 
-def even_split_block_rows(rows, tile_n, granule=VARLEN_N_GRANULE):
-    """Host twin of quack's varlen_n_block_rows over a tensor of per-expert row counts (0 rows -> tile_n)."""
-    num_blocks = ((rows + tile_n - 1) // tile_n).clamp(min=1)
-    return ((rows + num_blocks - 1) // num_blocks + granule - 1) // granule * granule
-
-
 def flag_targets(cu_seqlens, flags, tile_n):
     """What the flags read once every row has landed: rows of each (expert, block) in flags' shape, the blocks the
     swap-AB GEMM's even-split N blocks (tile_n = its tile N)."""
     rows = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int64)[:, None]
-    b = even_split_block_rows(rows, tile_n)
+    b = varlen_n_block_rows_host(rows, tile_n, VARLEN_N_GRANULE)
     first = torch.arange(flags.shape[1], device=flags.device)[None, :] * b
     return torch.minimum((rows - first).clamp_(min=0), b).to(torch.int32)
 

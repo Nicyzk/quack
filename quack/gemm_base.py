@@ -1372,13 +1372,17 @@ class GemmTmaBase(GemmBase):
             )
         tma_atom_c, tma_tensor_c = None, None
         if const_expr(mC is not None):
-            assert not varlen_n, "varlen_n does not support C yet"
             # Same zero-fill contract as A: with an active M-fold sink, C rows
             # past a sequence end must load as zero, not the next sequence's.
+            # varlen_n: C is ragged along N like D (the block's columns).
+            if const_expr(varlen_n):
+                mC_tma = copy_utils.create_ragged_tensor_for_tma(mC, ragged_dim=1, ptr_shift=False)
+            elif const_expr(varlen_m and self.epilogue_zero_fill_varlen_m(epilogue_args)):
+                mC_tma = copy_utils.create_ragged_tensor_for_tma(mC, ragged_dim=0, ptr_shift=False)
+            else:
+                mC_tma = mC
             tma_atom_c, tma_tensor_c = self._make_tma_epi_atoms_and_tensors(
-                copy_utils.create_ragged_tensor_for_tma(mC, ragged_dim=0, ptr_shift=False)
-                if varlen_m and self.epilogue_zero_fill_varlen_m(epilogue_args)
-                else mC,
+                mC_tma,
                 self.epi_c_smem_layout_staged,
                 self.epi_tile,
                 op_type="load",

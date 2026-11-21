@@ -32,9 +32,10 @@ from quack.gemm_tvm_ffi_utils import (
     make_scheduler_args,
     make_varlen_args,
     varlen_n_block_atoms,
+    varlen_n_block_rows_host,
+    varlen_n_sf_atoms,
 )
 from quack.rounding import RoundingMode
-from quack.varlen_utils import VARLEN_N_GRANULE
 
 sm100_only = pytest.mark.skipif(
     not torch.cuda.is_available() or get_device_capacity(torch.device("cuda"))[0] not in (10, 11),
@@ -83,13 +84,6 @@ def unblock_sf(sf6):
     return out.view(sf6.dtype)
 
 
-def even_split(counts, tile_n, granule=VARLEN_N_GRANULE):
-    """Host twin of varlen_n_block_rows: (blocks per expert, rows per block)."""
-    num_blocks = (counts + tile_n - 1) // tile_n
-    b = ((counts + num_blocks - 1) // num_blocks + granule - 1) // granule * granule
-    return num_blocks, b
-
-
 def cumsum0(x):
     return torch.cat([torch.zeros(1, dtype=torch.int32), x.cumsum(0).to(torch.int32)])
 
@@ -118,17 +112,6 @@ def quantize(x, fmt):
     return q, sf2d.reshape(*x.shape[:-1], -1), pts, op.dequantize(torch.float32).reshape(x.shape)
 
 
-def block_sf_atoms(p, tok_s, atoms):
-    """Token scales into per-block atoms, (1, slots * atoms, K / 128, 32, 4, 4)."""
-    slot_rows = atoms * 128
-    pad = torch.zeros(
-        int(p.cu_tiles[-1]) * slot_rows, tok_s.shape[1], dtype=torch.uint8, device=tok_s.device
-    )
-    for _, lo, hi, slot in block_spans(p):
-        pad[slot * slot_rows : slot * slot_rows + hi - lo] = tok_s[lo:hi].view(torch.uint8)
-    return blocked_sf(pad)[None].view(tok_s.dtype)
-
-
 def stack_sf(scales):
     """Per-expert blocked atoms, stacked through a byte view (no e8m0 cat kernel)."""
     return torch.stack([blocked_sf(s).view(torch.uint8) for s in scales]).view(scales.dtype)
@@ -150,7 +133,7 @@ def sf_kwargs(p, sfa, b_scales, tile_n):
     """The host entries' blockscaled kwargs: A's per-expert atoms, B's per-block atoms (bf16: none)."""
     if sfa is None:
         return {}
-    sfb = block_sf_atoms(p, b_scales, varlen_n_block_atoms(tile_n))
+    sfb = varlen_n_sf_atoms(b_scales, p.cu, tile_n)
     return dict(SFA=sfa, SFB=sfb, bs_format_a=BS_NAME[p.fmt], bs_format_b=BS_NAME[p.fmt])
 
 
@@ -220,7 +203,8 @@ def make_problem(fmt, tile_n, device):
     p = SimpleNamespace(fmt=fmt, E=len(COUNTS), counts=torch.tensor(COUNTS))
     p.total = int(p.counts.sum())
     p.cu = cumsum0(p.counts).to(device)
-    p.num_blocks, p.b = even_split(p.counts, tile_n)
+    p.num_blocks = (p.counts + tile_n - 1) // tile_n
+    p.b = varlen_n_block_rows_host(p.counts, tile_n)
     p.cu_tiles = cumsum0(p.num_blocks).to(device) if FORMATS[fmt][1] is not None else None
     w1_cat = torch.randn(p.E, 2 * I, H, device=device, dtype=torch.bfloat16) * 0.05
     w1_q, w1_s, p.pts_w, p.w1_dq = quantize(w1_cat, fmt)
@@ -274,7 +258,7 @@ def test_fc1_gated(fmt, tile_n, use_clc):
     p = make_problem(fmt, tile_n, device)
     postact = torch.empty(p.total, I, device=device, dtype=torch.bfloat16)
     epi_kw = {"alpha": Float32(float(p.pts_w * p.pts_tok))} if fmt == "nvfp4" else {}
-    sfs = () if p.sfa is None else (p.sfa, block_sf_atoms(p, p.tok_s, gemm.sfb_window_atoms))
+    sfs = () if p.sfa is None else (p.sfa, varlen_n_sf_atoms(p.tok_s, p.cu, tile_n))
     Cls = type(gemm)
     fn(
         p.w1_q_il,

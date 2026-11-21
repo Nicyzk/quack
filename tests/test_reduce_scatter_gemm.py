@@ -268,6 +268,51 @@ def _run_rank():
         check(f"rs+relu D iter={it}", out, ref, base)
         check(f"rs+relu iter={it}", post[:slab], ref.relu(), base.relu())
 
+    # --- blockscaled GEMM + RS (SM100): mxfp8 and nvfp4 operands into the same operator; the reducers are
+    # format-agnostic (bf16 partials, the EVT after the sum). nvfp4's per-tensor scales ride alpha, applied
+    # after the reduce, so they are the same on every rank (a global amax) ---
+    if capacity[0] in (10, 11):
+        from quack.blockscaled.operand import BlockScaledOperand
+        from quack.blockscaled.quantize import nvfp4_per_tensor_scale
+        from quack.gemm import gemm
+
+        for name in ("mxfp8_e4m3", "nvfp4"):
+            d, out, args = make_reduce_scatter_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
+            for it in range(NUM_ITERS):
+                torch.manual_seed(9000 + 10 * it + rank)
+                a = torch.randn(m, k, dtype=dtype, device=device) / 8
+                b = torch.randn(n, k, dtype=dtype, device=device) / 8
+                pts_a = pts_b = None
+                if name == "nvfp4":
+                    amax = torch.stack([a.abs().amax(), b.abs().amax()])
+                    dist.all_reduce(amax, op=dist.ReduceOp.MAX)
+                    pts_a, pts_b = nvfp4_per_tensor_scale(amax[0]), nvfp4_per_tensor_scale(amax[1])
+                a_op = BlockScaledOperand.quantize(a, name, per_tensor_scale=pts_a)
+                b_op = BlockScaledOperand.quantize(b, name, per_tensor_scale=pts_b)
+                gemm(
+                    a_op.qdata,
+                    b_op.qdata,
+                    d,
+                    None,
+                    None,
+                    TILE_M,
+                    TILE_N,
+                    1,
+                    1,
+                    raster_order=RasterOrderOption.AlongN,
+                    alpha=float(pts_a * pts_b) if name == "nvfp4" else 1.0,
+                    dist_op=ReduceScatter(rank, world),
+                    dist_op_args=args,
+                    SFA=a_op.scale,
+                    SFB=b_op.scale,
+                    bs_format_a=name,
+                    bs_format_b=name,
+                )
+                torch.cuda.synchronize(device)
+                a_dq, b_dq = (op.dequantize(torch.float32).to(dtype) for op in (a_op, b_op))
+                rows = slice(rank * slab, (rank + 1) * slab)
+                check(f"rs {name} iter={it}", out, full_ref(a_dq, b_dq)[rows], nccl_rs(a_dq, b_dq))
+
     d, out, args = make_lamport_buffers(m, n, dtype, TILE_M)  # D's own extent passes the module path's checks
     for it in range(max(NUM_ITERS, 5)):
         torch.manual_seed(7000 + 10 * it + rank)

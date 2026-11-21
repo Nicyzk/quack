@@ -3,7 +3,7 @@
 # drains each staged D subtile straight into the origin rank's slot for that (token, k) pair, 16 B per lane along
 # hidden (store_tile's own copy: the GEMM stages accumulator -> registers -> epi ops -> smem as always, the TMA store
 # is replaced). D is never written, nothing is waited on; completion is the kernel's end, then the caller barriers
-# and reduces every token's K slots (duckpond reduce_over_k). Slot id of token column c = row_key[c] = rank *
+# and reduces every token's K slots (quack.distributed.reduce_over_k). Slot id of token column c = row_key[c] = rank *
 # slots_per_rank + local. Usage: d, slots, args = make_combine_buffers(tokens_local, k, hidden, dtype, group,
 # max_rows); per call gemm(w2, act, d.T, ..., cu_seqlens_n=cu, dist_op=CombineStore(hidden),
 # dist_op_args=args(row_key)); then barrier; the landed rows are slots (tokens_local, k, hidden).

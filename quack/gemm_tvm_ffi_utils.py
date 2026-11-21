@@ -72,6 +72,33 @@ def varlen_n_block_atoms(tile_n):
     return -(-tile_n // 128)
 
 
+def varlen_n_block_rows_host(seqlens, tile_n, granule=16):
+    """Host twin of varlen_utils.varlen_n_block_rows over a tensor of per-sequence row counts: the rows of each
+    sequence's even-split blocks, ceil(n / ceil(n / tile_n)) rounded up to the granule (0 rows -> 0)."""
+    num_blocks = (seqlens + tile_n - 1) // tile_n
+    return ((seqlens + num_blocks - 1) // num_blocks.clamp(min=1) + granule - 1) // granule * granule
+
+
+def varlen_n_sf_atoms(scales, cu_seqlens_n, tile_n):
+    """The swap-AB GEMM's SFB from per-row scales (total_n, sf_k), 1 byte each: every even-split block owns
+    varlen_n_block_atoms(tile_n) 128-row atoms at slot cu_tiles_n[b] + j (VarlenManager.offset_block_SFB), as
+    (1, slots * atoms, rk, 32, 4, 4). Host-side; the slot count is one device read."""
+    import torch
+    from quack.blockscaled.quantize import pack_scale_2d_to_blocked_contig
+
+    total, sf_k = scales.shape
+    atoms = varlen_n_block_atoms(tile_n)
+    cu_tiles = compute_cu_tiles_m(cu_seqlens_n, tile_n)
+    b = varlen_n_block_rows_host(cu_seqlens_n[1:] - cu_seqlens_n[:-1], tile_n)
+    r = torch.arange(total, dtype=cu_seqlens_n.dtype, device=scales.device)
+    seq = torch.searchsorted(cu_seqlens_n, r, right=True) - 1
+    local = r - cu_seqlens_n[seq]
+    dst = (cu_tiles[seq] + local // b[seq]) * (atoms * 128) + local % b[seq]
+    rows = torch.zeros(int(cu_tiles[-1]) * atoms * 128, sf_k, dtype=torch.uint8, device=scales.device)
+    rows[dst.long()] = scales.view(torch.uint8)
+    return pack_scale_2d_to_blocked_contig(rows.view(scales.dtype))
+
+
 def validate_blockscaled_sf(
     A,
     B,
@@ -606,11 +633,10 @@ def make_fake_gemm_tensors(
     assert not (swap_ab and (varlen_m or varlen_k or varlen_n or b_kn)), (
         "swap_ab: dense, b_kn folded in"
     )
-    assert packed_cd is None or (not swap_ab and not varlen_k and not varlen_n), (
-        "packed_cd: dense/varlen_m only"
-    )
+    assert packed_cd is None or (not swap_ab and not varlen_k), "packed_cd: dense/varlen only"
     assert not (varlen_n and gather_A), "varlen_n does not support gather_A"
-    assert packed_cd != "m" or not varlen_m, "varlen packed C/D is n-major"
+    assert packed_cd != "m" or not varlen_m, "varlen_m packed C/D is n-major"
+    assert packed_cd != "n" or not varlen_n, "varlen_n packed C/D is m-major"
     a_leading = 1 if a_major == "k" else 0
     b_leading = 1 if b_major == "k" else 0
     d_leading = 1 if d_major == "n" else 0
@@ -668,8 +694,9 @@ def make_fake_gemm_tensors(
         n = cute.sym_int()
         mA = fake_batched(a_dtype, m, a_k_sym, l, a_leading, div_a)
         mB = fake_batched(b_dtype, n, b_k_sym, None, b_leading, div_b)
-        mD = fake_batched(d_dtype, m, n, None, d_leading, div_d)
-        mC = fake_batched(c_dtype, m, n, None, c_leading, div_c)
+        dc_m = pd if packed_cd is not None else m  # "m" form only under varlen_n
+        mD = fake_batched(d_dtype, dc_m, n, None, d_leading, div_d)
+        mC = fake_batched(c_dtype, dc_m, n, None, c_leading, div_c)
     elif varlen_k:
         # k is total_k in this case: the flattened K dimension of A/B
         k = cute.sym_int()

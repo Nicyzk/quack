@@ -700,11 +700,18 @@ class VecLoad(EpiOp):
         mVec = self._get_gmem_vec(param, ctx)
         tile_dim = self._tile_dim(ctx)
         coord_idx = ctx.tile_coord_mnkl[self._coord_idx()]
+        limit = min(cute.size(mVec, mode=[0]) - coord_idx * tile_dim, tile_dim)
+        if const_expr(self.dim == 1 and ctx.varlen_manager.varlen_n):
+            # a (total_n,) row vector: the block's even-split columns, their origin folded in
+            vm, batch, pid_n = ctx.varlen_manager, ctx.batch_idx, ctx.tile_coord_mnkl[1]
+            b = vm.block_n_rows(batch, tile_dim, gemm.varlen_n_granule)
+            mVec = cute.domain_offset((vm.params.cu_seqlens_n[batch] + pid_n * b,), mVec)
+            coord_idx = Int32(0)
+            limit = vm.block_n_valid(batch, pid_n, tile_dim, gemm.varlen_n_granule)
         gVec = cute.local_tile(mVec, (tile_dim,), (coord_idx,))
         tVgV = thr_copy.partition_S(gVec)
         tVsV = thr_copy.partition_D(smem_tensor)
         tVcV = thr_copy.partition_S(cute.make_identity_tensor(tile_dim))
-        limit = min(cute.size(mVec, mode=[0]) - coord_idx * tile_dim, tile_dim)
         for m in cutlass.range(cute.size(tVsV.shape[1]), unroll_full=True):
             if tVcV[0, m] < tile_dim:  # Guard to avoid writing beyond the smem we've allocated
                 pred = cute.make_rmem_tensor(1, Boolean)
@@ -931,16 +938,18 @@ class TileStore(EpiOp):
         # n-major by construction (asserted in to_params). Sub-byte (fp4)
         # tiles also need a fresh sym: their packed contiguous extent must be
         # statically divisible (the FFI packing check).
-        if self.epi_tile_fn is not None or dtype.width < 8:
-            n = cute.sym_int(divisibility=div_for_dtype(dtype))
+        # The M-halved tile (the M-paired gated aux) is the mirror: a fresh M sym, M contiguous.
+        halved_m = self.epi_tile_fn is _gated_m_epi_tile_fn
+        div = div_for_dtype(dtype)
+        m = cute.sym_int(divisibility=div) if halved_m else fctx.m
+        if not halved_m and (self.epi_tile_fn is not None or dtype.width < 8):
+            n = cute.sym_int(divisibility=div)
         else:
             n = fctx.n
-        leading = 1 if (major == "n" or self.epi_tile_fn is not None) else 0
+        leading = 0 if halved_m else (1 if (major == "n" or self.epi_tile_fn is not None) else 0)
         batch = fctx.l if (fctx.batched and not (fctx.varlen_m or fctx.varlen_n)) else None
-        if self.gated and self.pair_dim == "m":
-            # (half the GEMM M, n), m-major: a fresh M sym, M contiguous
-            m = cute.sym_int(divisibility=div_for_dtype(dtype))
-            return fake_batched(dtype, m, fctx.n, batch, 0, div_for_dtype(dtype))
+        if halved_m:
+            return fake_batched(dtype, m, n, batch, leading, div)
         if fctx.swapped:
             # Crossing order is caller-oriented (n_k, m_k); the caller-stride
             # major label flips with the shape order, so ``leading`` is
@@ -1054,6 +1063,10 @@ class TileStore(EpiOp):
         )
         layout = getattr(gemm, self._layout_gemm_attr())
         if gemm.arch == 100:
+            if tiled_copy_t2r is None:
+                # no tmem load to vectorize against (an operator's comm warps re-entering the epilogue
+                # on their own frame): the plain store, what the helper picks for a non-tmem copy
+                return cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), dtype)
             return blackwell_helpers.get_smem_store_op(
                 layout, dtype, gemm.acc_dtype, tiled_copy_t2r
             )
@@ -2232,7 +2245,19 @@ class RowVecReduce(VecReduce):
             tile_shape_mn if tile_shape_mn is not None else gemm.cta_tile_shape_mnk[:2]
         )[1]
         batch_idx = tile_coord_mnkl[3]
-        if const_expr(not varlen_manager.varlen_m):
+        col0 = Int32(0)  # the vector's column origin within the tile's N (varlen_n: the block's)
+        if const_expr(varlen_manager.varlen_n):
+            # (m_tiles, total_n) partials: this tile's row, the block's even-split columns
+            limit_m_tiles = param.shape[0]
+            mRowVec = param[tile_coord_mnkl[0], None]
+            b = varlen_manager.block_n_rows(batch_idx, tile_N, gemm.varlen_n_granule)
+            mRowVec = cute.domain_offset(
+                (varlen_manager.params.cu_seqlens_n[batch_idx] + tile_coord_mnkl[1] * b,), mRowVec
+            )
+            limit_n = varlen_manager.block_n_valid(
+                batch_idx, tile_coord_mnkl[1], tile_N, gemm.varlen_n_granule
+            )
+        elif const_expr(not varlen_manager.varlen_m):
             limit_m_tiles = param.shape[1]
             mRowVec = param[batch_idx, tile_coord_mnkl[0], None]
         else:
@@ -2247,11 +2272,14 @@ class RowVecReduce(VecReduce):
             )
             limit_m_tiles = varlen_manager.len_m_tiles(batch_idx)
             mRowVec = param[varlen_manager.tile_m_offset(batch_idx) + tile_coord_mnkl[0], None]
-        gRowVec = cute.local_tile(mRowVec, (tile_N,), (tile_coord_mnkl[1],))
-        limit_n = min(
-            cute.size(mRowVec, mode=[0]) - tile_coord_mnkl[1] * tile_N,
-            tile_N,
-        )
+        if const_expr(varlen_manager.varlen_n):
+            gRowVec = cute.local_tile(mRowVec, (tile_N,), (col0,))
+        else:
+            gRowVec = cute.local_tile(mRowVec, (tile_N,), (tile_coord_mnkl[1],))
+            limit_n = min(
+                cute.size(mRowVec, mode=[0]) - tile_coord_mnkl[1] * tile_N,
+                tile_N,
+            )
         # Two-input max.xorsign.abs leaves an XOR-derived sign; clear it once
         # after the full reduction.
         if const_expr(use_swap_shuffle):

@@ -220,7 +220,7 @@ _KIND_TO_OP = {
 }
 
 
-def _infer_kind(name, value, m, n, varlen_m=False):
+def _infer_kind(name, value, m, n, varlen_m=False, varlen_n=False):
     if not hasattr(value, "stride"):  # python number
         return "scalar"
     if value.ndim == 0 or value.numel() == 1:
@@ -230,14 +230,16 @@ def _infer_kind(name, value, m, n, varlen_m=False):
     inner = value.shape[-1]
     if value.ndim <= 2 and inner in (m, n):
         if value.ndim == 1:
-            # Rank-1 vectors are the varlen colvec form: (total_m,), offset per
-            # segment via cu_seqlens on the device side.
-            if not (varlen_m and inner == m):
-                raise ValueError(
-                    f"operand '{name}': rank-1 vectors are varlen colvecs (total_m,); "
-                    f"dense calls pass (l, dim)"
-                )
-            return "col"
+            # Rank-1 vectors are the varlen forms: (total_m,) colvecs under varlen_m, (total_n,)
+            # rowvecs under varlen_n, offset per segment / block on the device side.
+            if varlen_m and inner == m:
+                return "col"
+            if varlen_n and inner == n:
+                return "row"
+            raise ValueError(
+                f"operand '{name}': rank-1 vectors are varlen vectors ((total_m,) colvecs, "
+                f"(total_n,) rowvecs); dense calls pass (l, dim)"
+            )
         if m == n:
             raise ValueError(
                 f"operand '{name}': m == n makes row/col inference ambiguous; "
@@ -834,10 +836,15 @@ class EpiMod:
                 raise ValueError("varlen_n: B is (total_n, k), k-major")
             if D is not None and (D.ndim != 2 or D.stride(0) != 1):
                 raise ValueError("varlen_n: D is (m, total_n), m-major")
-            if C is not None or add_to_output or self.prepass is not None or self.sinks:
-                raise ValueError("varlen_n: no C, add_to_output, prepass or sinks yet")
-            if any(not isinstance(self.ops.get(name), Scalar) for name in self.operand_names):
-                raise ValueError("varlen_n: scalar epilogue operands only (no vec / tile loads)")
+            if (C is not None and self.mode != "packed_cd_b16x2") or add_to_output or self.prepass:
+                raise ValueError("varlen_n: no C (except the packed pair mode's), add_to_output or prepass")
+            if any(getattr(op, "dim", 1) != 1 for op in self.sinks.values()):
+                raise ValueError("varlen_n: row-vector (per token column) sinks only")
+            if any(
+                not isinstance(self.ops.get(name), (Scalar, RowVecLoad)) and name != "c"
+                for name in self.operand_names
+            ):
+                raise ValueError("varlen_n: scalar and row-vector (per token column) operands only")
         if blockscaled:
             if varlen_m or gather_A:
                 raise ValueError("blockscaled GEMM does not support varlen/gather yet")
@@ -1001,7 +1008,9 @@ class EpiMod:
             if name not in epi_args:
                 raise ValueError(f"missing epilogue operand '{name}'")
             kind = (
-                "pinned" if name in pins else _infer_kind(name, epi_args[name], m_i, n_i, varlen_m)
+                "pinned"
+                if name in pins
+                else _infer_kind(name, epi_args[name], m_i, n_i, varlen_m, varlen_n)
             )
             if varlen_m and kind == "tile":
                 raise ValueError(f"operand '{name}': TileLoad does not support varlen_m yet")
@@ -1241,9 +1250,11 @@ class EpiMod:
     # decisions). B is (k, n) logical at this surface — the torch convention —
     # with the physical layout free.
 
-    def _lead_shape(self, A, cu_seqlens_m, A_idx):
+    def _lead_shape(self, A, cu_seqlens_m, A_idx, cu_seqlens_n=None):
         if cu_seqlens_m is not None:
             return ((A_idx.shape[0] if A_idx is not None else A.shape[0]),)
+        if cu_seqlens_n is not None:
+            return (A.shape[-2],)  # the swap-AB GEMM's outputs are 2-D (m, total_n)
         return tuple(A.shape[:-1])
 
     def _default_config(self, A, B, transform_a):

@@ -883,8 +883,10 @@ class GemmSm100(GemmTmaBase):
                 and not op.is_tile_store()
                 and getattr(op, "fn_port", None) != "scalar"  # a scalar reads no row / block coordinate
                 and getattr(op, "quant_output", "D") == "D"  # an aux's quantize codec offsets by block itself
+                # row vectors and row-vector sinks fold the block's column origin themselves
+                and not (getattr(op, "dim", None) == 1 and getattr(op, "fn_port", None) in ("row", "sink"))
                 for op in getattr(type(self), "_epi_ops", ())
-            ), "varlen_n supports only tile-store epilogue ops, scalars and their quantize codecs"
+            ), "varlen_n supports tile-store ops, scalars, their quantize codecs and row vectors"
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes(epilogue_args, varlen_args)
@@ -1799,13 +1801,26 @@ class GemmSm100(GemmTmaBase):
                     batch_idx, split_idx = tile_coord_mnkl[3], tile_coord_mnkl[2]
                     copy_C = None
                     if const_expr(has_C):
+                        if const_expr(varlen_manager.varlen_n):
+                            # C ragged to the block's columns (as the D store); the n coordinate is folded in
+                            mC_blk = varlen_manager.offset_block_epi(
+                                mC_mnl,
+                                batch_idx,
+                                tile_coord_mnkl[1],
+                                self.cta_tile_shape_mnk[1],
+                                self.varlen_n_granule,
+                            )
+                            coord_C = (tile_coord_mnkl[0], Int32(0), *tile_coord_mnkl[2:])
+                        else:
+                            mC_blk = varlen_manager.offset_batch_epi(mC_mnl, batch_idx)
+                            coord_C = tile_coord_mnkl
                         copy_C_fn, _, _ = self.epilog_gmem_copy_and_partition(
                             tma_atom_c,
-                            varlen_manager.offset_batch_epi(mC_mnl, batch_idx),
+                            mC_blk,
                             self.cta_tile_shape_mnk[:2],
                             epi_tile,
                             sC,
-                            tile_coord_mnkl,
+                            coord_C,
                         )
                         copy_C = copy_utils.tma_producer_copy_fn(copy_C_fn, epi_pipeline)
                     tile_load_copy_fns = self.epi_tile_load_g2s_copy_fns(

@@ -123,7 +123,7 @@ def dswiglu_mod(acc, c):
     return {"D": pack(dx, dy), "postact": out}
 
 
-def make_dgated_moe_mod(dgate):
+def make_dgated_moe_mod(dgate, pair_dim="n"):
     """MoE-expert fc2-dgrad epilogue factory (the gpt-oss shape: biased FFN +
     per-token router score on the expert output). acc = d(expert_out) @ W2^T
     UNSCALED, score colvec = the router weight. Emits:
@@ -135,33 +135,32 @@ def make_dgated_moe_mod(dgate):
         per token — the router score grad, one fma via the scaled reduce;
       * the fc1 bias grad as an N-wide rowvec PAIR (the preact is 2N-wide and
         a rowvec slot is one f32): host interleaves db[0::2] = dbias_g,
-        db[1::2] = dbias_u, matching the packed (x, y) preact layout."""
+        db[1::2] = dbias_u, matching the packed (x, y) preact layout.
+    pair_dim "m" (the swap-AB fc2 dgrad under cu_seqlens_n: A = W2^T per
+    expert, tokens along N): the preact pairs pack along M (C / D (2I, total)
+    m-major, pairwise-interleaved rows), score is a (total,) rowvec, dscore a
+    row-vector reduce over I, postact (I, total) m-major. No bias grads there
+    yet: they would be per-expert column reduces into a (num_seqs, I) sink."""
+    bias = pair_dim == "n"
+    ops = {"score": (ColVecLoad if bias else RowVecLoad)("score")}
+    reduces = {"dscore": (ColVecReduce if bias else RowVecReduce)("dscore", scaled=True)}
+    if bias:
+        reduces.update(dbias_g=RowVecReduce("dbias_g"), dbias_u=RowVecReduce("dbias_u"))
 
-    @gemm_epilogue(
-        outputs=("postact",),
-        ops={"score": ColVecLoad("score")},
-        reduces={
-            "dscore": ColVecReduce("dscore", scaled=True),
-            "dbias_g": RowVecReduce("dbias_g"),
-            "dbias_u": RowVecReduce("dbias_u"),
-        },
-        mode="packed_cd_b16x2",
-    )
+    @gemm_epilogue(outputs=("postact",), ops=ops, reduces=reduces, mode="packed_cd_b16x2")
     def dgated_moe_mod(acc, c, score):
         x, y = unpack(c)
         dx, dy, out = dgate(x, y, acc * score)
-        return {
-            "D": pack(dx, dy),
-            "postact": out * score,
-            "dscore": (out, acc),
-            "dbias_g": dx,
-            "dbias_u": dy,
-        }
+        outs = {"D": pack(dx, dy), "postact": out * score, "dscore": (out, acc)}
+        if bias:
+            outs.update(dbias_g=dx, dbias_u=dy)
+        return outs
 
     return dgated_moe_mod
 
 
 dswiglu_moe_mod = make_dgated_moe_mod(dswiglu)
+dswiglu_moe_swap_mod = make_dgated_moe_mod(dswiglu, pair_dim="m")  # the swap-AB (tokens on N) fc2 dgrad
 
 
 # gpt-oss exact: swiglu_oai with the swiglu_limit=7.0 preact clamp (grads
