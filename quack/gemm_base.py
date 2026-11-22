@@ -51,6 +51,17 @@ class NamedBarrierGemm(enum.IntEnum):
 COMM_BARRIER_ID = max(NamedBarrierGemm) + 1
 
 
+class PartialStore(DStore):
+    """D's store op for a runs_evt operator's raw partial: the convert targets the wire's dtype
+    (d_stage_dtype), round-to-nearest; the output's dtype and codec are the comm warps' D."""
+
+    @cute.jit
+    def store_convert(
+        self, gemm, tRS_rD, sr_seed, tidx, tile_coord_mnkl, num_prev_subtiles, epi_idx
+    ):
+        return tRS_rD.to(gemm.d_stage_dtype)
+
+
 class DistOpCtx:
     """What a kernel hands the operator's hooks: built once per kernel after setup, the same object at
     every call point. Operators unpack the fields they use into locals before any dynamic loop (the DSL
@@ -66,11 +77,12 @@ class DistOpCtx:
         epi_smem_tensors=None,  # gemm.epilogue with them
         varlen=None,  # the VarlenManager
         mC=None,  # runs_evt: the C operand (gmem), read per subtile by the comm warps
+        mD=None,  # runs_evt: the output D (gmem), committed per subtile by the comm warps
     ):
         self.args, self.smem, self.sched_params = args, smem, sched_params
         self.TileSchedulerCls, self.varlen = TileSchedulerCls, varlen
         self.epi_params, self.epi_smem_tensors = epi_params, epi_smem_tensors
-        self.mC = mC
+        self.mC, self.mD = mC, mD
 
 
 class DistOp:
@@ -115,18 +127,36 @@ class DistOp:
 
     def epi_warp_shape_mnk(self, gemm):
         """runs_evt: the (m, n, k) warp arrangement the comm warps run the epi ops in (what the
-        ops' smem is laid out for); the tile and subtile they run on are arguments of their epilogue call."""
+        ops' smem is laid out for); the tile they run on is an argument of their epilogue call."""
+        return None
+
+    def epi_tile(self, gemm):
+        """runs_evt: the (m, n) subtile the comm warps run the epi ops on (what the aux outputs' smem
+        stage and TMA box are sized for); their epilogue call's epi_tile."""
         return None
 
     def d_shape(self, shape):
-        """Host: the shape of D for a problem whose output is `shape` (the buffer factory allocates it,
-        the frontend validates it from this one place)."""
+        """Host: the operator's output shape (D) for a problem whose GEMM output is `shape` (RS: the
+        slab); the buffer factory allocates it, the frontend validates it from this one place."""
         return shape
+
+    def partial_tensor(self, dist_op_args):
+        """runs_evt: the operator's buffer the GEMM's epilogue warps stage and TMA-store their raw
+        partial into, in D's place (its dtype is the wire's); D itself is committed by the comm warps."""
+        return None
+
+    @cute.jit
+    def store_sink(self, dst: cute.Tensor, idx, value):
+        """runs_evt: where an epilogue reduce output's slot lands, dst[idx] = value (the ops call it
+        through gemm.store_sink). Local by default; an operator whose result is replicated into every
+        rank stores it into every rank's copy too (the slot is complete on the one rank that reduced
+        its stripe)."""
+        dst[idx] = value
 
     def store_tile(self, gemm, ctx, sD, epi_tile, tidx, tile_coord_mnkl, batch_idx, varlen_manager):
         """Trace-time, in the epilogue warps, per schedule tile: the s2g of its staged subtiles, as
-        (coord, copy) with one set. coord: a tile coordinate in D for the GEMM's TMA store (default this
-        tile; D is the operator's, not the caller's output). copy: the operator's own jit callable
+        (coord, copy) with one set. coord: a tile coordinate for the GEMM's TMA store (default this
+        tile; under runs_evt the store's target is partial_tensor). copy: the operator's own jit callable
         (src_idx, dst_idx) every epilogue thread runs on smem stage src_idx (combine: each row's slice into
         its origin rank's slot). The staging (accumulator -> registers -> epi ops -> smem) stays the GEMM's."""
         return tile_coord_mnkl, None
@@ -349,6 +379,18 @@ class GemmBase:
             return self.dist_op.epi_warp_shape_mnk(self)
         return self.epi_warp_shape_mnk()
 
+    def epi_smem_tile(self):
+        """The subtile the aux outputs are staged on: the operator's when its warps run the epilogue
+        (runs_evt), else this arch's epi_tile."""
+        if self.dist_op.runs_evt:
+            return self.dist_op.epi_tile(self)
+        return self.epi_tile
+
+    @cute.jit
+    def store_sink(self, dst: cute.Tensor, idx, value):
+        """An epilogue reduce output's slot store, dst[idx] = value: where it lands is the operator's."""
+        self.dist_op.store_sink(dst, idx, value)
+
     def epi_warp_shape_mnk(self):
         """This arch's epilogue warps as (m, n, k)."""
         return (self.num_epi_warps, 1, 1)
@@ -417,7 +459,7 @@ class GemmBase:
         )
         has_C = const_expr(tRS_rC is not None)
         has_epi_load = const_expr(self.epi_c_stage > 0 and load_C is None and not store_partial)
-        has_D = const_expr(copy_D is not None)
+        has_D = const_expr(copy_D is not None or commit_D is not None)
         assert not (copy_D is not None and commit_D is not None), (
             "copy_D (smem+TMA) and commit_D (register-direct) are alternative D store paths"
         )
@@ -442,7 +484,7 @@ class GemmBase:
             assert has_D and self.rounding_mode != RoundingMode.RS, (
                 "store_partial commits D with round-to-nearest"
             )
-            store_ctxs = ((DStore(), None, tiled_copy_r2s, tRS_sD, copy_D, None),)
+            store_ctxs = ((PartialStore(), None, tiled_copy_r2s, tRS_sD, copy_D, None),)
         else:
             store_ctxs = self.epi_setup_aux_out(
                 params,
@@ -455,8 +497,16 @@ class GemmBase:
                 tile_shape_mn=frame_mn,
             )
             if const_expr(has_D):
+                # D's stage: smem + TMA (copy_D), or none for a register-direct commit (commit_D)
                 store_ctxs = (
-                    (DStore(), self._epi_store_quant("D"), tiled_copy_r2s, tRS_sD, copy_D, None),
+                    (
+                        DStore(),
+                        self._epi_store_quant("D"),
+                        tiled_copy_r2s if copy_D is not None else None,
+                        tRS_sD,
+                        copy_D,
+                        None,
+                    ),
                 ) + store_ctxs
 
         epi_tile_shape = cute.zipped_divide(cute.make_layout(frame_mn), epi_tile).shape[1]
@@ -630,13 +680,14 @@ class GemmBase:
             iket.range_push("epi_r2s")
             for i in cutlass.range_constexpr(len(store_ctxs)):
                 op, _, tiled_copy_st, tRS_s, _, _ = store_ctxs[i]
-                op.store_r2s(
-                    self,
-                    tiled_copy_st,
-                    store_frags_out[i],
-                    tRS_s[None, None, None, epi_buffer],
-                    tidx,
-                )
+                if const_expr(tiled_copy_st is not None):
+                    op.store_r2s(
+                        self,
+                        tiled_copy_st,
+                        store_frags_out[i],
+                        tRS_s[None, None, None, epi_buffer],
+                        tidx,
+                    )
             iket.range_pop()
             if const_expr(use_tma_epi):
                 iket.range_push("epi_store_issue")
@@ -645,25 +696,27 @@ class GemmBase:
                 if is_tma_warp:
                     for i in cutlass.range_constexpr(len(store_ctxs)):
                         _, _, _, _, copy_out, store_pred = store_ctxs[i]
-                        if const_expr(store_pred is None):
-                            copy_out(src_idx=epi_buffer, dst_idx=epi_coord)
-                        else:
-                            if store_pred:
+                        if const_expr(copy_out is not None):
+                            if const_expr(store_pred is None):
                                 copy_out(src_idx=epi_buffer, dst_idx=epi_coord)
+                            else:
+                                if store_pred:
+                                    copy_out(src_idx=epi_buffer, dst_idx=epi_coord)
                     epi_store_pipeline.producer_commit()
                 iket.range_pop()
             else:
                 epilogue_barrier.arrive_and_wait()
                 for i in cutlass.range_constexpr(len(store_ctxs)):
                     _, _, _, _, copy_out, store_pred = store_ctxs[i]
-                    if const_expr(store_pred is None):
-                        copy_out(src_idx=epi_buffer, dst_idx=epi_coord)
-                    else:
-                        if store_pred:
+                    if const_expr(copy_out is not None):
+                        if const_expr(store_pred is None):
                             copy_out(src_idx=epi_buffer, dst_idx=epi_coord)
+                        else:
+                            if store_pred:
+                                copy_out(src_idx=epi_buffer, dst_idx=epi_coord)
                 epilogue_barrier.arrive_and_wait()
             if const_expr(commit_D is not None):
-                commit_D(tRS_rD, epi_coord)
+                commit_D(store_frags_out[0], epi_coord)  # D's converted (quantized) fragment
 
         if const_expr(not store_partial):
             self.epi_end(
@@ -1508,8 +1561,11 @@ class GemmTmaBase(GemmBase):
             syncwarp_before_release=True,
         )
 
-    def make_epi_store_pipeline(self):
-        num_epi_threads = self.num_epi_warps * cute.arch.WARP_SIZE
+    def make_epi_store_pipeline(self, num_warps=None):
+        """The TMA store pipeline of a group of warps (default: this arch's epilogue warps)."""
+        num_epi_threads = (
+            num_warps if num_warps is not None else self.num_epi_warps
+        ) * cute.arch.WARP_SIZE
         epi_store_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread, num_epi_threads)
         return pipeline.PipelineTmaStore.create(
             num_stages=self.epi_stage, producer_group=epi_store_producer_group

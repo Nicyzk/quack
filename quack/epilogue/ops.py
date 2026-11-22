@@ -996,7 +996,9 @@ class TileStore(EpiOp):
                 )
         setattr(gemm, self._layout_gemm_attr(), layout)
         setattr(gemm, self._dtype_gemm_attr(), tensor.element_type)
-        epi_tile = self.epi_tile_fn(gemm, gemm.epi_tile) if self.epi_tile_fn else None
+        epi_tile = gemm.epi_smem_tile()  # the storing warps' subtile (an operator's under runs_evt)
+        if self.epi_tile_fn:
+            epi_tile = self.epi_tile_fn(gemm, epi_tile)
         tma_atom, tma_tensor, smem_layout, epi_tile_out = setup_epi_tensor(
             gemm,
             tensor,
@@ -1996,6 +1998,7 @@ class ColVecReduce(VecReduce):
                                 vals_m[k][m] = merged[k]
 
         # Write to gmem (limits in the epilogue frame)
+        store_sink = gemm.store_sink  # bound here: the object cannot cross into a dynamic if
         tile_M = const_expr(
             tile_shape_mn if tile_shape_mn is not None else gemm.cta_tile_shape_mnk[:2]
         )[0]
@@ -2016,7 +2019,7 @@ class ColVecReduce(VecReduce):
                 for j in cutlass.range_constexpr(slice_elems):
                     row_idx = tDcD_m[lane_g * slice_elems + j][0]
                     if row_idx < limit_m:
-                        gColVec[row_idx] = self._finalize(tuple(v[j] for v in vals_m))
+                        store_sink(gColVec, row_idx, self._finalize(tuple(v[j] for v in vals_m)))
         else:
             should_write_gmem = (
                 is_lane_n_leader
@@ -2027,7 +2030,7 @@ class ColVecReduce(VecReduce):
                 for m in cutlass.range(cute.size(tDcD_m, mode=[0])):
                     row_idx = tDcD_m[m][0]
                     if row_idx < limit_m:
-                        gColVec[row_idx] = self._finalize(tuple(v[m] for v in vals_m))
+                        store_sink(gColVec, row_idx, self._finalize(tuple(v[m] for v in vals_m)))
 
 
 class RowVecReduce(VecReduce):
@@ -2241,6 +2244,7 @@ class RowVecReduce(VecReduce):
                             )
 
         # Write to gmem (limits in the epilogue frame)
+        store_sink = gemm.store_sink  # bound here: the object cannot cross into a dynamic if
         tile_N = const_expr(
             tile_shape_mn if tile_shape_mn is not None else gemm.cta_tile_shape_mnk[:2]
         )[1]
@@ -2288,10 +2292,12 @@ class RowVecReduce(VecReduce):
                 for j in cutlass.range_constexpr(slice_elems):
                     col_idx = tDcD_n[lane_g * slice_elems + j][1]
                     if col_idx < limit_n:
-                        gRowVec[col_idx] = (
+                        store_sink(
+                            gRowVec,
+                            col_idx,
                             cute.math.abs(tDrReduce_n[j])
                             if const_expr(self.combine == "max_abs")
-                            else tDrReduce_n[j]
+                            else tDrReduce_n[j],
                         )
         else:
             should_write_gmem = (
@@ -2303,10 +2309,12 @@ class RowVecReduce(VecReduce):
                 for n in cutlass.range(cute.size(tDcD_n, mode=[0])):
                     col_idx = tDcD_n[n][1]
                     if col_idx < limit_n:
-                        gRowVec[col_idx] = (
+                        store_sink(
+                            gRowVec,
+                            col_idx,
                             cute.math.abs(tDrReduce_n[n])
                             if const_expr(self.combine == "max_abs")
-                            else tDrReduce_n[n]
+                            else tDrReduce_n[n],
                         )
 
 

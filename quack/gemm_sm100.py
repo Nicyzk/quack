@@ -594,7 +594,7 @@ class GemmSm100(GemmTmaBase):
             self.cta_tile_shape_mnk,
             self.use_2cta_instrs,
             self.epi_d_layout,
-            self.d_dtype if self.d_dtype is not None else cutlass.BFloat16,
+            self.d_stage_dtype if self.d_stage_dtype is not None else cutlass.BFloat16,
             layout_c=self.c_layout if self.c_layout is not None else tile_load_layout,
             elem_ty_c=self.c_dtype if self.c_dtype is not None else tile_load_dtype,
         )
@@ -649,7 +649,7 @@ class GemmSm100(GemmTmaBase):
             self.b_smem_dtype,
             self.sf_dtype,
             self.sf_vec_size,
-            self.d_dtype,
+            self.d_stage_dtype,
             self.c_dtype,
             self.d_layout,
             self.c_layout,
@@ -659,6 +659,7 @@ class GemmSm100(GemmTmaBase):
             - self.dist_op.smem_bytes(self),  # smem_capacity
             self.occupancy,
             self.epi_smem_warp_shape_mnk(),
+            epi_smem_tile=self.epi_smem_tile(),
         )
         # With CLC the try_cancel response lands directly in the consumer slot, so
         # the next query can only be issued once all consumers (cluster-wide)
@@ -692,9 +693,9 @@ class GemmSm100(GemmTmaBase):
             self.tiled_mma, self.mma_tiler, self.b_smem_dtype, self.ab_stage
         )
         self.epi_smem_layout_staged = None
-        if const_expr(self.d_dtype is not None):
+        if const_expr(self.d_stage_dtype is not None):
             self.epi_smem_layout_staged = sm100_utils.make_smem_layout_epi(
-                self.d_dtype, self.d_layout, self.epi_tile, self.epi_stage
+                self.d_stage_dtype, self.d_layout, self.epi_tile, self.epi_stage
             )
         self.epi_c_smem_layout_staged = None
         if const_expr(self.c_dtype is not None):
@@ -794,9 +795,11 @@ class GemmSm100(GemmTmaBase):
             if const_expr(cute.rank(mSFB) == 5):
                 mSFB = layout_utils.expand(mSFB, 0, 1)
         # the comm warps run the epilogue and read C themselves (per subtile, from gmem): the GEMM stages no C
-        mC_comm = None
+        mC_comm, mD_comm = None, None
         if const_expr(self.dist_op.runs_evt):
+            # ... and commit D themselves; the GEMM stages the operator's partial in D's place
             mC_comm, mC = mC, None
+            mD_comm, mD = mD, self.dist_op.partial_tensor(dist_op_args)
         # Tensors arrive batch-first: rotate (l, x, y) -> (x, y, l) at trace time.
         # Dense rank-2 operands get a trivial batch mode appended instead.
         mA, mB, mD, mC, epilogue_args = self.rotate_batch_last(
@@ -847,7 +850,8 @@ class GemmSm100(GemmTmaBase):
             self.a_unpack, self.b_unpack = False, False
         self.a_smem_dtype = cutlass.Uint8 if self.a_unpack else self.a_dtype
         self.b_smem_dtype = cutlass.Uint8 if self.b_unpack else self.b_dtype
-        self.d_dtype = mD.element_type if mD is not None else None
+        self.d_stage_dtype = mD.element_type if mD is not None else None  # what the epilogue warps stage
+        self.d_dtype = mD_comm.element_type if mD_comm is not None else self.d_stage_dtype  # the output
         self.c_dtype = mC.element_type if mC is not None else None
         self.sf_dtype: Optional[Type[cutlass.Numeric]] = (
             mSFA.element_type if mSFA is not None else None
@@ -885,8 +889,10 @@ class GemmSm100(GemmTmaBase):
                 and getattr(op, "quant_output", "D") == "D"  # an aux's quantize codec offsets by block itself
                 # row vectors and row-vector sinks fold the block's column origin themselves
                 and not (getattr(op, "dim", None) == 1 and getattr(op, "fn_port", None) in ("row", "sink"))
+                # column vectors index M (the weight's rows, per sequence), which is not ragged
+                and not (getattr(op, "dim", None) == 0 and getattr(op, "fn_port", None) == "col")
                 for op in getattr(type(self), "_epi_ops", ())
-            ), "varlen_n supports tile-store ops, scalars, their quantize codecs and row vectors"
+            ), "varlen_n supports tile-store ops, scalars, their quantize codecs, row and column vectors"
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes(epilogue_args, varlen_args)
@@ -1084,7 +1090,7 @@ class GemmSm100(GemmTmaBase):
         self.epi_load_bytes_per_stage = self.epi_smem_bytes(
             epilogue_args,
             self.cta_tile_shape_mnk,
-            self.epi_tile,
+            self.epi_smem_tile(),
             self.epi_smem_warp_shape_mnk(),
         ).c_stage
         if const_expr(mC is not None):
@@ -1138,7 +1144,7 @@ class GemmSm100(GemmTmaBase):
             # (EPI_TILE_M, EPI_TILE_N, STAGE)
             sD: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.d_dtype if self.d_dtype is not None else Int32, epi_smem_size
+                    self.d_stage_dtype if self.d_stage_dtype is not None else Int32, epi_smem_size
                 ],
                 self.buffer_align_bytes,
             ]
@@ -1207,6 +1213,7 @@ class GemmSm100(GemmTmaBase):
             TileSchedulerCls,
             dist_op_args,
             mC_comm,
+            mD_comm,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -1249,6 +1256,7 @@ class GemmSm100(GemmTmaBase):
         TileSchedulerCls: cutlass.Constexpr[Callable],
         dist_op_args,
         mC_comm: Optional[cute.Tensor],
+        mD_comm: Optional[cute.Tensor],
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -1408,6 +1416,7 @@ class GemmSm100(GemmTmaBase):
             epi_smem_tensors,
             varlen_manager,
             mC_comm,
+            mD_comm,
         )
 
         # Cluster wait before tensor memory alloc
@@ -2078,7 +2087,7 @@ class GemmSm100(GemmTmaBase):
 
             tTR_rD = cute.make_rmem_tensor(tTR_rAcc.shape, self.acc_dtype)
             tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
-                tiled_copy_t2r, self.epi_d_layout, self.d_dtype, tTR_rD, sD, epi_tidx
+                tiled_copy_t2r, self.epi_d_layout, self.d_stage_dtype, tTR_rD, sD, epi_tidx
             )
             tRS_rC, tSR_rC, tSR_sC = None, None, None
             tiled_copy_s2r = None
@@ -2702,7 +2711,7 @@ class GemmSm100(GemmTmaBase):
         copy_atom_t2r = sm100_utils.get_tmem_load_op(
             self.cta_tile_shape_mnk,
             self.epi_d_layout,
-            self.d_dtype if self.d_dtype is not None else cutlass.BFloat16,
+            self.d_stage_dtype if self.d_stage_dtype is not None else cutlass.BFloat16,
             self.acc_dtype,
             epi_tile,
             use_2cta_instrs,
@@ -3008,6 +3017,7 @@ class GemmSm100(GemmTmaBase):
         smem_capacity: int,
         occupancy: int,
         warp_shape_mnk: Tuple[int, int, int] | None = None,
+        epi_smem_tile=None,  # the aux outputs' subtile when not epi_tile (an operator's comm warps)
     ) -> Tuple[int, int, int]:
         """Computes the number of stages for A/B/C operands based on heuristics.
 
@@ -3044,7 +3054,10 @@ class GemmSm100(GemmTmaBase):
         # Default D stages
         epi_stage = 4 if cute.size(epi_tile[1]) <= 16 else 2
         epi_smem_bytes = cls.epi_smem_bytes(
-            epilogue_args, cta_tile_shape_mnk, epi_tile, warp_shape_mnk
+            epilogue_args,
+            cta_tile_shape_mnk,
+            epi_smem_tile if epi_smem_tile is not None else epi_tile,
+            warp_shape_mnk,
         )
         has_tile_load = epi_smem_bytes.c_stage > 0
         epi_c_stage = (

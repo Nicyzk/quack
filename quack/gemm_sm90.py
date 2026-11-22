@@ -460,7 +460,7 @@ class GemmSm90(GemmTmaBase):
         self.epi_tile = self._compute_tile_shape_or_override(
             self.cta_tile_shape_mnk,
             self.atom_layout_mnk,
-            self.d_dtype,
+            self.d_stage_dtype,
         )
         self.epi_tile_shape = cute.ceil_div(self.cta_tile_shape_mnk[:2], self.epi_tile)
 
@@ -473,13 +473,14 @@ class GemmSm90(GemmTmaBase):
             self.epi_tile,
             self.a_smem_dtype,
             self.b_smem_dtype,
-            self.d_dtype,
+            self.d_stage_dtype,
             self.c_dtype,
             epilogue_args,
             cutlass.utils.get_smem_capacity_in_bytes(f"sm_{self.arch}")
             - self.dist_op.smem_bytes(self),  # smem_capacity
             self.occupancy,
             self.epi_smem_warp_shape_mnk(),
+            epi_smem_tile=self.epi_smem_tile(),
             # layout-owning transform_a: A's smem bytes come from the
             # transform, not the (tile_M, tile_K) shape
             a_bytes_per_stage_override=(
@@ -509,7 +510,7 @@ class GemmSm90(GemmTmaBase):
             self.b_smem_dtype,
             self.b_layout,
             self.ab_stage,
-            self.d_dtype,
+            self.d_stage_dtype,
             self.d_layout,
             self.epi_stage,
             self.c_dtype,
@@ -589,9 +590,11 @@ class GemmSm90(GemmTmaBase):
         elif const_expr(self.transform_a is not None and self.transform_a.aux_raw):
             assert mAuxA is not None, "the transform's raw aux operand (e.g. seed) needs mA.sf"
         # the comm warps run the epilogue and read C themselves (per subtile, from gmem): the GEMM stages no C
-        mC_comm = None
+        mC_comm, mD_comm = None, None
         if const_expr(self.dist_op.runs_evt):
+            # ... and commit D themselves; the GEMM stages the operator's partial in D's place
             mC_comm, mC = mC, None
+            mD_comm, mD = mD, self.dist_op.partial_tensor(dist_op_args)
         if const_expr(not a_owned):
             # Tensors arrive batch-first: rotate (l, x, y) -> (x, y, l) at trace time.
             # Dense rank-2 operands get a trivial batch mode appended instead.
@@ -627,7 +630,8 @@ class GemmSm90(GemmTmaBase):
         # setup static attributes before smem/grid/tma computation
         self.a_dtype = mA.element_type
         self.b_dtype = mB.element_type
-        self.d_dtype = mD.element_type if mD is not None else None
+        self.d_stage_dtype = mD.element_type if mD is not None else None  # what the epilogue warps stage
+        self.d_dtype = mD_comm.element_type if mD_comm is not None else self.d_stage_dtype  # the output
         self.c_dtype = mC.element_type if mC is not None else None
         self.sf_dtype = mSFA.element_type if const_expr(mSFA is not None) else None
         # smem storage / TMA-internal dtypes default to the element dtypes; the
@@ -788,7 +792,7 @@ class GemmSm90(GemmTmaBase):
         self.epi_load_bytes_per_stage = self.epi_smem_bytes(
             epilogue_args,
             self.cta_tile_shape_mnk,
-            self.epi_tile,
+            self.epi_smem_tile(),
             self.epi_smem_warp_shape_mnk(),
         ).c_stage
         if const_expr(mC is not None):
@@ -817,7 +821,7 @@ class GemmSm90(GemmTmaBase):
         class SharedStorage:
             sD: cute.struct.Align[
                 cute.struct.MemRange[
-                    self.d_dtype if self.d_dtype is not None else Int32, epi_smem_size
+                    self.d_stage_dtype if self.d_stage_dtype is not None else Int32, epi_smem_size
                 ],
                 self.buffer_align_bytes,
             ]
@@ -885,6 +889,7 @@ class GemmSm90(GemmTmaBase):
             TileSchedulerCls,
             dist_op_args,
             mC_comm,
+            mD_comm,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -933,6 +938,7 @@ class GemmSm90(GemmTmaBase):
         TileSchedulerCls: cutlass.Constexpr[Callable],
         dist_op_args,
         mC_comm: Optional[cute.Tensor],
+        mD_comm: Optional[cute.Tensor],
     ):
         """
         GPU device kernel performing the batched GEMM computation.
@@ -1066,6 +1072,7 @@ class GemmSm90(GemmTmaBase):
             epi_smem_tensors,
             varlen_manager,
             mC_comm,
+            mD_comm,
         )
 
         # Cluster wait for barrier init
@@ -1419,7 +1426,9 @@ class GemmSm90(GemmTmaBase):
                     )
                     copy_C = copy_utils.chain_tma_producer_copy_fns((copy_C, *tile_load_copy_fns))
 
-                d_dtype_for_layout = self.d_dtype if self.d_dtype is not None else cutlass.BFloat16
+                d_dtype_for_layout = (
+                    self.d_stage_dtype if self.d_stage_dtype is not None else cutlass.BFloat16
+                )
                 tiled_copy_r2s, tRS_rD, tRS_sD = self.epilog_smem_store_and_partition(
                     tiled_mma, self.d_layout, d_dtype_for_layout, sD, tidx
                 )
@@ -1901,8 +1910,8 @@ class GemmSm90(GemmTmaBase):
         # setmaxnreg cap and the split's few extra registers spill to local
         # (measured ~150MB STL, a net loss; same for a mirrored LDS split).
         return (
-            self.d_dtype is not None
-            and self.d_dtype.width == 32
+            self.d_stage_dtype is not None
+            and self.d_stage_dtype.width == 32
             and (self.d_layout is None or self.d_layout.is_n_major_c())
             and self.epi_tile[1] % 16 == 0
             and self.c_dtype is None
@@ -2028,6 +2037,7 @@ class GemmSm90(GemmTmaBase):
         smem_capacity: int,
         occupancy: int,
         warp_shape_mnk: Tuple[int, int, int] | None = None,
+        epi_smem_tile=None,  # the aux outputs' subtile when not epi_tile (an operator's comm warps)
         a_bytes_per_stage_override: Optional[int] = None,
         ab_extra_bytes_per_stage: int = 0,
     ) -> Tuple[int, int]:
@@ -2063,7 +2073,10 @@ class GemmSm90(GemmTmaBase):
         )
         epi_stage = min(epi_tiles, 4 if epi_tile[1] <= 16 else 2)
         epi_smem_bytes = cls.epi_smem_bytes(
-            epilogue_args, cta_tile_shape_mnk, epi_tile, warp_shape_mnk
+            epilogue_args,
+            cta_tile_shape_mnk,
+            epi_smem_tile if epi_smem_tile is not None else epi_tile,
+            warp_shape_mnk,
         )
         has_tile_load = epi_smem_bytes.c_stage > 0
         epi_tile_elems = cute.size(cute.shape(epi_tile))

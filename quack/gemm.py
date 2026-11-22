@@ -877,6 +877,10 @@ def _build_gemm_plan(
         assert device_capacity[0] in [10, 11, 12], (
             "Quantized output (SFD) requires SM100/SM110/SM120"
         )
+        assert not getattr(dist_op, "broadcast", False), (
+            "two-shot AR replicates D only; its scale factors would land on the reducing rank alone "
+            "(unsupported for now)"
+        )
         sfd_dtype = torch2cute_dtype_map[SFD.dtype]
         assert SFD.dim() == 6 and SFD.shape[-3:] == (32, 4, 4), (
             f"SFD must be (l, rm, rk, 32, 4, 4), got {tuple(SFD.shape)}"

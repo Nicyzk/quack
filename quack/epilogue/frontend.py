@@ -723,6 +723,11 @@ class EpiMod:
                 raise ValueError("dist_op requires its dist_op_args bundle")
             if D is None and dist_op.runs_evt:
                 raise ValueError("dist_op: the partial the operator reduces is staged into D, pass D")
+            if getattr(dist_op, "broadcast", False) and self.outputs:
+                raise ValueError(
+                    "two-shot AR replicates D and reduce outputs; an aux tensor would land on the "
+                    "reducing rank alone (unsupported for now)"
+                )
             if not persistent:
                 raise ValueError("dist_op: persistent scheduler only")
             if dist_op.num_warps and is_dynamic_persistent:
@@ -841,10 +846,13 @@ class EpiMod:
             if any(getattr(op, "dim", 1) != 1 for op in self.sinks.values()):
                 raise ValueError("varlen_n: row-vector (per token column) sinks only")
             if any(
-                not isinstance(self.ops.get(name), (Scalar, RowVecLoad)) and name != "c"
+                not isinstance(self.ops.get(name), (Scalar, RowVecLoad, ColVecLoad)) and name != "c"
                 for name in self.operand_names
             ):
-                raise ValueError("varlen_n: scalar and row-vector (per token column) operands only")
+                raise ValueError(
+                    "varlen_n: scalar, row-vector (per token column) and column-vector (per weight "
+                    "row, one per sequence) operands only"
+                )
         if blockscaled:
             if varlen_m or gather_A:
                 raise ValueError("blockscaled GEMM does not support varlen/gather yet")
@@ -955,7 +963,9 @@ class EpiMod:
             import torch
 
             aux = epi_args[out_name]
-            out_m, out_n = m, n_gemm
+            # an aux output follows D's rows (an operator's D: d_shape, e.g. RS's slab)
+            out_m = m if dist_op is None else dist_op.d_shape((m, n_gemm))[0]
+            out_n = n_gemm
             if paired_acc:
                 if pair_dim == "m":
                     out_m //= 2
@@ -1034,7 +1044,15 @@ class EpiMod:
             elif visit_kind == "row":
                 _require_shape(name, epi_args[name], (batch_l, n_i))
             elif visit_kind == "col":
-                expected = (m_i,) if varlen_m else (batch_l, m_i)
+                # a vector along M follows D's rows (an operator's D: d_shape, e.g. RS's slab); under
+                # varlen_n M is the weight's rows, one vector per sequence (expert)
+                m_d = m_i if dist_op is None else dist_op.d_shape((m_i, n_i))[0]
+                if varlen_m:
+                    expected = (m_d,)
+                elif varlen_n:
+                    expected = (cu_seqlens_n.shape[0] - 1, m_d)
+                else:
+                    expected = (batch_l, m_d)
                 _require_shape(name, epi_args[name], expected)
             elif visit_kind == "tile":
                 _require_shape(name, epi_args[name], base_shape)

@@ -1,5 +1,6 @@
 """The combine's gather-and-sum over K in CuTe-DSL (from duckpond kernels/moe/reduce_over_k/reduce_over_k.py,
-2026-11-21; its fused @reduce_epilogue mods stay there): out[t, :] = sum_k w[t, k] * x[t, k, :] (w optional), the
+2026-11-21; the fused @reduce_epilogue mods are in reduce_over_k_epilogue.py): out[t, :] = sum_k w[t, k] *
+x[t, k, :] (w optional), the
 replacement for sonic's token_gather_and_sum_varlen_K_triton as the forward calls it (identity perm, K rows per
 token). Memory-bound: each thread loads vecs 16 B vectors of each of the token's K rows, accumulates in fp32 in fixed
 k order (bitwise run-to-run) and stores the vectors in the output dtype; a CTA covers (num_threads / threads_per_row)
@@ -51,6 +52,11 @@ class ReduceOverK(ComposableEpiMixin):
         """warps along (tokens, columns, 1): a row's threads span threads_per_row / 32 warps."""
         warps_per_row = max(self.threads_per_row // 32, 1)
         return (self.num_epi_warps // warps_per_row, warps_per_row, 1)
+
+    @cute.jit
+    def store_sink(self, dst: cute.Tensor, idx, value):
+        """A reduce output's slot store (the ops' frame hook): local, no operator sits behind this kernel."""
+        dst[idx] = value
 
     def epi_to_underlying_arguments(self, args):
         return self.EpilogueParams(**self._epi_ops_to_params_dict(args))
@@ -174,6 +180,7 @@ class ReduceOverK(ComposableEpiMixin):
             tile_coord_mnkl,
             varlen_manager,
             tidx,
+            epilogue_barrier=self.epilogue_barrier,
         )
         tXrOut = cute.make_rmem_tensor_like(tXgOut)
         tXrOut.store(tXrAcc.load().to(self.dtype))
@@ -243,5 +250,5 @@ def reduce_over_k(x, w, out, epilogue=None, epi_args=None, **config):
         w = w.view(T, K)
     arch = get_device_capacity(x.device)[0] * 10
     if epilogue is not None:
-        return epilogue(x, w, out, epi_args or {}, arch, **config)
+        return epilogue.launch(x, w, out, epi_args or {}, arch, **config)
     compile_reduce_over_k(dtype, K, w is not None, arch, **config)(x, w, out, None)

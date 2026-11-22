@@ -256,8 +256,8 @@ class _EpiModMixinBase(ComposableEpiMixin):
             pair_m = const_expr(getattr(self, "_epi_mod_pair_dim", "n") == "m")
             pair_tiler = cute.make_layout(2, stride=2) if pair_m else cute.make_layout(2)
             if const_expr(pair_m):
-                assert all(kind in ("scalar", "apply") for _, kind in self._epi_mod_operands), (
-                    "M-paired gated fn takes only the accumulator (and scalars / apply ops)"
+                assert all(kind != "tile" for _, kind in self._epi_mod_operands), (
+                    "M-paired gated fn takes no tile operand (its C is the packed pair)"
                 )
             acc_pair = cute.flat_divide(tRS_rD, pair_tiler)
             acc0, acc1 = acc_pair[0, ...], acc_pair[1, ...]
@@ -286,16 +286,19 @@ class _EpiModMixinBase(ComposableEpiMixin):
                     out[j] = view[j]
                 return out
 
+            # the vector that varies across a pair's two lanes: the row vector for N pairs (adjacent
+            # columns), the column vector for M pairs (the gate / up rows); the other one is identical
+            # in both lanes and is handed to the fn as one value
+            varies = lambda kind: (kind == "row") != pair_m
             views = {}
             for name, kind in self._epi_mod_operands:
                 if const_expr(kind in ("scalar", "apply")):
                     views[name] = frags[name]
                 else:
-                    p = cute.flat_divide(frags[name], cute.make_layout(2))
-                    if const_expr(kind == "col"):
-                        # colvec broadcasts along N: both lanes are identical.
+                    p = cute.flat_divide(frags[name], pair_tiler)
+                    if const_expr(kind in ("col", "row") and not varies(kind)):
                         views[name] = _dense(p[0, ...])
-                    elif const_expr(kind == "row"):
+                    elif const_expr(kind in ("col", "row")):
                         views[name] = (_dense(p[0, ...]), _dense(p[1, ...]))
                     else:  # tile / c views are dense by construction
                         views[name] = (p[0, ...], p[1, ...])
@@ -309,7 +312,7 @@ class _EpiModMixinBase(ComposableEpiMixin):
                         if kind == "scalar"
                         else (
                             views[name][i]
-                            if kind == "col"
+                            if kind in ("col", "row") and not varies(kind)
                             else Pair(views[name][0][i], views[name][1][i])
                         )
                     )

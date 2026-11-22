@@ -326,7 +326,7 @@ class BlockScaleFactorStore(EpiOp):
         # aux target (postact interleaves gate/up at pair granularity).
         vec_acc = vec * acc_mult
         assert gemm.cta_tile_shape_mnk[1] % vec_acc == 0
-        epi_tile_n = gemm.epi_tile[1]
+        epi_tile_n = gemm.epi_smem_tile()[1]  # the storing warps' subtile
         # Each SF vector must be produced within a single epilogue subtile: the
         # contiguous N run of a subtile must cover whole SF vectors. epi_tile_n
         # is an int shape normally, or a strided layout from the non-pow2
@@ -484,7 +484,7 @@ class BlockScaleFactorStore(EpiOp):
         warp_shape = gemm.epi_smem_warp_shape_mnk()
         if not self._xwarp_smem_needed(vec_acc, warp_shape, run, arch=gemm.arch):
             return None
-        return self._xwarp_smem_shape(gemm.epi_tile, self._xwarp_warps(warp_shape))
+        return self._xwarp_smem_shape(gemm.epi_smem_tile(), self._xwarp_warps(warp_shape))
 
     def smem_struct_field(self, gemm, params):
         shape = self._xwarp_smem_shape_for(gemm)
@@ -749,7 +749,7 @@ class BlockScaleFactorStore(EpiOp):
             # buffers, so one barrier per subtile is WAR-safe — writes to a
             # buffer are separated from the previous reads of that same
             # buffer by the intervening subtile's barrier).
-            epi_tile = gemm.epi_tile
+            epi_tile = gemm.epi_smem_tile()
             epi_m_size = cute.size(epi_tile[0])
             epi_n_size = cute.size(epi_tile[1])
             cnt_m = gemm.cta_tile_shape_mnk[0] // epi_m_size
@@ -923,7 +923,7 @@ class BlockScaleFactorStore(EpiOp):
         limit_m, limit_n = state.limit_m, state.limit_n
         lane_span, lane_stride = state.lane_span, state.lane_stride
         vec = getattr(gemm, self._vec_attr())
-        tile_N = gemm.cta_tile_shape_mnk[1]
+        tile_M, tile_N = tile_shape_mn if tile_shape_mn is not None else gemm.cta_tile_shape_mnk[:2]
         # When SF vectors are lane-split, every lane in the subgroup holds
         # identical SF bytes; only the subgroup leader stores. Warp-split
         # vectors (SM120): every member warp holds identical bytes after the
@@ -940,7 +940,7 @@ class BlockScaleFactorStore(EpiOp):
         whole_tile_ok = const_expr(self.direction == "row" and tile_N % (4 * vec) == 0)
         if is_leader and limit_m > 0:
             if const_expr(whole_tile_ok):
-                if limit_m >= gemm.cta_tile_shape_mnk[0] and limit_n >= tile_N:
+                if limit_m >= tile_M and limit_n >= tile_N:
                     # Whole tile in bounds: vectorized stores (4 consecutive SF
                     # slots of a row are consecutive bytes -> 4-byte stores,
                     # when this thread's slots are actually adjacent).

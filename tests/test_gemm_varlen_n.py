@@ -208,6 +208,7 @@ def make_problem(fmt, tile_n, device):
     p.cu_tiles = cumsum0(p.num_blocks).to(device) if FORMATS[fmt][1] is not None else None
     w1_cat = torch.randn(p.E, 2 * I, H, device=device, dtype=torch.bfloat16) * 0.05
     w1_q, w1_s, p.pts_w, p.w1_dq = quantize(w1_cat, fmt)
+    p.w1_q, p.w1_s = w1_q, w1_s  # [gate; up] rows: the plain (non-gated) fc1 takes the first I
     p.w1_q_il = interleave_gate_up(w1_q)
     p.sfa = None if w1_s is None else stack_sf(interleave_gate_up(w1_s))
     tokens = torch.randn(p.total, H, device=device, dtype=torch.bfloat16)
@@ -304,6 +305,69 @@ def test_fc1_gated_mod(fmt, tile_n):
     torch.cuda.synchronize()
     for e in range(p.E):
         assert_bf16_close(postact[p.cu[e] : p.cu[e + 1]], ref_fc1(p, e), f"expert {e}")
+
+
+@sm100_only
+@pytest.mark.parametrize("fmt", ["bf16", "mxfp8"])
+def test_fc1_plain_act(fmt):
+    """A non-gated fc1 (ReLU²: weights (I, H), the postact row for row) under cu_seqlens_n."""
+    device = torch.device("cuda")
+    torch.random.manual_seed(0)
+    p = make_problem(fmt, 256, device)
+    w = p.w1_q[:, :I].contiguous()
+    sfa = None if p.w1_s is None else stack_sf(p.w1_s[:, :I])
+    postact = torch.empty(p.total, I, device=device, dtype=torch.bfloat16)
+    mod = linear_act_mod("relu_sq", gated=False, has_c=False, has_rowvec=False, has_colvec=False)
+    mod.gemm(
+        w,
+        p.B,
+        None,
+        None,
+        epi_args={"mAuxOut": postact.T},
+        tile_M=256,
+        tile_N=256,
+        cluster_M=2,
+        cluster_N=1,
+        cu_seqlens_n=p.cu,
+        **sf_kwargs(p, sfa, p.tok_s, 256),
+    )
+    torch.cuda.synchronize()
+    for e in range(p.E):
+        x = p.tok_dq[p.cu[e] : p.cu[e + 1]]
+        ref = F.relu(x @ p.w1_dq[e, :I].T) ** 2
+        assert_bf16_close(postact[p.cu[e] : p.cu[e + 1]], ref, f"expert {e}")
+
+
+@sm100_only
+def test_fc1_gated_bias():
+    """A gated fc1 with per-expert gate / up biases (a column vector along M: one (2I,) vector per sequence,
+    interleaved like the weight rows), added before the gating."""
+    device = torch.device("cuda")
+    torch.random.manual_seed(0)
+    p = make_problem("bf16", 256, device)
+    bias = torch.randn(p.E, 2 * I, device=device, dtype=torch.float32) * 0.1  # [gate; up]
+    bias_il = interleave_gate_up(bias.unsqueeze(-1)).squeeze(-1).contiguous()
+    postact = torch.empty(p.total, I, device=device, dtype=torch.bfloat16)
+    mod = linear_act_mod("swiglu", gated=True, has_c=False, has_rowvec=False, has_colvec=True)
+    mod.gemm(
+        p.w1_q_il,
+        p.B,
+        None,
+        None,
+        epi_args={"mAuxOut": postact.T, "mColVecBroadcast": bias_il},
+        tile_M=256,
+        tile_N=256,
+        cluster_M=2,
+        cluster_N=1,
+        cu_seqlens_n=p.cu,
+    )
+    torch.cuda.synchronize()
+    for e in range(p.E):
+        x = p.tok_dq[p.cu[e] : p.cu[e + 1]]
+        g, u = p.w1_dq[e].chunk(2, dim=0)
+        bg, bu = bias[e].chunk(2)
+        ref = F.silu(x @ g.T + bg) * (x @ u.T + bu)
+        assert_bf16_close(postact[p.cu[e] : p.cu[e + 1]], ref, f"expert {e}")
 
 
 @sm100_only

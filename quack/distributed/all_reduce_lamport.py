@@ -1,14 +1,15 @@
 # GEMM + all-reduce, one-shot (cutlass Lamport), as the GEMM's distributed operator: no flags, the data is the flag.
-# D is the multicast view of 3 slots x world mirrors of (m, n), stacked along M; slot k = launch counter % 3.
+# The partials buffer is 3 slots x world mirrors of (m, n), stacked along M, stored through its multicast
+# view; slot k = launch counter % 3.
 # Every rank's epilogue warps store their -0.0-scrubbed raw partial of each tile into slot k's mirror `rank`
 # (one TMA multicast store lands on every rank, the GEMM's partial-only epilogue through this operator's
 # store_tile / scrub_partial), then re-arm last call's slot (k - 1) over that tile in every local mirror:
 # peers write that slot again only in call i + 2, after this rank's call i + 1 data, so nothing orders the
 # re-arm. The comm warps poll their local slot-k mirrors per 16 B atom until no word is the sentinel, sum in
-# f32, run the GEMM's epilogue on the whole tile and store this rank's plain out.
-# Usage: d, out, args = make_lamport_buffers(m, n, dtype, tile_m); args.slot.add_(1) before every launch;
-# mod(a, b, out={"D": d}, config=cfg, dist_op=AllReduceLamport(rank, world), dist_op_args=args); out is the
-# result. Direct: GemmSm100(..., dist_op=AllReduceLamport(rank, world)), launch with mD=d, dist_op_args=args.
+# f32, run the GEMM's epilogue on the whole tile and commit it into D, this rank's plain (m, n) output.
+# Usage: d, args = make_lamport_buffers(m, n, dtype, tile_m); args.slot.add_(1) before every launch;
+# mod(a, b, out={"D": d}, config=cfg, dist_op=AllReduceLamport(rank, world), dist_op_args=args).
+# Direct: GemmSm100(..., dist_op=AllReduceLamport(rank, world)), launch with mD=d, dist_op_args=args.
 from functools import partial
 from typing import NamedTuple
 
@@ -30,17 +31,17 @@ class LamportArguments(NamedTuple):
     """The comm warps' bundle (the GEMM's dist_op_args)."""
 
     slots: cute.Tensor  # this rank's mirrors (SLOTS * world * m, n), slot-major then mirror
-    out: cute.Tensor  # this rank's (m, n) result
+    slots_mc: cute.Tensor  # their multicast view: the GEMM's partial store lands in every rank's mirror
     slot: cute.Tensor  # (1,) int32 launch counter; the host adds 1 before every launch
 
 
-def _fake_arguments(dtype):
+def _fake_arguments():
     def mat(dt):
         return make_fake_tensor(dt, (cute.sym_int(), cute.sym_int()), leading_dim=1, divisibility=8)
 
     return LamportArguments(
-        mat(dtype),
-        mat(dtype),
+        mat(AllReduceLamport.partial_dtype),
+        mat(AllReduceLamport.partial_dtype),
         make_fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1),
     )
 
@@ -135,33 +136,40 @@ def _tiled_copy(dtype, thr_shape, val_shape):
 
 
 class AllReduceLamport(DistOp):
-    """GEMM + one-shot all-reduce over `world` ranks, d_dtype D; the whole tile is this CTA's."""
+    """GEMM + one-shot all-reduce over `world` ranks: D = the full (m, n) result; the whole tile is this
+    CTA's."""
 
     num_warps = 4
     regs = None
     runs_evt = True
+    partial_dtype = cutlass.BFloat16  # the wire
 
     def __init__(self, rank: int, world: int):
         self.rank, self.world = rank, world
 
     def fake_args(self, d_dtype):
-        return _fake_arguments(d_dtype)
+        return _fake_arguments()
 
-    def d_shape(self, shape):
-        m, n = shape
-        return (SLOTS * self.world * m, n)
+    def partial_tensor(self, dist_op_args):
+        return dist_op_args.slots_mc
 
     def epi_warp_shape_mnk(self, gemm):
         cta_m, cta_n = gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[1]
         threads = gemm.num_comm_warps * cute.arch.WARP_SIZE
-        (_, thr_n), _, _ = _frame(gemm.d_dtype, cta_m, cta_n, threads)
+        (_, thr_n), _, _ = _frame(self.partial_dtype, cta_m, cta_n, threads)
         warps_n = max(1, thr_n // cute.arch.WARP_SIZE)
         return (gemm.num_comm_warps // warps_n, warps_n, 1)
+
+    def epi_tile(self, gemm):
+        cta_m, cta_n = gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[1]
+        threads = gemm.num_comm_warps * cute.arch.WARP_SIZE
+        (thr_m, _), _, chunk = _frame(self.partial_dtype, cta_m, cta_n, threads)
+        return (chunk * thr_m, cta_n)
 
     def store_tile(self, gemm, ctx, sD, epi_tile, tidx, tile_coord_mnkl, batch_idx, varlen_manager):
         """The GEMM's TMA store into slot k, mirror `rank`: the tile's row in the stacked mirrors."""
         dist_op_args = ctx.args
-        tiles_m = dist_op_args.out.shape[0] // gemm.cta_tile_shape_mnk[0]
+        tiles_m = ctx.mD.shape[0] // gemm.cta_tile_shape_mnk[0]
         row = (_slot(dist_op_args.slot) * self.world + self.rank) * tiles_m + tile_coord_mnkl[0]
         return (row, tile_coord_mnkl[1], tile_coord_mnkl[2], tile_coord_mnkl[3]), None
 
@@ -181,7 +189,7 @@ class AllReduceLamport(DistOp):
         thr_shape, val_shape, _ = _frame(dtype, cta_m, cta_n, threads)
         thr_copy = _tiled_copy(dtype, thr_shape, val_shape).get_slice(tidx)
         gSlots = cute.local_tile(dist_op_args.slots, (cta_m, cta_n), (None, None))
-        tiles_m = dist_op_args.out.shape[0] // cta_m
+        tiles_m = ctx.mD.shape[0] // cta_m
         k = (_slot(dist_op_args.slot) + (SLOTS - 1)) % SLOTS
         pid_m, pid_n = tile_coord_mnkl[0], tile_coord_mnkl[1]
         rows = [(k * self.world + r) * tiles_m + pid_m for r in range(self.world)]
@@ -198,7 +206,7 @@ class AllReduceLamport(DistOp):
         dist_op_args, TileSchedulerCls, varlen_manager = ctx.args, ctx.TileSchedulerCls, ctx.varlen
         epilogue_params, epi_smem_tensors, mC = ctx.epi_params, ctx.epi_smem_tensors, ctx.mC
         cta_m, cta_n = gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[1]
-        slots, out = dist_op_args.slots, dist_op_args.out
+        slots, out = dist_op_args.slots, ctx.mD
         thr_shape, val_shape, chunk = _frame(
             slots.element_type, cta_m, cta_n, gemm.num_comm_warps * cute.arch.WARP_SIZE
         )
@@ -208,7 +216,7 @@ class AllReduceLamport(DistOp):
         gSlots = cute.local_tile(slots, (cta_m, cta_n), (None, None))
         gOut = cute.local_tile(out, (cta_m, cta_n), (None, None))
         _atom, _, loop_n = thr_copy.partition_S(cute.make_identity_tensor((cta_m, cta_n))).shape
-        epi_tile = (chunk * thr_shape[0], cta_n)  # the epilogue's subtile on the tile
+        epi_tile = self.epi_tile(gemm)  # the epilogue's subtile on the tile
         tRS_rD = cute.make_rmem_tensor((_atom, chunk, loop_n), gemm.acc_dtype)
         # C: read per subtile straight from gmem, the same thread copy as the mirrors
         tRS_rC, gC = None, None
@@ -216,6 +224,7 @@ class AllReduceLamport(DistOp):
             tRS_rC = cute.make_rmem_tensor((_atom, chunk, loop_n), mC.element_type)
             gC = cute.local_tile(mC, (cta_m, cta_n), (None, None))
         is_tma_warp = warp_idx == gemm.comm_warp_ids[0]
+        epi_store_pipeline = gemm.make_epi_store_pipeline(gemm.num_comm_warps)  # aux outputs' TMA stores
         tiles_m = out.shape[0] // cta_m
         k = _slot(dist_op_args.slot)
 
@@ -235,7 +244,7 @@ class AllReduceLamport(DistOp):
                 epilogue_params,
                 epi_smem_tensors,
                 None,  # epi_pipeline: C is read directly
-                None,  # epi_store_pipeline
+                epi_store_pipeline,
                 None,  # epi_read_state
                 None,  # epi_producer_state
                 epi_tile,
@@ -264,6 +273,8 @@ class AllReduceLamport(DistOp):
             )
             tile_sched._current_work_idx = tile_sched._fetch_next_work_idx()
             work_tile = tile_sched._delinearize_work_idx(tile_sched._current_work_idx)
+        if is_tma_warp:
+            epi_store_pipeline.producer_tail()
         # no exit barrier: a peer never reads this rank's memory after its own kernel ends
 
 
@@ -271,18 +282,22 @@ class AllReduceLamport(DistOp):
 
 
 def make_lamport_buffers(m, n, torch_dtype, tile_m):
-    """(d, out, args) for GEMM + one-shot AR of an (m, n) output: D = the multicast view of the slot
-    mirrors (AllReduceLamport.d_shape), out = this rank's full result, args with the launch counter:
-    args.slot.add_(1) before every launch. The operator is AllReduceLamport(rank, world)."""
+    """(d, args) for GEMM + one-shot AR of an (m, n) output: D = this rank's full (m, n) result, args =
+    the slot mirrors (partial_dtype) with the launch counter: args.slot.add_(1) before every launch. The
+    operator is AllReduceLamport(rank, world)."""
     import torch
     import torch.distributed as dist
 
-    rank, world = dist.get_rank(), dist.get_world_size()
+    from quack.cute_dsl_utils import torch2cute_dtype_map
+
+    world = dist.get_world_size()
     assert m % tile_m == 0, "whole tiles along M"
-    slots, d, _ = _symm(AllReduceLamport(rank, world).d_shape((m, n)), torch_dtype)
+    wire = next(t for t, c in torch2cute_dtype_map.items() if c is AllReduceLamport.partial_dtype)
+    slots, slots_mc, _ = _symm((SLOTS * world * m, n), wire)
     slots.fill_(-0.0)
-    out = torch.empty(m, n, dtype=torch_dtype, device="cuda")
+    cols = n // 2 if torch_dtype == torch.float4_e2m1fn_x2 else n  # fp4 D packs two values a byte
+    d = torch.empty(m, cols, dtype=torch_dtype, device="cuda")
     slot = torch.zeros(1, dtype=torch.int32, device="cuda")
     torch.cuda.synchronize()
     dist.barrier()  # every rank's mirrors are armed before any peer stores into them
-    return d, out, LamportArguments(slots, out, slot)
+    return d, LamportArguments(slots, slots_mc, slot)

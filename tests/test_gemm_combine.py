@@ -64,6 +64,24 @@ def test_gemm_combine():
         err = (landed[rows].float() - ref).abs().max()
         assert err < 2 * (ref.bfloat16().float() - ref).abs().max() + 1e-3, f"expert {e}"
 
+    # the combine's sum over k with the block epilogue: score-weighted sum + residual into D, and the
+    # per-token sum of squares (the RMSNorm statistic, finalized downstream as gemm_rms does)
+    from quack.distributed.reduce_over_k import reduce_over_k
+    from quack.distributed.reduce_over_k_epilogue import rms_partial
+
+    tokens = slots.shape[0]
+    scores = torch.rand(tokens, TOPK, device=device, dtype=torch.float32)
+    res = torch.randn(tokens, H, device=device, dtype=torch.bfloat16)
+    out = torch.empty(tokens, H, device=device, dtype=torch.bfloat16)
+    partials = torch.zeros(1, tokens, -(-H // 1024), device=device, dtype=torch.float32)
+    sums = reduce_over_k(
+        slots, scores, out, epilogue=rms_partial, epi_args={"res": res, "sqsum": partials}
+    )
+    torch.cuda.synchronize()
+    y = (slots.float() * scores[:, :, None]).sum(1) + res.float()
+    assert (out.float() - y).abs().max() < 2 * (y.bfloat16().float() - y).abs().max() + 1e-3
+    assert torch.allclose(sums["sqsum"].view(-1), (y * y).sum(-1), rtol=2e-2, atol=1e-2)
+
 
 @sm100_only
 @pytest.mark.parametrize("dist_op, varlen", [(DistOp(), True), (CombineStore(H), False)])

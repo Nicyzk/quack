@@ -188,8 +188,11 @@ def _compile_gemm_epi(
             varlen_n=varlen_n,
         )
         if dist_op is not None and d_dtype is not None:
-            # the operator's D is its wire with its own M extent (a Lamport wire stacks mirrors
-            # along M): untie it from A's M in the compiled signature (varlen: 2-D)
+            # the operator's D has its own M extent (d_shape: RS's slab): untie it from A's M in the
+            # compiled signature (varlen: 2-D). The epilogue operands index M in the operator's frame
+            # (d_shape rows, in accumulator space: not A's M, not a packed D's): untied as well, the
+            # frontend checks their shapes against d_shape
+            m = cute.sym_int()
             mD = fake_batched(
                 d_dtype,
                 cute.sym_int(),
