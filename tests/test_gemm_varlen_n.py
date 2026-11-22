@@ -437,17 +437,25 @@ def test_fc1_quant_postact_fc2(fmt, tile_n):
     if nvfp4:  # the inputs' per-tensor scales on the accumulator, the postact's folded into its SFs
         epi_args["alpha"] = float(p.pts_w * p.pts_tok)
         epi_args["sfd_norm_const"] = 1.0 / pts_act
+    launch = dict(tile_M=256, tile_N=tile_n, cluster_M=2, cluster_N=1, cu_seqlens_n=p.cu)
+    # the codec's host check: an SF buffer short of the postact's extents is refused, not clamped
+    with pytest.raises(ValueError, match="postact_sf"):
+        gated_quant_mod("swiglu", "m", has_alpha=nvfp4).gemm(
+            p.w1_q_il,
+            p.B,
+            None,
+            None,
+            epi_args={**epi_args, "postact_sf": postact_sf[:, :, :-1]},
+            **launch,
+            **sf_kwargs(p, p.sfa, p.tok_s, tile_n),
+        )
     gated_quant_mod("swiglu", "m", has_alpha=nvfp4).gemm(
         p.w1_q_il,
         p.B,
         None,
         None,
         epi_args=epi_args,
-        tile_M=256,
-        tile_N=tile_n,
-        cluster_M=2,
-        cluster_N=1,
-        cu_seqlens_n=p.cu,
+        **launch,
         **sf_kwargs(p, p.sfa, p.tok_s, tile_n),
     )
     torch.cuda.synchronize()

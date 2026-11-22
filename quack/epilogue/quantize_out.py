@@ -248,6 +248,42 @@ class BlockScaleFactorStore(EpiOp):
         assert ndim == 6, f"SFD expects a 6-D blocked scale tensor, got ndim {ndim}"
         return make_fake_sf_tensor(dtype, 1 if (fctx.varlen_m or fctx.varlen_n) else fctx.l)
 
+    def host_validate(self, value, *, varlen_m, epi_args, **_):
+        """The SF buffer is blocked (l, r_other, r_vec, 32, 4, 4) and covers the quantized output's padded
+        extents: 128 rows of the other dim per atom row, 4 vectors per atom column (the kernel clamps its
+        SF stores to the buffer, so an undersized one would drop scale bytes silently)."""
+        import torch
+
+        if self.quant_output == "D":
+            return  # gemm() checks SFD against D itself (gemm.py)
+        name = f"'{self.name}'"
+        if value.dtype not in (torch.float8_e8m0fnu, torch.float8_e4m3fn):
+            raise ValueError(f"{name}: scale dtype must be e8m0 (vec 32) or e4m3 (vec 16)")
+        vec = 32 if value.dtype == torch.float8_e8m0fnu else 16
+        blocked = value.dim() == 6 and tuple(value.shape[-3:]) == (32, 4, 4)
+        if not blocked or value.stride()[-3:] != (16, 4, 1):
+            raise ValueError(
+                f"{name}: must be blocked (l, r, r, 32, 4, 4) with a contiguous atom, got shape "
+                f"{tuple(value.shape)} strides {value.stride()}"
+            )
+        if varlen_m and value.shape[0] != 1:
+            raise ValueError(f"{name}: one M-padded buffer with batch dim 1 under varlen_m")
+        out = epi_args[self.quant_output]
+        rows, cols = out.shape[-2], out.shape[-1]
+        if out.dtype == torch.float4_e2m1fn_x2:  # fp4 pairs packed along the contiguous dim
+            if out.stride(-1) == 1:
+                cols *= 2
+            else:
+                rows *= 2
+        other, along = (rows, cols) if self.direction == "row" else (cols, rows)
+        if value.shape[1] < -(-other // 128) or value.shape[2] < -(-along // (4 * vec)):
+            raise ValueError(
+                f"{name}: (r_other={value.shape[1]}, r_vec={value.shape[2]}) does not cover the "
+                f"({rows}, {cols}) output, direction {self.direction}, vec {vec}"
+            )
+        if self.direction == "col" and value.shape[2] % (128 // (4 * vec)):
+            raise ValueError(f"{name}: col direction pads r_vec to whole 128-row stripes")
+
     def _vec_attr(self):
         return f"_sf_vec_{self.name}"
 

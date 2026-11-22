@@ -171,7 +171,8 @@ class EpiContext:
         self.tile_M = tile_shape_mn[0]
         self.tile_N = tile_shape_mn[1]
         self.batch_idx = tile_coord_mnkl[3]
-        self.num_epi_threads = gemm.num_epi_warps * cute.arch.WARP_SIZE
+        # the warps running the epilogue: an operator's frame under runs_evt, else this arch's
+        self.num_epi_threads = math.prod(gemm.epi_smem_warp_shape_mnk()) * cute.arch.WARP_SIZE
         self.partition_for_epilogue_fn = partial(
             partition_for_epilogue,
             epi_tile=epi_tile,
@@ -1064,11 +1065,11 @@ class TileStore(EpiOp):
             dtype_override if dtype_override is not None else getattr(gemm, self._dtype_gemm_attr())
         )
         layout = getattr(gemm, self._layout_gemm_attr())
+        if gemm.dist_op.runs_evt:
+            # an operator's comm warps re-entering the epilogue on their own thread frame: no MMA
+            # fragment (tmem load, stmatrix) to shape the atom on, the plain store
+            return cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), dtype)
         if gemm.arch == 100:
-            if tiled_copy_t2r is None:
-                # no tmem load to vectorize against (an operator's comm warps re-entering the epilogue
-                # on their own frame): the plain store, what the helper picks for a non-tmem copy
-                return cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), dtype)
             return blackwell_helpers.get_smem_store_op(
                 layout, dtype, gemm.acc_dtype, tiled_copy_t2r
             )
