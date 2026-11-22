@@ -86,7 +86,7 @@ def bench_shape(m_total, n_local, k, dtype, rank, world_size, device, rounds, ar
         )
 
     def ag_gemm(a):
-        with ag.gather(a) as (a_buf, ag_args):
+        with ag.prepare(a) as (a_buf, ag_args):
             quack_gemm(
                 a_buf,
                 b,

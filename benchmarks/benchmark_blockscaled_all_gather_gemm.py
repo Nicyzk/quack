@@ -259,7 +259,7 @@ def run_shape(rank, ws, device, M, N, K):
         quack_gemm(a_q_full, b_q, d, None, None, *CFG, SFA=sfa_static, SFB=sfb, **MX)
 
     def quack_bf16_ag():
-        with runner_bf16.gather(a_hp) as (a_full, ag_args):
+        with runner_bf16.prepare(a_hp) as (a_full, ag_args):
             quack_gemm(
                 a_full, b_hp, d, None, None, 256, 256, 2, 1,
                 dist_op=AllGather(), dist_op_args=ag_args,
@@ -268,7 +268,7 @@ def run_shape(rank, ws, device, M, N, K):
     def quack_mx_staged():
         packed = pack_scale_2d_to_blocked_contig(a_sc.view(1, m, K // SF_VEC))
         op = BlockScaledOperand(a_q, packed, "mxfp8_e4m3")
-        with runner_mx.gather(op) as (a_op, ag_args):
+        with runner_mx.prepare(op) as (a_op, ag_args):
             quack_gemm(
                 a_op.qdata, b_q, d, None, None, *CFG,
                 SFA=a_op.scale, SFB=sfb, **MX, dist_op=AllGather(), dist_op_args=ag_args,
@@ -283,7 +283,7 @@ def run_shape(rank, ws, device, M, N, K):
             packed.view(torch.uint8).view(-1),
             group=_PG,
         )
-        with runner_mx.gather(a_q_u8) as (a_full, ag_args):
+        with runner_mx.prepare(a_q_u8) as (a_full, ag_args):
             quack_gemm(
                 a_full.view(torch.float8_e4m3fn), b_q, d, None, None, *CFG,
                 SFA=sfa_nccl, SFB=sfb, **MX, dist_op=AllGather(), dist_op_args=ag_args,

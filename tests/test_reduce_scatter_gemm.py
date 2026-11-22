@@ -81,13 +81,13 @@ def _run_rank():
         get_max_active_clusters,
         torch2cute_dtype_map,
     )
-    from quack.distributed.all_reduce_lamport import AllReduceLamport, make_lamport_buffers
+    from quack.distributed.all_reduce_lamport import AllReduceLamport, AllReduceOneShotRunner
     from quack.distributed.reduce_scatter import (
         AllReduce,
+        AllReduceRunner,
         ReduceScatter,
+        ReduceScatterRunner,
         _symm,
-        make_all_reduce_buffers,
-        make_reduce_scatter_buffers,
     )
     from quack.epilogue.frontend import gemm_epilogue
     from quack.epilogue.ops import ColVecLoad, ColVecReduce, RowVecLoad, RowVecReduce
@@ -144,7 +144,8 @@ def _run_rank():
         return out
 
     # --- reduce-scatter: each rank ends with its M slab of the full-K product ---
-    d, args = make_reduce_scatter_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
+    rs = ReduceScatterRunner(m, n, dtype, TILE_M, TILE_N)
+    d, args = rs.d, rs.prepare()
     fn = _compile(gemm_cls, ReduceScatter(rank, world),epi_fake, cdtype)
     for it in range(NUM_ITERS):
         torch.manual_seed(1000 + 10 * it + rank)
@@ -156,7 +157,8 @@ def _run_rank():
         check(f"rs iter={it}", d,full_ref(a, b)[rows], nccl_rs(a, b))
 
     # --- all-reduce: every rank ends with the whole full-K product ---
-    d, args = make_all_reduce_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
+    ar = AllReduceRunner(m, n, dtype, TILE_M, TILE_N)
+    d, args = ar.d, ar.prepare()
     fn = _compile(gemm_cls, AllReduce(rank, world),epi_fake, cdtype)
     for it in range(NUM_ITERS):
         torch.manual_seed(2000 + 10 * it + rank)
@@ -167,7 +169,8 @@ def _run_rank():
         check(f"ar iter={it}", d,full_ref(a, b), nccl_ar(a, b))
 
     # --- C operand, applied after the reduce: RS adds this rank's slab residual, AR a replicated one ---
-    d, args = make_reduce_scatter_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
+    rs = ReduceScatterRunner(m, n, dtype, TILE_M, TILE_N)
+    d, args = rs.d, rs.prepare()
     fn = _compile(gemm_cls, ReduceScatter(rank, world),epi_fake, cdtype, has_c=True)
     for it in range(NUM_ITERS):
         torch.manual_seed(4000 + 10 * it + rank)
@@ -179,7 +182,8 @@ def _run_rank():
         rows = slice(rank * slab, (rank + 1) * slab)
         check(f"rs+c iter={it}", d,full_ref(a, b)[rows] + c.float(), nccl_rs(a, b) + c)
 
-    d, args = make_all_reduce_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
+    ar = AllReduceRunner(m, n, dtype, TILE_M, TILE_N)
+    d, args = ar.d, ar.prepare()
     fn = _compile(gemm_cls, AllReduce(rank, world),epi_fake, cdtype, has_c=True)
     for it in range(NUM_ITERS):
         torch.manual_seed(5000 + 10 * it + rank)
@@ -194,7 +198,8 @@ def _run_rank():
     # --- one-shot Lamport all-reduce: no flags, the data is the flag; more launches than slots so the
     # 3-slot rotation and the re-arm are exercised ---
     for has_c in (False, True):
-        d, args = make_lamport_buffers(m, n, dtype, TILE_M)
+        ar1 = AllReduceOneShotRunner(m, n, dtype, TILE_M)
+        d = ar1.d
         fn = _compile(gemm_cls, AllReduceLamport(rank, world), epi_fake, cdtype, has_c=has_c)
         for it in range(max(NUM_ITERS, 5)):
             torch.manual_seed(6000 + 10 * it + rank)
@@ -204,7 +209,7 @@ def _run_rank():
             if has_c:
                 torch.manual_seed(6000 + 10 * it)  # rank-invariant residual
                 c = torch.randn(m, n, dtype=dtype, device=device)
-            args.slot.add_(1)
+            args = ar1.prepare()
             fn(a, b, d, c, epi_rt, sched_rt, None, None, None, args)
             torch.cuda.synchronize(device)
             ref, base = full_ref(a, b), nccl_ar(a, b)
@@ -227,7 +232,8 @@ def _run_rank():
         raster_order=RasterOrderOption.AlongN,  # the reducers' measured raster (S2 schedule)
         device_capacity=capacity[0],
     )
-    d, args = make_reduce_scatter_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
+    rs = ReduceScatterRunner(m, n, dtype, TILE_M, TILE_N)
+    d, args = rs.d, rs.prepare()
     for it in range(NUM_ITERS):
         torch.manual_seed(6000 + 10 * it + rank)
         a = torch.randn(m, k, dtype=dtype, device=device) / 8
@@ -242,7 +248,8 @@ def _run_rank():
     # --- GEMM + RS + ReLU: the mod's EVT runs in the comm warps after the reduce (store_tile stores the
     # raw partial); the aux output follows D, this rank's slab ---
     relu_mod = linear_act_mod("relu", gated=False, has_c=False, has_rowvec=False, has_colvec=False)
-    d, args = make_reduce_scatter_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
+    rs = ReduceScatterRunner(m, n, dtype, TILE_M, TILE_N)
+    d, args = rs.d, rs.prepare()
     post = torch.zeros(slab, n, dtype=dtype, device=device)
     for it in range(NUM_ITERS):
         torch.manual_seed(8000 + 10 * it + rank)
@@ -279,13 +286,16 @@ def _run_rank():
     scale_all = torch.randn(m, device=device, dtype=torch.float32)
     for label in ("rs", "ar", "lamport"):
         if label == "rs":
-            d, args = make_reduce_scatter_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
+            rs = ReduceScatterRunner(m, n, dtype, TILE_M, TILE_N)
+            d, args = rs.d, rs.prepare()
             op, rows = ReduceScatter(rank, world), slice(rank * slab, (rank + 1) * slab)
         elif label == "ar":
-            d, args = make_all_reduce_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
+            ar = AllReduceRunner(m, n, dtype, TILE_M, TILE_N)
+            d, args = ar.d, ar.prepare()
             op, rows = AllReduce(rank, world), slice(0, m)
         else:
-            d, args = make_lamport_buffers(m, n, dtype, TILE_M)
+            ar1 = AllReduceOneShotRunner(m, n, dtype, TILE_M)
+            d = ar1.d
             op, rows = AllReduceLamport(rank, world), slice(0, m)
         scale = scale_all[rows].contiguous()
         for it in range(NUM_ITERS):
@@ -293,7 +303,7 @@ def _run_rank():
             a = torch.randn(m, k, dtype=dtype, device=device) / 8
             b = torch.randn(n, k, dtype=dtype, device=device) / 8
             if label == "lamport":
-                args.slot.add_(1)
+                args = ar1.prepare()
             vec_epi.gemm(
                 a,
                 b,
@@ -316,13 +326,14 @@ def _run_rank():
 
     # --- one-shot AR with an aux tensor: every rank reduces whole tiles, so it lands complete and local,
     # as under RS ---
-    d, args = make_lamport_buffers(m, n, dtype, TILE_M)
+    ar1 = AllReduceOneShotRunner(m, n, dtype, TILE_M)
+    d = ar1.d
     post = torch.zeros(m, n, dtype=dtype, device=device)
     for it in range(max(NUM_ITERS, 5)):
         torch.manual_seed(8700 + 10 * it + rank)
         a = torch.randn(m, k, dtype=dtype, device=device) / 8
         b = torch.randn(n, k, dtype=dtype, device=device) / 8
-        args.slot.add_(1)
+        args = ar1.prepare()
         relu_mod.gemm(
             a,
             b,
@@ -351,7 +362,8 @@ def _run_rank():
         from quack.gemm import gemm
 
         for name in ("mxfp8_e4m3", "nvfp4"):
-            d, args = make_reduce_scatter_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
+            rs = ReduceScatterRunner(m, n, dtype, TILE_M, TILE_N)
+            d, args = rs.d, rs.prepare()
             for it in range(NUM_ITERS):
                 torch.manual_seed(9000 + 10 * it + rank)
                 a = torch.randn(m, k, dtype=dtype, device=device) / 8
@@ -390,7 +402,8 @@ def _run_rank():
         # --- requant: D quantized to mxfp8 by its SF op in the comm warps, after the sum (bf16 wire) ---
         from quack.blockscaled.quantize import unpack_scale_blocked_to_2d
 
-        d, args = make_reduce_scatter_buffers(m, n, torch.float8_e4m3fn, TILE_M, TILE_N, clusters)
+        rs = ReduceScatterRunner(m, n, torch.float8_e4m3fn, TILE_M, TILE_N)
+        d, args = rs.d, rs.prepare()
         sfd = torch.empty(
             1, slab // 128, n // 128, 32, 4, 4, dtype=torch.float8_e8m0fnu, device=device
         )
@@ -429,7 +442,8 @@ def _run_rank():
         # --- the same, nvfp4 D (16-wide e4m3 scales, fp4 pairs through the register-direct commit) ---
         from quack.blockscaled.quantize import dequant_operand
 
-        d, args = make_reduce_scatter_buffers(m, n, torch.float4_e2m1fn_x2, TILE_M, TILE_N, clusters)
+        rs = ReduceScatterRunner(m, n, torch.float4_e2m1fn_x2, TILE_M, TILE_N)
+        d, args = rs.d, rs.prepare()
         sfd = torch.empty(
             1, slab // 128, n // 64, 32, 4, 4, dtype=torch.float8_e4m3fn, device=device
         )
@@ -467,13 +481,14 @@ def _run_rank():
 
         # --- one-shot AR with a quantized D: every rank reduces whole tiles, so the SF op runs locally
         # like RS's ---
-        d, args = make_lamport_buffers(m, n, torch.float8_e4m3fn, TILE_M)
+        ar1 = AllReduceOneShotRunner(m, n, torch.float8_e4m3fn, TILE_M)
+        d = ar1.d
         sfd = torch.empty(1, m // 128, n // 128, 32, 4, 4, dtype=torch.float8_e8m0fnu, device=device)
         for it in range(max(NUM_ITERS, 5)):
             torch.manual_seed(9700 + 10 * it + rank)
             a = torch.randn(m, k, dtype=dtype, device=device) / 8
             b = torch.randn(n, k, dtype=dtype, device=device) / 8
-            args.slot.add_(1)
+            args = ar1.prepare()
             gemm(
                 a,
                 b,
@@ -499,13 +514,14 @@ def _run_rank():
                     f"rank{rank} lamport mxfp8-D iter={it}: err={err.max().item()} bound={bound.max().item()}"
                 )
 
-        d, args = make_lamport_buffers(m, n, torch.float4_e2m1fn_x2, TILE_M)
+        ar1 = AllReduceOneShotRunner(m, n, torch.float4_e2m1fn_x2, TILE_M)
+        d = ar1.d
         sfd = torch.empty(1, m // 128, n // 64, 32, 4, 4, dtype=torch.float8_e4m3fn, device=device)
         for it in range(max(NUM_ITERS, 5)):
             torch.manual_seed(9750 + 10 * it + rank)
             a = torch.randn(m, k, dtype=dtype, device=device) / 8
             b = torch.randn(n, k, dtype=dtype, device=device) / 8
-            args.slot.add_(1)
+            args = ar1.prepare()
             gemm(
                 a,
                 b,
@@ -531,12 +547,13 @@ def _run_rank():
                     f"rank{rank} lamport nvfp4-D iter={it}: err={err.max().item()} bound={bound.max().item()}"
                 )
 
-    d, args = make_lamport_buffers(m, n, dtype, TILE_M)
+    ar1 = AllReduceOneShotRunner(m, n, dtype, TILE_M)
+    d = ar1.d
     for it in range(max(NUM_ITERS, 5)):
         torch.manual_seed(7000 + 10 * it + rank)
         a = torch.randn(m, k, dtype=dtype, device=device) / 8
         b = torch.randn(n, k, dtype=dtype, device=device) / 8
-        args.slot.add_(1)
+        args = ar1.prepare()
         identity_epi(
             a, b.T, out={"D": d}, config=cfg, dist_op=AllReduceLamport(rank, world), dist_op_args=args
         )
@@ -552,7 +569,8 @@ def _run_rank():
     colmax_fake = make_fake_tensor(
         Float32, (cute.sym_int(), cute.sym_int(), cute.sym_int()), leading_dim=2
     )
-    d, args = make_reduce_scatter_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
+    rs = ReduceScatterRunner(m, n, dtype, TILE_M, TILE_N)
+    d, args = rs.d, rs.prepare()
     fn = _compile(cls, ReduceScatter(rank, world),cls.EpilogueArguments(colmax=colmax_fake), cdtype)
     stripe = TILE_M // world  # the comm warps' frame: one reduce row per stripe of the slab
     colmax = torch.zeros(1, m // TILE_M, n, dtype=torch.float32, device=device)
@@ -569,7 +587,8 @@ def _run_rank():
         stripe_max = lambda x: x.view(m // TILE_M, stripe, n).abs().amax(1)
         check(f"rs+rowmax colmax iter={it}", colmax[0], stripe_max(ref), stripe_max(base))
 
-    d, args = make_lamport_buffers(m, n, dtype, TILE_M)
+    ar1 = AllReduceOneShotRunner(m, n, dtype, TILE_M)
+    d = ar1.d
     fn = _compile(
         cls, AllReduceLamport(rank, world), cls.EpilogueArguments(colmax=colmax_fake), cdtype
     )
@@ -578,7 +597,7 @@ def _run_rank():
         torch.manual_seed(3700 + 10 * it + rank)
         a = torch.randn(m, k, dtype=dtype, device=device) / 8
         b = torch.randn(n, k, dtype=dtype, device=device) / 8
-        args.slot.add_(1)
+        args = ar1.prepare()
         fn(a, b, d, None, cls.EpilogueArguments(colmax=colmax), sched_rt, None, None, None, args)
         torch.cuda.synchronize(device)
         ref, base = full_ref(a, b), nccl_ar(a, b).float()
@@ -598,7 +617,8 @@ def _run_rank():
     sumsq_fake = make_fake_tensor(
         Float32, (cute.sym_int(), cute.sym_int(), cute.sym_int()), leading_dim=2
     )
-    d, args = make_all_reduce_buffers(m, n, dtype, TILE_M, TILE_N, clusters)
+    ar = AllReduceRunner(m, n, dtype, TILE_M, TILE_N)
+    d, args = ar.d, ar.prepare()
     fn = _compile(cls, AllReduce(rank, world), cls.EpilogueArguments(sumsq=sumsq_fake), cdtype)
     sumsq, sumsq_mc, _ = _symm((1, m, n // TILE_N), torch.float32, zero=True)
     for it in range(NUM_ITERS):

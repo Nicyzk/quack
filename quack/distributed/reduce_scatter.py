@@ -8,11 +8,10 @@
 # world partials, multimem ld_reduce the stripe from the multicast partials view, run the GEMM's epilogue
 # on the sum (the epi ops, framed on the stripe) and commit it into D, this rank's (m // world, n) slab
 # (the user's output, any dtype quack stores D in: a quantized D runs its SF op here, after the sum).
-# Usage: d, args = make_reduce_scatter_buffers(m, n, dtype, tile_m, tile_n, ctas); mod(a, b, out={"D": d},
-# config=cfg, dist_op=ReduceScatter(rank, world), dist_op_args=args). Direct:
-# GemmSm100(..., dist_op=ReduceScatter(rank, world)), launch with mD=d, dist_op_args=args.
+# Usage: rs = ReduceScatterRunner(m, n, dtype, tile_m, tile_n); mod.gemm(a, b, rs.d, c, ..., dist_op=rs.op,
+# dist_op_args=rs.prepare()). Direct: GemmSm100(..., dist_op=rs.op), launch with mD=rs.d, dist_op_args=rs.args.
 # AllReduce = the same reduce with a broadcast commit: the reduced stripe goes by multimem st into every
-# rank's symmetric (m, n) D (two-shot AR); make_all_reduce_buffers.
+# rank's symmetric (m, n) D (two-shot AR); AllReduceRunner.
 # A C operand (residual) is applied after the reduce: the epi-load warp stages it per comm subtile at
 # the result's coordinates, so C is slab-shaped (m // world, n) for RS and the full (m, n) for AR.
 import math
@@ -22,6 +21,7 @@ from typing import NamedTuple
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
+import torch
 from cutlass import Int32, Int64
 from cutlass.cute.typing import AddressSpace
 from quack.compile_utils import make_fake_tensor
@@ -409,11 +409,11 @@ def _symm(shape, torch_dtype, zero=False):
     return base, _wrap_device_ptr(hdl.multicast_ptr, tuple(shape), torch_dtype), hdl
 
 
-def _make_partials(m, n, tile_m, tile_n, ctas):
+def _make_partials(m, n, tile_m, tile_n):
     """(partials, partials_mc, flags, flags_mc, peer_flags, exit_flags, exit_flags_mc): the symmetric
     partials buffer the GEMM stores into (partial_dtype) with its multicast view, the tile flags with their
-    multicast view and every rank's flags address, and the exit slots (ctas = the persistent grid's CTA
-    count)."""
+    multicast view and every rank's flags address, and the exit slots (one per resident CTA: the persistent
+    grid is at most the SM count)."""
     import torch
 
     from quack.cute_dsl_utils import torch2cute_dtype_map
@@ -423,32 +423,49 @@ def _make_partials(m, n, tile_m, tile_n, ctas):
     partials, partials_mc, _ = _symm((m, n), wire)
     flags, flags_mc, flags_hdl = _symm((m // tile_m, n // tile_n), torch.int32, zero=True)
     peer_flags = torch.tensor(flags_hdl.buffer_ptrs, dtype=torch.int64, device="cuda")
-    exit_flags, exit_flags_mc, _ = _symm((ctas,), torch.int32, zero=True)
+    sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+    exit_flags, exit_flags_mc, _ = _symm((sms,), torch.int32, zero=True)
     return partials, partials_mc, flags, flags_mc, peer_flags, exit_flags, exit_flags_mc
 
 
-def make_reduce_scatter_buffers(m, n, torch_dtype, tile_m, tile_n, ctas):
-    """(d, args) for GEMM + RS of an (m, n) output: D = this rank's (m // world, n) slab in torch_dtype, and
-    the ReduceScatterArguments. The operator is ReduceScatter(rank, world); the flags self-reset, so
-    nothing runs between launches."""
-    import torch
-    import torch.distributed as dist
-
-    world = dist.get_world_size()
-    assert m % (world * tile_m) == 0, "RS: a whole number of tiles per slab"
-    partials, partials_mc, flags, _, *rest = _make_partials(m, n, tile_m, tile_n, ctas)
-    cols = n // 2 if torch_dtype == torch.float4_e2m1fn_x2 else n  # fp4 D packs two values a byte
-    d = torch.empty(m // world, cols, dtype=torch_dtype, device="cuda")
-    torch.cuda.synchronize()
-    return d, ReduceScatterArguments(partials, partials_mc, flags, *rest)
+def _d_cols(n, torch_dtype):
+    return n // 2 if torch_dtype == torch.float4_e2m1fn_x2 else n  # fp4 D packs two values a byte
 
 
-def make_all_reduce_buffers(m, n, torch_dtype, tile_m, tile_n, ctas):
-    """(d, args) for GEMM + two-shot AR: D = this rank's symmetric copy of the full (m, n) result, and the
-    AllReduceArguments. The operator is AllReduce(rank, world)."""
-    import torch
+class ReduceScatterRunner:
+    """GEMM + RS of an (m, n) output computed at tile (tile_m, tile_n) (the flags are per tile): `d` = this
+    rank's (m // world, n) slab in torch_dtype, `op` = ReduceScatter(rank, world), `prepare()` = the GEMM's
+    dist_op_args (constant: the flags self-reset, nothing runs between launches)."""
 
-    partials, partials_mc, flags, flags_mc, _, *rest = _make_partials(m, n, tile_m, tile_n, ctas)
-    d, d_mc, _ = _symm((m, n), torch_dtype)
-    torch.cuda.synchronize()
-    return d, AllReduceArguments(partials, partials_mc, d_mc, flags, flags_mc, *rest)
+    def __init__(self, m, n, torch_dtype, tile_m, tile_n):
+        import torch.distributed as dist
+
+        rank, world = dist.get_rank(), dist.get_world_size()
+        assert m % (world * tile_m) == 0, "RS: a whole number of tiles per slab"
+        partials, partials_mc, flags, _, *rest = _make_partials(m, n, tile_m, tile_n)
+        self.d = torch.empty(m // world, _d_cols(n, torch_dtype), dtype=torch_dtype, device="cuda")
+        self.op = ReduceScatter(rank, world)
+        self.args = ReduceScatterArguments(partials, partials_mc, flags, *rest)
+        torch.cuda.synchronize()
+
+    def prepare(self):
+        return self.args
+
+
+class AllReduceRunner:
+    """GEMM + two-shot AR of an (m, n) output at tile (tile_m, tile_n): `d` = this rank's symmetric copy of
+    the full result (the broadcast commit's target), `op` = AllReduce(rank, world), `prepare()` = the GEMM's
+    dist_op_args (constant)."""
+
+    def __init__(self, m, n, torch_dtype, tile_m, tile_n):
+        import torch.distributed as dist
+
+        rank, world = dist.get_rank(), dist.get_world_size()
+        partials, partials_mc, flags, flags_mc, _, *rest = _make_partials(m, n, tile_m, tile_n)
+        self.d, d_mc, _ = _symm((m, _d_cols(n, torch_dtype)), torch_dtype)
+        self.op = AllReduce(rank, world)
+        self.args = AllReduceArguments(partials, partials_mc, d_mc, flags, flags_mc, *rest)
+        torch.cuda.synchronize()
+
+    def prepare(self):
+        return self.args

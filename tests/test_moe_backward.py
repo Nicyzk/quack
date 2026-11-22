@@ -60,8 +60,8 @@ def _run_rank():
     import torch.distributed as dist
     import torch.distributed._symmetric_memory as symm_mem
 
-    from quack.distributed.combine import CombineStore, make_combine_buffers
-    from quack.distributed.dispatch import DispatchPull, make_dispatch_rows
+    from quack.distributed.combine import CombineRunner
+    from quack.distributed.dispatch import DispatchRunner
     from quack.distributed.reduce_over_k import reduce_over_k
     from quack.cute_dsl_utils import get_device_capacity
     from quack.epilogue.library import dswiglu_moe_swap_mod
@@ -118,10 +118,8 @@ def _run_rank():
     ).contiguous()  # (E, I, H), K-major: the transposed weight copy, once per step
     w1t = w1_pw.transpose(1, 2).contiguous()  # (E, H, 2I), K in the pairwise order dh comes in
     dout_loc, dout_hdl = symm_rows(dout_all)
-    build, rows_d, args_d = make_dispatch_rows(
-        topk_g, s_scatter, s_reverse, rank, cu, dout_loc, dout_hdl, TILE_N
-    )
-    d, slots, combine_args = make_combine_buffers(T_LOCAL, TOPK, H, bf16, group, max_rows)
+    dispatch = DispatchRunner(dout_loc, dout_hdl, TILE_N)
+    combine = CombineRunner(T_LOCAL, TOPK, H, bf16, group, max_rows)
     dh = torch.zeros(max_rows, 2 * I, device=device, dtype=bf16)  # packed pairwise, as h
     a_s = torch.zeros(max_rows, I, device=device, dtype=bf16)
     # the score grad's per-CTA-M-tile partials (the sink rule: M tiles of the per-CTA tile, N columns)
@@ -129,8 +127,7 @@ def _run_rank():
     dscore = torch.zeros(-(-I // cta_tile_m), max_rows, device=device, dtype=torch.float32)
     dx = torch.empty(T_LOCAL, H, device=device, dtype=bf16)
     dist.barrier()  # every rank's dout is written before any pull reads it
-    build()
-    args_d.flags.zero_()
+    rows_d, args_d = dispatch.prepare(topk_g, s_scatter, s_reverse, cu)
     # 1 + 2 fused: the dgated epilogue on the fc2 dgrad reads the preact (C), writes dh (D), a * s and the
     # per-token score grad (a row-vector reduce over I)
     dswiglu_moe_swap_mod.gemm(
@@ -144,7 +141,7 @@ def _run_rank():
         cluster_M=2,
         cluster_N=1,
         cu_seqlens_n=cu,
-        dist_op=DispatchPull(H * 2),
+        dist_op=dispatch.op,
         dist_op_args=args_d,
     )
     ds_g = torch.zeros(world * T_LOCAL * TOPK, device=device, dtype=torch.float32)
@@ -155,7 +152,7 @@ def _run_rank():
     gemm(
         w1t,
         dh,
-        d.T,
+        combine.d.T,
         None,
         None,
         256,
@@ -163,12 +160,12 @@ def _run_rank():
         2,
         1,
         cu_seqlens_n=cu,
-        dist_op=CombineStore(H),
-        dist_op_args=combine_args(s_scatter),  # a row's slot id is its routing slot
+        dist_op=combine.op,
+        dist_op_args=combine.prepare(s_scatter),  # a row's slot id is its routing slot
     )
     torch.cuda.synchronize(device)
     dist.barrier()  # every rank's drains have landed
-    reduce_over_k(slots, None, dx)
+    reduce_over_k(combine.slots, None, dx)
     # 4. the weight grads as varlen-K GEMMs over the packed rows: dW2_e = dy_e^T (a s)_e, dW1_e = dh_e^T x_e;
     # A (m, total_k) m-major, B (n, total_k) n-major = the rows' transposes
     dw1, dw2 = torch.empty_like(w1_loc), torch.empty_like(w2_loc)

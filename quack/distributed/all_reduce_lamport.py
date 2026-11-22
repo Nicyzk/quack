@@ -7,9 +7,8 @@
 # peers write that slot again only in call i + 2, after this rank's call i + 1 data, so nothing orders the
 # re-arm. The comm warps poll their local slot-k mirrors per 16 B atom until no word is the sentinel, sum in
 # f32, run the GEMM's epilogue on the whole tile and commit it into D, this rank's plain (m, n) output.
-# Usage: d, args = make_lamport_buffers(m, n, dtype, tile_m); args.slot.add_(1) before every launch;
-# mod(a, b, out={"D": d}, config=cfg, dist_op=AllReduceLamport(rank, world), dist_op_args=args).
-# Direct: GemmSm100(..., dist_op=AllReduceLamport(rank, world)), launch with mD=d, dist_op_args=args.
+# Usage: ar = AllReduceOneShotRunner(m, n, dtype, tile_m); per launch: mod.gemm(a, b, ar.d, c, ...,
+# dist_op=ar.op, dist_op_args=ar.prepare()). Direct: GemmSm100(..., dist_op=ar.op), launch with mD=ar.d.
 from functools import partial
 from typing import NamedTuple
 
@@ -281,23 +280,29 @@ class AllReduceLamport(DistOp):
 # ---- host ----
 
 
-def make_lamport_buffers(m, n, torch_dtype, tile_m):
-    """(d, args) for GEMM + one-shot AR of an (m, n) output: D = this rank's full (m, n) result, args =
-    the slot mirrors (partial_dtype) with the launch counter: args.slot.add_(1) before every launch. The
-    operator is AllReduceLamport(rank, world)."""
-    import torch
-    import torch.distributed as dist
+class AllReduceOneShotRunner:
+    """GEMM + one-shot (Lamport) AR of an (m, n) output: `d` = this rank's full (m, n) result in torch_dtype,
+    `op` = AllReduceLamport(rank, world); `prepare()` advances the launch counter (slot k = launches % 3) and
+    returns the GEMM's dist_op_args: call it once per launch."""
 
-    from quack.cute_dsl_utils import torch2cute_dtype_map
+    def __init__(self, m, n, torch_dtype, tile_m):
+        import torch
+        import torch.distributed as dist
 
-    world = dist.get_world_size()
-    assert m % tile_m == 0, "whole tiles along M"
-    wire = next(t for t, c in torch2cute_dtype_map.items() if c is AllReduceLamport.partial_dtype)
-    slots, slots_mc, _ = _symm((SLOTS * world * m, n), wire)
-    slots.fill_(-0.0)
-    cols = n // 2 if torch_dtype == torch.float4_e2m1fn_x2 else n  # fp4 D packs two values a byte
-    d = torch.empty(m, cols, dtype=torch_dtype, device="cuda")
-    slot = torch.zeros(1, dtype=torch.int32, device="cuda")
-    torch.cuda.synchronize()
-    dist.barrier()  # every rank's mirrors are armed before any peer stores into them
-    return d, LamportArguments(slots, slots_mc, slot)
+        from quack.cute_dsl_utils import torch2cute_dtype_map
+
+        rank, world = dist.get_rank(), dist.get_world_size()
+        assert m % tile_m == 0, "whole tiles along M"
+        wire = next(t for t, c in torch2cute_dtype_map.items() if c is AllReduceLamport.partial_dtype)
+        slots, slots_mc, _ = _symm((SLOTS * world * m, n), wire)
+        slots.fill_(-0.0)
+        cols = n // 2 if torch_dtype == torch.float4_e2m1fn_x2 else n  # fp4 D packs two values a byte
+        self.d = torch.empty(m, cols, dtype=torch_dtype, device="cuda")
+        self.op = AllReduceLamport(rank, world)
+        self.args = LamportArguments(slots, slots_mc, torch.zeros(1, dtype=torch.int32, device="cuda"))
+        torch.cuda.synchronize()
+        dist.barrier()  # every rank's mirrors are armed before any peer stores into them
+
+    def prepare(self):
+        self.args.slot.add_(1)
+        return self.args

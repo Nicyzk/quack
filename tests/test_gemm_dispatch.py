@@ -61,7 +61,7 @@ def _run_rank(fmt):
 
     from quack.blockscaled.operand import BlockScaledOperand
     from quack.blockscaled.quantize import nvfp4_per_tensor_scale, unpack_scale_blocked_to_2d
-    from quack.distributed.dispatch import DispatchPull, make_dispatch_rows, sf_words_of
+    from quack.distributed.dispatch import DispatchRunner
     from quack.epilogue.library import linear_act_mod
     from quack.gemm_tvm_ffi_utils import varlen_n_block_atoms
 
@@ -135,9 +135,7 @@ def _run_rank(fmt):
     sf_loc, sf_hdl = (None, None) if x_sf is None else symm_rows(x_sf)
     cu, s_scatter, s_reverse = routing(topk_g, rank)
     total = int(cu[-1])
-    build, rows, args = make_dispatch_rows(
-        topk_g, s_scatter, s_reverse, rank, cu, x_loc, x_hdl, TILE_N, sf_loc, sf_hdl, sf_pool
-    )
+    dispatch = DispatchRunner(x_loc, x_hdl, TILE_N, sf_loc, sf_hdl, sf_pool)
     postact = torch.zeros(total, I, device=device, dtype=torch.bfloat16)
     epi_args["mAuxOut"] = postact.T
     mod = linear_act_mod(
@@ -149,8 +147,7 @@ def _run_rank(fmt):
         has_alpha=fmt == "nvfp4",
     )
     dist.barrier()  # every rank's rows are written before any pull reads them
-    build()
-    args.flags.zero_()
+    rows, args = dispatch.prepare(topk_g, s_scatter, s_reverse, cu)
     mod.gemm(
         w_q,
         rows,
@@ -162,7 +159,7 @@ def _run_rank(fmt):
         cluster_M=2,
         cluster_N=1,
         cu_seqlens_n=cu,
-        dist_op=DispatchPull(rows.shape[1] * rows.element_size(), sf_words=sf_words_of(name, rows)),
+        dist_op=dispatch.op,
         dist_op_args=args,
         **sf_kw,
     )

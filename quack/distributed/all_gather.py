@@ -11,7 +11,7 @@ GEMM variant participates through the :class:`AllGather` operator. The
 driver half (:class:`AllGatherRunner`) owns buffers/flags/transport and
 wraps the GEMM(s) in a context::
 
-    with runner.gather(a_shard) as (a_full, ag_args):
+    with runner.prepare(a_shard) as (a_full, ag_args):
         d = gemm(a_full, b, ..., dist_op=AllGather(), dist_op_args=ag_args)
 
 Contrast with the ecosystem: TransformerEngine's ub overlap lives INSIDE
@@ -195,7 +195,7 @@ anyway. Typical totals at compute-bound shapes: ~3.5% TP2 / ~7% TP4 /
 already pipeline-hidden); A needs none (the inbound CE writes ARE one).
 
 CUDA graphs: whole calls are OUTER-capture-safe — torch.cuda.graph around
-ANY number of gather() calls. Capture records enqueued work as a DAG
+ANY number of prepare() calls. Capture records enqueued work as a DAG
 (edges = stream order + event record->wait pairs); Python runs ONCE, at
 capture; replay executes the DAG without re-entering Python. Ordinary
 single-stream tensor code captures with no special handling; this file
@@ -207,13 +207,13 @@ check below maps to one of them:
    its docstring has the proof that the skip is redundant, not unsafe.
 2. FORKED SIDE STREAMS LEFT DANGLING: capture_end requires every forked
    branch rejoined, but a plain per-call join bakes barrier_i ->
-   compute_{i+1} edges — the 1-buffer lockstep schedule. gather() joins
+   compute_{i+1} edges — the 1-buffer lockstep schedule. prepare() joins
    and then RESTORES the pre-join capture dependency set, making the
    side-branch tails graph LEAVES (still inside the graph — replay N+1
    waits for every node of replay N — but off the captured critical
    path). capture_lockstep=True keeps the join edges instead; both
    schedules and their measurements are documented at the join site in
-   gather().
+   prepare().
 3. HOST VALUES BAKE at capture. Designed away rather than checked: the
    epoch lives in DEVICE memory and flag writes are 4-byte copies FROM
    it — values are read at node execution, fresh and monotone for ANY
@@ -280,7 +280,7 @@ def _check(err_ret):
 
 @mlir_namedtuple
 class AllGatherArguments(NamedTuple):
-    """AllGather's bundle (the GEMM's dist_op_args; what gather() yields). The gate spins on the
+    """AllGather's bundle (the GEMM's dist_op_args; what prepare() yields). The gate spins on the
     flags; make_scheduler_args reads the shard geometry off it for the scheduler's shard tile order
     (the shard-major rotated decode, validated against the tile config by validate_ag_geometry)."""
 
@@ -391,7 +391,7 @@ class AllGatherRunner:
         # True = every captured call paced behind the cross-rank barrier
         # (the 1-buffer-style schedule) — measured FASTER in uniform
         # steady-state replay loops (TP4 1.5-5%), worse in theory under
-        # per-rank jitter (each call waits the fleet max). See gather().
+        # per-rank jitter (each call waits the fleet max). See prepare().
         capture_lockstep: bool = False,
     ):
         self.group = group if group is not None else dist.group.WORLD
@@ -460,7 +460,7 @@ class AllGatherRunner:
         # the epoch tensor 4-byte aligned — one scalar load — so rows at 4-byte
         # offsets from the base are fine.)
         self.epoch = torch.zeros(3, 1, dtype=torch.int32, device=self.device)
-        # Outer-capture bookkeeping: gather() detects a NEW capture via the
+        # Outer-capture bookkeeping: prepare() detects a NEW capture via the
         # capture-sequence id and resets the per-buffer "reuse recorded in
         # this capture" flags (consumed by _wait_reuse's skip logic).
         self._capture_id = None
@@ -489,8 +489,8 @@ class AllGatherRunner:
         # a count cannot name a buffer: replayed graphs end on their BAKED
         # final parity regardless of how many times they replayed).
         self.last_parity = 0
-        self._capture_parity = 0  # capture-local parity sequencer (see gather())
-        self._in_gather = False  # reentrancy guard for gather()
+        self._capture_parity = 0  # capture-local parity sequencer (see prepare())
+        self._in_gather = False  # reentrancy guard for prepare()
         dist.barrier(self.group)  # flags zeroed everywhere before first use
 
     def gathered_a(self) -> torch.Tensor:
@@ -505,13 +505,13 @@ class AllGatherRunner:
         return self.bufs[self.last_parity]
 
     def next_local_slot(self) -> torch.Tensor:
-        """The local-shard slice of the buffer the NEXT gather() will use.
+        """The local-shard slice of the buffer the NEXT prepare() will use.
 
         Zero-copy producer fusion: have the op producing A write directly into
-        this view, then pass it as ``a_shard`` — gather() detects the aliasing
+        this view, then pass it as ``a_shard`` — prepare() detects the aliasing
         and skips the staging copy. NOTE: writing here races with lagging peers
         of the PREVIOUS call unless the producer runs after ev_reuse; when in
-        doubt, pass a plain tensor and let gather() stage it. Tracks
+        doubt, pass a plain tensor and let prepare() stage it. Tracks
         last_parity (see gathered_a): after graph replays, quiesce() first.
         """
         buf = self.bufs[self.last_parity ^ 1]
@@ -531,7 +531,7 @@ class AllGatherRunner:
         last_parity: int | None = None,
         replay_stream: torch.cuda.Stream | None = None,
     ):
-        """THE sanctioned boundary for switching between eager gather()
+        """THE sanctioned boundary for switching between eager prepare()
         calls and graph replays (either direction). Call it on every rank at
         the same point in the call sequence (standard collective congruence
         — ranks must run identical eager/replay sequences), on the stream
@@ -621,7 +621,7 @@ class AllGatherRunner:
         call after graph work waits the last EAGER record (satisfied —
         redundant-but-valid under the sync-boundary contract in the module
         docstring)."""
-        # (new-capture detection/reset happens once per call, in gather())
+        # (new-capture detection/reset happens once per call, in prepare())
         if torch.cuda.is_current_stream_capturing():
             if self._reuse_in_capture[parity]:
                 stream.wait_event(self.ev_reuse_capture[parity])
@@ -710,10 +710,10 @@ class AllGatherRunner:
         self.ev_shard_staged.record()
 
     @contextmanager
-    def gather(self, a_shard: torch.Tensor):
+    def prepare(self, a_shard: torch.Tensor):
         """Overlapped all-gather around any GEMM(s) — the primary API::
 
-            with runner.gather(a_shard) as (a_full, ag_args):
+            with runner.prepare(a_shard) as (a_full, ag_args):
                 d = gemm(a_full, b, ..., dist_op=AllGather(), dist_op_args=ag_args)
 
         On ENTER: acquire the rotating buffer, stage the local shard, commit
@@ -748,7 +748,7 @@ class AllGatherRunner:
         """
         assert a_shard.shape == (self.shard_m, self.k) and a_shard.dtype == self.dtype
         assert a_shard.stride(-1) == 1, "A shard must be K-major (row-contiguous)"
-        assert not self._in_gather, "gather() calls cannot nest or overlap"
+        assert not self._in_gather, "prepare() calls cannot nest or overlap"
         self._in_gather = True
         try:
             # last_parity tracks the buffer of the last EXECUTED call.
@@ -891,7 +891,7 @@ class BlockScaledAllGatherRunner(AllGatherRunner):
     gather the quantized values AND the blocked scale factors under ONE
     flag set, fully overlapped with the GEMM.
 
-    Same ``gather()`` interface as the parent, made type-symmetric:
+    Same ``prepare()`` interface as the parent, made type-symmetric:
     ``gather(X)`` yields ``(X_gathered, ag_args)``. A plain
     ``torch.Tensor`` X runs the parent verbatim; a
     :class:`~quack.blockscaled.operand.BlockScaledOperand` X engages the
@@ -899,7 +899,7 @@ class BlockScaledAllGatherRunner(AllGatherRunner):
 
         runner = BlockScaledAllGatherRunner(shard_m, k, "mxfp8_e4m3")
         shard = BlockScaledOperand(a_q, sfa_blocked, "mxfp8_e4m3")
-        with runner.gather(shard) as (a_op, ag_args):
+        with runner.prepare(shard) as (a_op, ag_args):
             gemm(a_op.qdata, b_q, d, None, None, tm, tn, cm, cn,
                  SFA=a_op.scale, SFB=sfb, bs_format_a="mxfp8_e4m3",
                  bs_format_b="mxfp8_e5m2",  # B format independent, as in dense
@@ -935,7 +935,7 @@ class BlockScaledAllGatherRunner(AllGatherRunner):
        rank * sfa_shard_bytes.
 
     2. ORDERING: SFA peer sends are enqueued on the parent's push_stream
-       DURING the gather() body, i.e. BEFORE the parent's __exit__ enqueues
+       DURING the prepare() body, i.e. BEFORE the parent's __exit__ enqueues
        the [A send, flag write] pairs. Same-stream CE order therefore places
        every peer's SFA memcpy before that peer's flag write: one flag
        publishes both payloads, by the same flag-implies-data argument the

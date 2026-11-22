@@ -128,20 +128,26 @@ class CombineStore(DistOp):
         )
 
 
-def make_combine_buffers(tokens_local, k, hidden, torch_dtype, group, max_rows):
-    """(d, slots, args) for GEMM2 + combine of tokens_local tokens x k experts x hidden: a (max_rows, hidden) D
-    the drain never writes (the kernel's D shape), the symmetric slots every peer's GEMM2 lands rows in (reduce
-    over k after a cross-rank barrier), and args(row_key) -> CombineArguments for a call's routing (each D row's
-    global slot id). The operator is CombineStore(hidden)."""
-    import torch
-    import torch.distributed._symmetric_memory as symm_mem
+class CombineRunner:
+    """GEMM2 + combine of tokens_local tokens x k experts x hidden: `d` = a (max_rows, hidden) D the drain never
+    writes (the kernel's D shape), `slots` = the symmetric slots every peer's GEMM2 lands rows in (reduce over
+    k after a cross-rank barrier: reduce_over_k), `op` = CombineStore(hidden); prepare(row_key) = the GEMM's
+    dist_op_args for a call's routing (each D row's global slot id)."""
 
-    dev = torch.cuda.current_device()
-    world = group.size()
-    slots = symm_mem.empty(tokens_local, k, hidden, dtype=torch_dtype, device=dev)
-    hdl = symm_mem.rendezvous(slots, group=group)
-    shape = (tokens_local, k, hidden)
-    bases = [hdl.get_buffer(q, shape, torch_dtype).data_ptr() for q in range(world)]
-    slot_base = torch.tensor(bases, dtype=torch.int64, device=dev)
-    d = torch.empty(max_rows, hidden, dtype=torch_dtype, device=dev)
-    return d, slots, partial(CombineArguments, slot_base, tokens_local * k)
+    def __init__(self, tokens_local, k, hidden, torch_dtype, group, max_rows):
+        import torch
+        import torch.distributed._symmetric_memory as symm_mem
+
+        dev = torch.cuda.current_device()
+        self.slots = symm_mem.empty(tokens_local, k, hidden, dtype=torch_dtype, device=dev)
+        hdl = symm_mem.rendezvous(self.slots, group=group)
+        shape = (tokens_local, k, hidden)
+        bases = [hdl.get_buffer(q, shape, torch_dtype).data_ptr() for q in range(group.size())]
+        self._args = partial(
+            CombineArguments, torch.tensor(bases, dtype=torch.int64, device=dev), tokens_local * k
+        )
+        self.d = torch.empty(max_rows, hidden, dtype=torch_dtype, device=dev)
+        self.op = CombineStore(hidden)
+
+    def prepare(self, row_key):
+        return self._args(row_key)

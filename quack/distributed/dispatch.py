@@ -268,27 +268,37 @@ def sf_words_of(a_format, x):
     return k // (4 * fmt.sf_vec_size)
 
 
-def make_dispatch_rows(
-    topk_idx_g, s_scatter, s_reverse, rank, cu_seqlens, x, x_hdl, tile_n, x_sf=None, x_sf_hdl=None, sf_pool=None
-):
-    """(build, rows, args) for GEMM1 + dispatch pull: the device-walk builder to run before every launch (then
-    args.flags.zero_()), the GEMM's B the pull fills (rows packed per expert, (max rows, K); pass with cu_seqlens_n =
-    cu_seqlens) and the DispatchArguments. The operator is DispatchPull(row bytes, sf_words_of(a_format, x)).
-    topk_idx_g (W, T_local, K) int32, s_scatter / s_reverse / cu_seqlens int32 as make_dispatch_walk; x = this
-    rank's (T_local, K) token rows (one dtype or a block-scaled format's qdata) in symmetric memory, x_hdl its
-    rendezvous handle: every rank's rows are read through it, and the walk keeps it so the mapping outlives the
-    pulls; tile_n = the GEMM's tile N (its even-split blocks are the gated unit); x_sf + x_sf_hdl + sf_pool: the
-    block-scaled scale lane (the (T_local, K / sf_vec_size) 1-byte scale rows, sf_pool = the GEMM's per-block SF
-    atoms)."""
-    W = topk_idx_g.shape[0]
-    peers = lambda t, hdl: [  # every rank's rows, typed as t (the handle hands out byte views)
-        hdl.get_buffer(q, (t.shape[0], t.shape[1] * t.element_size()), torch.uint8).view(t.dtype) for q in range(W)
-    ]
-    build, walk = make_dispatch_walk(
-        topk_idx_g, s_scatter, s_reverse, rank, cu_seqlens, peers(x, x_hdl), tile_n,
-        x_sf_peer_bufs=None if x_sf is None else peers(x_sf, x_sf_hdl),
-    )
-    walk.handles = (x_hdl, x_sf_hdl)  # pins the symmetric mappings as long as build (which closes over walk) lives
-    rows = torch.empty(s_scatter.numel(), x.shape[1], dtype=x.dtype, device=x.device)
-    sf_bytes = None if sf_pool is None else sf_pool.view(torch.uint8).view(-1)  # the pull addresses bytes
-    return build, rows, DispatchArguments(walk.args, rows.view(torch.uint8), walk.flags, sf_bytes)
+class DispatchRunner:
+    """GEMM1 + dispatch pull. x = this rank's (T_local, K) token rows (one dtype or a block-scaled format's
+    qdata) in symmetric memory, x_hdl its rendezvous handle: every rank's rows are read through it, and the
+    runner keeps it so the mapping outlives the pulls; tile_n = the GEMM's tile N (its even-split blocks are
+    the gated unit); x_sf + x_sf_hdl + sf_pool: the block-scaled scale lane (the (T_local, K / sf_vec_size)
+    1-byte scale rows, sf_pool = the GEMM's per-block SF atoms). `op` = DispatchPull(row bytes, scale words).
+    prepare(topk_idx_g, s_scatter, s_reverse, cu_seqlens) runs the device walk for a call's routing
+    (topk_idx_g (W, T_local, K) int32, the rest int32 as make_dispatch_walk) and returns (rows, args): the
+    GEMM's B the pull fills (rows packed per expert, (max rows, K); pass with cu_seqlens_n = cu_seqlens) and
+    the dist_op_args. The caller orders every rank's rows before the first pull (a barrier)."""
+
+    def __init__(self, x, x_hdl, tile_n, x_sf=None, x_sf_hdl=None, sf_pool=None):
+        self.rank, world = x_hdl.rank, x_hdl.world_size
+        peers = lambda t, hdl: [  # every rank's rows, typed as t (the handle hands out byte views)
+            hdl.get_buffer(q, (t.shape[0], t.shape[1] * t.element_size()), torch.uint8).view(t.dtype)
+            for q in range(world)
+        ]
+        self.x, self.tile_n = x, tile_n
+        self.peers = peers(x, x_hdl)
+        self.sf_peers = None if x_sf is None else peers(x_sf, x_sf_hdl)
+        self.handles = (x_hdl, x_sf_hdl)  # pins the symmetric mappings as long as the runner lives
+        self.sf_bytes = None if sf_pool is None else sf_pool.view(torch.uint8).view(-1)  # the pull addresses bytes
+        sf_words = 0 if x_sf is None else x_sf.shape[1] * x_sf.element_size() // 4
+        self.op = DispatchPull(x.shape[1] * x.element_size(), sf_words)
+
+    def prepare(self, topk_idx_g, s_scatter, s_reverse, cu_seqlens):
+        build, self.walk = make_dispatch_walk(
+            topk_idx_g, s_scatter, s_reverse, self.rank, cu_seqlens, self.peers, self.tile_n,
+            x_sf_peer_bufs=self.sf_peers,
+        )
+        rows = torch.empty(s_scatter.numel(), self.x.shape[1], dtype=self.x.dtype, device=self.x.device)
+        build()
+        self.walk.flags.zero_()
+        return rows, DispatchArguments(self.walk.args, rows.view(torch.uint8), self.walk.flags, self.sf_bytes)

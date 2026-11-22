@@ -19,13 +19,13 @@ NUM_ITERS = 6  # exercises epoch monotonicity + double-buffer reuse
 
 
 def _ag_gemm(runner, a_shard, b, d=None):
-    """Plain AG+GEMM (D = A_full @ B^T) through the gather() context."""
+    """Plain AG+GEMM (D = A_full @ B^T) through the prepare() context."""
     from quack.distributed import AllGather
     from quack.gemm import gemm as quack_gemm
 
     if d is None:
         d = torch.empty(runner.m_total, b.shape[0], dtype=runner.dtype, device=runner.device)
-    with runner.gather(a_shard) as (a_full, ag_args):
+    with runner.prepare(a_shard) as (a_full, ag_args):
         # world_size == 1 yields no flags: a plain GEMM
         dist_op = AllGather() if ag_args is not None else None
         quack_gemm(a_full, b, d, None, None, 128, 256, 2, 1, dist_op=dist_op, dist_op_args=ag_args)
@@ -99,7 +99,7 @@ def _run_rank():
                     f"gathered_err={gathered_err}"
                 )
     # --- Abstraction check: AllGather + GEMM+SiLU epilogue via the
-    # runner.gather() CONTEXT — proves any epilogue-mod GEMM overlaps by
+    # runner.prepare() CONTEXT — proves any epilogue-mod GEMM overlaps by
     # calling it inline in the with-body with the AllGather operator (same
     # route serves rope etc.).
     from quack.epilogue.library import linear_act_mod
@@ -119,7 +119,7 @@ def _run_rank():
         acc = a_full_ref.float() @ b.float().T
         ref = torch.nn.functional.silu(acc)
         baseline = torch.nn.functional.silu(acc.to(dtype).float())
-        with runner.gather(a_shard) as (a_full, ag_args):
+        with runner.prepare(a_shard) as (a_full, ag_args):
             linear_act_mod(
                 "silu", gated=False, has_c=False, has_rowvec=False, has_colvec=False
             ).gemm(
@@ -140,6 +140,72 @@ def _run_rank():
         tol = (baseline - ref).abs().max().item() + 1e-4
         if err > 2 * tol:
             failures.append(f"rank{rank} AG+gemm_act(silu) iter={it}: err={err} tol={tol}")
+
+    # --- The same route, the TP block's epilogues: gated SwiGLU (gate/up interleaved along N), RoPE on
+    # the QKV output (an interleaved cos/sin tile operand), a quantized D (mxfp8 + SFD, SM100) ---
+    from quack.cute_dsl_utils import get_device_capacity
+    from quack.epilogue.library import rope_epi
+    from quack.gemm import gemm as quack_gemm
+
+    F = torch.nn.functional
+    sm100 = get_device_capacity(device)[0] in (10, 11)
+    torch.manual_seed(4322)
+    b = (torch.randn(n, k, dtype=dtype, device=device) / 8).contiguous()
+    table = torch.randn(m_total, n, dtype=dtype, device=device)
+    postact = torch.empty(m_total, n // 2, dtype=dtype, device=device)
+    d = torch.empty(m_total, n, dtype=dtype, device=device)
+    if sm100:
+        d_q = torch.empty(m_total, n, dtype=torch.float8_e4m3fn, device=device)
+        sfd = torch.empty(
+            1, m_total // 128, n // 128, 32, 4, 4, dtype=torch.float8_e8m0fnu, device=device
+        )
+    swiglu = linear_act_mod("swiglu", gated=True, has_c=False, has_rowvec=False, has_colvec=False)
+    kw = dict(tile_M=128, tile_N=256, cluster_M=2, cluster_N=1, dist_op=AllGather())
+
+    def check(label, got, ref, base):
+        err = (got.float() - ref).abs().max().item()
+        tol = (base - ref).abs().max().item() + 1e-4
+        if err > 2 * tol:
+            failures.append(f"rank{rank} {label}: err={err} tol={tol}")
+
+    for it in range(3):
+        torch.manual_seed(78 * it + rank)
+        a_shard = (torch.randn(shard_m, k, dtype=dtype, device=device) / 8).contiguous()
+        a_full_ref = torch.empty(m_total, k, dtype=dtype, device=device)
+        dist.all_gather_into_tensor(a_full_ref, a_shard)
+        acc = a_full_ref.float() @ b.float().T
+        accq = acc.to(dtype).float()  # the baseline's one rounding
+        with runner.prepare(a_shard) as (a_full, ag_args):
+            swiglu.gemm(a_full, b, None, None, epi_args=dict(mAuxOut=postact), dist_op_args=ag_args, **kw)
+        torch.cuda.synchronize(device)
+        ref = F.silu(acc[:, 0::2]) * acc[:, 1::2]
+        check(f"AG+swiglu iter={it}", postact, ref, F.silu(accq[:, 0::2]) * accq[:, 1::2])
+        with runner.prepare(a_shard) as (a_full, ag_args):
+            rope_epi.gemm(a_full, b, d, None, epi_args=dict(table=table), dist_op_args=ag_args, **kw)
+        torch.cuda.synchronize(device)
+        cos, sin = table.float()[:, 0::2], table.float()[:, 1::2]
+
+        def rope(x):
+            x1, x2 = x[:, 0::2], x[:, 1::2]
+            return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1).reshape(m_total, n)
+
+        check(f"AG+rope iter={it}", d, rope(acc), rope(accq))
+        if sm100:
+            from quack.blockscaled.quantize import unpack_scale_blocked_to_2d
+
+            with runner.prepare(a_shard) as (a_full, ag_args):
+                # the 2-CTA tile is 256 rows: a 64-row CTA half would split SF vectors across threads
+                quack_gemm(
+                    a_full, b, d_q, None, None, 256, 256, 2, 1, dist_op=AllGather(), dist_op_args=ag_args, SFD=sfd
+                )
+            torch.cuda.synchronize(device)
+            scale = unpack_scale_blocked_to_2d(sfd, m_total, n // 32)[0].float()
+            scale = scale.repeat_interleave(32, -1)
+            err = (d_q.float() * scale - acc).abs()
+            # half the widest e4m3 bin (16 units of the scale) plus the baseline's rounding
+            bound = scale * 16 * 1.05 + (accq - acc).abs().max()
+            if not (err <= bound).all() or torch.isnan(scale).any():
+                failures.append(f"rank{rank} AG+mxfp8-D iter={it}: err={err.max().item()}")
 
     # --- Outer-capture smoke: the epoch is device-resident, so a caller may
     # capture any number of whole calls and replay.
