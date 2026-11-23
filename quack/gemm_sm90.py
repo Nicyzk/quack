@@ -681,6 +681,7 @@ class GemmSm90(GemmTmaBase):
         # SFD needs the varlen mode to shape its logical scale layout).
         self.varlen_m = varlen_m
         self.varlen_k = varlen_k
+        self.varlen_n = False  # cu_seqlens_n is SM100+ (gemm.py); operators read the flag on both arches
 
         self._setup_attributes(epilogue_args)
 

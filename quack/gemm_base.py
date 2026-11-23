@@ -85,6 +85,13 @@ class DistOpCtx:
         self.mC, self.mD = mC, mD
 
 
+def grouped_ragged_dim(sm: int) -> str:
+    """The grouped GEMM the MoE operators (dispatch, combine) run on, per arch: "n" (swap-AB, cu_seqlens_n)
+    on SM100+, whose runtime-N MMA sizes each block's MMA; "m" (cu_seqlens_m) on SM90, which has no runtime N
+    and where on our EP shapes neither full tiles nor compiled N variants beat grouped M (H100, 2026-11)."""
+    return "n" if sm >= 10 else "m"
+
+
 class DistOp:
     """A distributed operator fused into the GEMM (GemmSmXX(..., dist_op=DistOp subclass)). It owns the
     per-tile gate (wait_tile) and publish (signal_tile), its comm warps (num_warps, regs = (epilogue,
@@ -121,9 +128,11 @@ class DistOp:
         return None
 
     def make_scheduler_args(self, dist_op_args):
-        """Host: the tile order from the bundle, a tile_scheduler.ShardTileOrder (shard-major over M
-        from first_shard) or None for the default order; called on fake_args at compile."""
-        return None
+        """Host: the scheduler options the operator sets, as TileSchedulerOptions fields from its bundle:
+        shard_tile_order (a tile_scheduler.ShardTileOrder, AG's arrival order) or tile_count_semaphore
+        (the operator's tile counter: the dynamic scheduler over the resident grid, CLC off, the
+        semaphore zeroed per call by its runner). Called on fake_args at compile; {} = the caller's."""
+        return {}
 
     def epi_warp_shape_mnk(self, gemm):
         """runs_evt: the (m, n, k) warp arrangement the comm warps run the epi ops in (what the
@@ -992,7 +1001,7 @@ class GemmBase:
             (self.num_comm_warps > 0) == (self.dist_op.num_warps > 0)
         ), "comm_warp_ids: some of the operator's warps, up to dist_op.num_warps"
         assert static_schedule or not self.num_comm_warps, (
-            "comm warps mirror the static schedule; a dynamic scheduler steals per CTA"
+            "comm warps need the resident grid (static or the tile counter): no CLC"
         )
         self.comm_barrier = (
             pipeline.NamedBarrier(

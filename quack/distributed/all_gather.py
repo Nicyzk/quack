@@ -313,7 +313,8 @@ class AllGather(DistOp):
 
     def make_scheduler_args(self, dist_op_args):
         """Shard-major from this rank's shard: tiles are consumed in arrival order."""
-        return ShardTileOrder(Int32(dist_op_args.num_shards), Int32(dist_op_args.first_shard))
+        order = ShardTileOrder(Int32(dist_op_args.num_shards), Int32(dist_op_args.first_shard))
+        return {"shard_tile_order": order}
 
     @cute.jit
     def wait_tile(self, gemm, ctx, tile_coord_mnkl, gate: Int32) -> Int32:

@@ -21,7 +21,9 @@ import sys
 import pytest
 import torch
 
-from test_gemm_dispatch import E_LOCAL, H, I, T_LOCAL, TILE_N, TOPK, interleave_gate_up, routing  # noqa: F401
+from test_gemm_dispatch import BLOCK_ROWS, E_LOCAL, H, I, T_LOCAL, TOPK, interleave_gate_up, routing  # noqa: F401
+
+TILE_N = BLOCK_ROWS["n"]  # the swap-AB operators' block: the GEMM's tile N
 
 REL_TOL = 2.0**-6  # vs fp32 autograd, the forward benches' bound
 
@@ -152,7 +154,7 @@ def _run_rank():
     gemm(
         w1t,
         dh,
-        combine.d.T,
+        combine.D,
         None,
         None,
         256,
@@ -199,6 +201,10 @@ def _run_rank():
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 10,
+    reason="the chain runs on the swap-AB operators (cu_seqlens_n is SM100+)",
+)
 def test_moe_backward():
     cmd = [
         sys.executable,

@@ -1,10 +1,13 @@
-# MoE dispatch as the GEMM's distributed operator (gemm_base.DistOp) on the swap-AB grouped GEMM (tokens along N
-# in even-split blocks, the B rows packed per expert). DispatchPull: transfer warps per CTA run pull_rows over the
-# device walk (dispatch_walk.py), landing each pulled row in every reader expert's row of B and bumping
-# flags[expert, block]; wait_tile spins until flags[expert, block] reaches the block's row count before the tile's
-# loads. The GEMM reads B as a plain contiguous operand: no index, every GEMM feature composes. The scheduler is the
-# GEMM's plain expert-grouped order: nothing rides the scheduler args. make_dispatch_rows allocates B and builds the
-# walk (flags included); the GEMM's D is the caller's output.
+# MoE dispatch as the GEMM's distributed operator (gemm_base.DistOp) on a grouped GEMM whose token operand is packed
+# per expert along the ragged dim: swap-AB (varlen_n: tokens are the B rows in even-split N blocks) or varlen_m
+# (tokens are the A rows in fixed tile_M blocks). DispatchPull: transfer warps per CTA run pull_rows
+# over the device walk (dispatch_walk.py), landing each pulled row in every reader expert's row of the token operand
+# and bumping flags[expert, block]; wait_tile spins until flags[expert, block] reaches the block's row count before
+# the tile's loads. The GEMM reads the operand as a plain contiguous tensor: no index, every GEMM feature composes.
+# The scheduler is the
+# GEMM's expert-grouped order on the operator's tile counter (make_scheduler_args: the dynamic scheduler over the
+# resident grid, CLC off). DispatchRunner allocates the rows and builds the walk (flags and counter included); the
+# GEMM's D is the caller's output.
 #
 # pull_rows is MegaMoE's deterministic `token_in` transfer-warp loop, rows moved as bytes (any dtype; block-scaled
 # formats also scatter each row's scales): a row is pulled from its peer's x buffer into a per-warp smem stage with
@@ -23,10 +26,10 @@ from cutlass import Int32, Int64, const_expr
 from cutlass.cute.typing import AddressSpace
 from quack.blockscaled.operand import BlockScaledFormat
 from quack.compile_utils import make_fake_tensor
-from quack.cute_dsl_utils import mlir_namedtuple
+from quack.cute_dsl_utils import get_device_capacity, mlir_namedtuple
 from quack.distributed.dispatch_walk import WalkArguments, fake_walk_arguments, make_dispatch_walk
 from quack.distributed.ptx import cp_async_bulk_s2g, red_add_release_gpu_s32, tma_load_1d
-from quack.gemm_base import DistOp
+from quack.gemm_base import DistOp, grouped_ragged_dim
 from quack.varlen_utils import varlen_n_block_rows
 
 
@@ -161,8 +164,9 @@ class DispatchArguments(NamedTuple):
     """The transfer warps' bundle (the GEMM's dist_op_args)."""
 
     walk: WalkArguments  # make_dispatch_walk's walk.args
-    rows: cute.Tensor  # the GEMM's B (= mB) as bytes: every reader expert's row of each pulled token
-    flags: cute.Tensor  # (E_local, max N blocks) int32, +1 per landed row: published here, gated on by wait_tile
+    rows: cute.Tensor  # the token operand as bytes: every reader expert's row of each pulled token
+    flags: cute.Tensor  # (E_local, max blocks) int32, +1 per landed row: published here, gated on by wait_tile
+    sem: cute.Tensor  # (1,) int32 the GEMM's tile counter (make_scheduler_args), zeroed per call
     sf_pool: Optional[cute.Tensor] = None  # block-scaled: the SF atoms the pulled scales land in (the GEMM's SFB)
 
 
@@ -173,21 +177,25 @@ def _fake_flags():
 def fake_dispatch_arguments(sf=False):
     """DispatchArguments of fake tensors for cute.compile."""
     rows = make_fake_tensor(cutlass.Uint8, (cute.sym_int(), cute.sym_int()), leading_dim=1, divisibility=16)
+    sem = make_fake_tensor(Int32, (1,), leading_dim=0, divisibility=1)
     sf_pool = make_fake_tensor(cutlass.Uint8, (cute.sym_int(),), leading_dim=0, divisibility=16) if sf else None
-    return DispatchArguments(fake_walk_arguments(sf), rows, _fake_flags(), sf_pool)
+    return DispatchArguments(fake_walk_arguments(sf), rows, _fake_flags(), sem, sf_pool)
 
 
 class DispatchPull(DistOp):
     """The dispatch pull as the GEMM's comm warps, gated per tile on the landed row counts. pull_bytes = one row's
-    bytes; sf_words = 4-byte scale words per row for block-scaled rows (K / (4 sf_vec_size)), 0 = none. The GEMM is
-    the swap-AB grouped form: tokens are the B rows, packed per expert in even-split N blocks, weights fill M."""
+    bytes; sf_words = 4-byte scale words per row for block-scaled rows (K / (4 sf_vec_size)), 0 = none; ragged_dim =
+    the ragged dim the walk is built for, which the call must match: "n" = swap-AB, tokens are the B rows in
+    even-split N blocks (cu_seqlens_n); "m" = varlen_m, tokens are the A rows in fixed tile_M blocks (cu_seqlens_m)."""
 
     num_warps = 4
     regs = (232, 120, 40)  # 4 warp groups share 512: epilogue 232, the GEMM's others 120 each, the transfer loop 40
-    ragged_dim = "n"  # tokens along N (cu_seqlens_n), the only form with a 16-row block granule on SM100
     flag_batch = 1  # publish each row as it lands: ~6 rows per warp, batching only delays every block's readiness
 
-    def __init__(self, pull_bytes: int, sf_words: int = 0):
+    def __init__(self, pull_bytes: int, sf_words: int = 0, ragged_dim: str = "n"):
+        assert ragged_dim in ("m", "n")
+        assert sf_words == 0 or ragged_dim == "n", "block-scaled dispatch scatters scales per even-split block"
+        self.ragged_dim = ragged_dim
         self.pull_bytes = pull_bytes
         self.pull_chunk = pull_chunk_bytes(pull_bytes, cutlass.Uint8)  # a chunk of the row per stage
         self.sf_words = sf_words
@@ -195,12 +203,24 @@ class DispatchPull(DistOp):
     def fake_args(self, d_dtype):
         return fake_dispatch_arguments(sf=self.sf_words > 0)
 
+    def make_scheduler_args(self, dist_op_args):
+        """The tile counter: CLC's arrival order over the resident grid, which CLC's oversized grid would cancel
+        the transfer warps of (static loses the arrival order's L2 reuse: results/2026-10-05/ablations.md)."""
+        return {"tile_count_semaphore": dist_op_args.sem}
+
     @cute.jit
     def wait_tile(self, gemm, ctx, tile_coord_mnkl, gate: Int32) -> Int32:
-        """Before a tile's gathered loads: spin until its even-split N block has all its rows (flags[expert, block])."""
-        cid, batch = tile_coord_mnkl[1], tile_coord_mnkl[3]
+        """Before a tile's gathered loads: spin until its block has all its rows (flags[expert, block])."""
+        batch = tile_coord_mnkl[3]
         cu = ctx.sched_params.cu_seqlens_m  # the ragged dim's cu_seqlens
-        block_rows = varlen_n_block_rows(cu[batch + 1] - cu[batch], gemm.cta_tile_shape_mnk[1], gemm.varlen_n_granule)
+        if const_expr(gemm.varlen_n):  # even-split N blocks
+            cid = tile_coord_mnkl[1]
+            block_rows = varlen_n_block_rows(
+                cu[batch + 1] - cu[batch], gemm.cta_tile_shape_mnk[1], gemm.varlen_n_granule
+            )
+        else:  # fixed tile_M blocks
+            cid = tile_coord_mnkl[0]
+            block_rows = Int32(gemm.cta_tile_shape_mnk[0])
         num_rows = cutlass.min(cu[batch + 1] - cu[batch] - cid * block_rows, block_rows)
         flags = ctx.args.flags
         ptr = flags.iterator + cute.crd2idx((batch, cid), flags.layout)
@@ -271,34 +291,42 @@ def sf_words_of(a_format, x):
 class DispatchRunner:
     """GEMM1 + dispatch pull. x = this rank's (T_local, K) token rows (one dtype or a block-scaled format's
     qdata) in symmetric memory, x_hdl its rendezvous handle: every rank's rows are read through it, and the
-    runner keeps it so the mapping outlives the pulls; tile_n = the GEMM's tile N (its even-split blocks are
-    the gated unit); x_sf + x_sf_hdl + sf_pool: the block-scaled scale lane (the (T_local, K / sf_vec_size)
-    1-byte scale rows, sf_pool = the GEMM's per-block SF atoms). `op` = DispatchPull(row bytes, scale words).
-    prepare(topk_idx_g, s_scatter, s_reverse, cu_seqlens) runs the device walk for a call's routing
-    (topk_idx_g (W, T_local, K) int32, the rest int32 as make_dispatch_walk) and returns (rows, args): the
-    GEMM's B the pull fills (rows packed per expert, (max rows, K); pass with cu_seqlens_n = cu_seqlens) and
-    the dist_op_args. The caller orders every rank's rows before the first pull (a barrier)."""
+    runner keeps it so the mapping outlives the pulls; block_rows = the GEMM's tile along the ragged dim, the
+    gated unit (tile N under "n", the per-CTA tile_M under "m"); x_sf + x_sf_hdl + sf_pool: the block-scaled
+    scale lane (the (T_local, K / sf_vec_size) 1-byte scale rows, sf_pool = the GEMM's per-block SF atoms);
+    ragged_dim = the GEMM call's ragged dim, None = this arch's default (gemm_base.grouped_ragged_dim).
+    `op` = DispatchPull(row bytes, scale words, ragged_dim). prepare(topk_idx_g, s_scatter, s_reverse,
+    cu_seqlens) runs the device walk for a call's routing (topk_idx_g (W, T_local, K) int32, the rest int32 as
+    make_dispatch_walk) and returns (rows, args): the token operand the pull fills (rows packed per expert,
+    (max rows, K); the GEMM's B with cu_seqlens_n = cu_seqlens under "n", its A with cu_seqlens_m under "m")
+    and the dist_op_args. The caller orders every rank's rows before the first pull (a barrier)."""
 
-    def __init__(self, x, x_hdl, tile_n, x_sf=None, x_sf_hdl=None, sf_pool=None):
+    def __init__(self, x, x_hdl, block_rows, x_sf=None, x_sf_hdl=None, sf_pool=None, ragged_dim=None):
         self.rank, world = x_hdl.rank, x_hdl.world_size
         peers = lambda t, hdl: [  # every rank's rows, typed as t (the handle hands out byte views)
             hdl.get_buffer(q, (t.shape[0], t.shape[1] * t.element_size()), torch.uint8).view(t.dtype)
             for q in range(world)
         ]
-        self.x, self.tile_n = x, tile_n
+        if ragged_dim is None:
+            ragged_dim = grouped_ragged_dim(get_device_capacity(x.device)[0])
+        self.x, self.block_rows = x, block_rows
         self.peers = peers(x, x_hdl)
         self.sf_peers = None if x_sf is None else peers(x_sf, x_sf_hdl)
         self.handles = (x_hdl, x_sf_hdl)  # pins the symmetric mappings as long as the runner lives
         self.sf_bytes = None if sf_pool is None else sf_pool.view(torch.uint8).view(-1)  # the pull addresses bytes
         sf_words = 0 if x_sf is None else x_sf.shape[1] * x_sf.element_size() // 4
-        self.op = DispatchPull(x.shape[1] * x.element_size(), sf_words)
+        self.op = DispatchPull(x.shape[1] * x.element_size(), sf_words, ragged_dim)
+        self.sem = torch.zeros(1, dtype=torch.int32, device=x.device)  # the GEMM's tile counter
 
     def prepare(self, topk_idx_g, s_scatter, s_reverse, cu_seqlens):
         build, self.walk = make_dispatch_walk(
-            topk_idx_g, s_scatter, s_reverse, self.rank, cu_seqlens, self.peers, self.tile_n,
-            x_sf_peer_bufs=self.sf_peers,
+            topk_idx_g, s_scatter, s_reverse, self.rank, cu_seqlens, self.peers, self.block_rows,
+            x_sf_peer_bufs=self.sf_peers, even_split=self.op.ragged_dim == "n",
         )
         rows = torch.empty(s_scatter.numel(), self.x.shape[1], dtype=self.x.dtype, device=self.x.device)
         build()
         self.walk.flags.zero_()
-        return rows, DispatchArguments(self.walk.args, rows.view(torch.uint8), self.walk.flags, self.sf_bytes)
+        self.sem.zero_()
+        return rows, DispatchArguments(
+            self.walk.args, rows.view(torch.uint8), self.walk.flags, self.sem, self.sf_bytes
+        )

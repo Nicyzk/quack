@@ -1,11 +1,13 @@
 # Copyright (C) 2026, Tri Dao.
 """Dispatch + fc1 through mod.gemm on two ranks: every rank's tokens live in a symmetric buffer, the GEMM's transfer
-warps pull the rows this rank's experts read into every reader expert's row of B (DispatchPull, the swap-AB
-grouped GEMM: tokens are B rows packed per expert in even-split N blocks), the tiles gate on the landed counts, and
-the gated SwiGLU postact matches a torch reference over the routed tokens. Block-scaled formats pull each token's
-scale row into the GEMM's per-block SFB atoms alongside (the scale lane).
+warps pull the rows this rank's experts read into every reader expert's row of the token operand (DispatchPull),
+the tiles gate on the landed counts, and the gated SwiGLU postact matches a torch reference over the routed tokens.
+Tokens on either ragged dim: "n" = swap-AB (B rows packed per expert in even-split N blocks, the M-paired gated
+store; SM100+, where the runtime-N MMA sizes each block), "m" = varlen_m (A rows in fixed tile_M blocks, the
+N-paired store). Block-scaled formats ("n") pull each token's scale row into the GEMM's per-block SFB atoms
+alongside (the scale lane).
 
-    torchrun --nproc_per_node=2 tests/test_gemm_dispatch.py mxfp8
+    torchrun --nproc_per_node=2 tests/test_gemm_dispatch.py mxfp8 n
     pytest tests/test_gemm_dispatch.py -x
 """
 
@@ -18,23 +20,31 @@ import torch
 
 H, I = 1024, 512
 E_LOCAL, TOPK, T_LOCAL = 4, 2, 512
-TILE_N = 256
+BLOCK_ROWS = {
+    "n": 256,
+    "m": 128,
+}  # the GEMM's tile along the ragged dim: tile_N (swap-AB), tile_M (varlen_m)
 FORMATS = {"bf16": None, "mxfp8": "mxfp8_e4m3", "nvfp4": "nvfp4"}  # BlockScaledFormat names
+# (format, ragged dim): block-scaled rows are swap-AB only (the scale lane fills per-block SF atoms)
+CASES = [("bf16", "m"), ("bf16", "n"), ("mxfp8", "n"), ("nvfp4", "n")]
 
 
-def interleave_gate_up(w):
-    """(E, 2I, X) [gate; up] -> rows interleaved per 8 (the M-paired gated store's layout)."""
+def interleave_gate_up(w, ragged_dim):
+    """(E, 2I, X) [gate; up] -> gate / up rows interleaved per 8 (ragged dim "n": the M-paired gated store) or
+    per row ("m": the N-paired store, row 2j = gate j)."""
     E, I2, X = w.shape
     g, u = w.chunk(2, dim=1)
-    return torch.stack([g.view(E, I2 // 16, 8, X), u.view(E, I2 // 16, 8, X)], dim=2).reshape(
-        E, I2, X
-    )
+    r = 8 if ragged_dim == "n" else 1
+    return torch.stack(
+        [g.view(E, I2 // (2 * r), r, X), u.view(E, I2 // (2 * r), r, X)], dim=2
+    ).reshape(E, I2, X)
 
 
-def split_gate_up(w_il):
+def split_gate_up(w_il, ragged_dim):
     """Inverse of interleave_gate_up: (E, 2I, X) interleaved -> (gate (E, I, X), up (E, I, X))."""
     E, I2, X = w_il.shape
-    gu = w_il.view(E, I2 // 16, 2, 8, X)
+    r = 8 if ragged_dim == "n" else 1
+    gu = w_il.view(E, I2 // (2 * r), 2, r, X)
     return gu[:, :, 0].reshape(E, I2 // 2, X), gu[:, :, 1].reshape(E, I2 // 2, X)
 
 
@@ -54,7 +64,7 @@ def routing(topk_g, rank):
     return i32(cu), i32(s_scatter), i32(s_reverse)
 
 
-def _run_rank(fmt):
+def _run_rank(fmt, ragged_dim):
     import torch.distributed as dist
     import torch.distributed._symmetric_memory as symm_mem
     import torch.nn.functional as F
@@ -69,6 +79,7 @@ def _run_rank(fmt):
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     device = torch.device("cuda", rank % torch.cuda.device_count())
     torch.cuda.set_device(device)
+    block = BLOCK_ROWS[ragged_dim]
     dist.init_process_group("nccl")
     group = dist.group.WORLD
 
@@ -81,7 +92,7 @@ def _run_rank(fmt):
         .to(torch.int32)
     )
     w_il = interleave_gate_up(
-        torch.randn(E_LOCAL, 2 * I, H, device=device, dtype=torch.bfloat16) * 0.05
+        torch.randn(E_LOCAL, 2 * I, H, device=device, dtype=torch.bfloat16) * 0.05, ragged_dim
     )
     torch.manual_seed(100 + rank)
     x = torch.randn(T_LOCAL, H, device=device, dtype=torch.bfloat16)
@@ -110,10 +121,10 @@ def _run_rank(fmt):
         x_sf = unpack_scale_blocked_to_2d(xop.scale[None], world * T_LOCAL, H // vec)[
             0
         ]  # 1-byte scale rows
-        ncols = -(-world * T_LOCAL // TILE_N)  # the walk's flag columns bound the block slots
+        ncols = -(-world * T_LOCAL // block)  # the walk's flag columns bound the block slots
         sf_pool = torch.zeros(
             1,
-            E_LOCAL * ncols * varlen_n_block_atoms(TILE_N),
+            E_LOCAL * ncols * varlen_n_block_atoms(block),
             H // (4 * vec),
             32,
             4,
@@ -135,9 +146,11 @@ def _run_rank(fmt):
     sf_loc, sf_hdl = (None, None) if x_sf is None else symm_rows(x_sf)
     cu, s_scatter, s_reverse = routing(topk_g, rank)
     total = int(cu[-1])
-    dispatch = DispatchRunner(x_loc, x_hdl, TILE_N, sf_loc, sf_hdl, sf_pool)
+    dispatch = DispatchRunner(x_loc, x_hdl, block, sf_loc, sf_hdl, sf_pool, ragged_dim=ragged_dim)
     postact = torch.zeros(total, I, device=device, dtype=torch.bfloat16)
-    epi_args["mAuxOut"] = postact.T
+    epi_args["mAuxOut"] = (
+        postact.T if ragged_dim == "n" else postact
+    )  # the M-paired store writes m-major
     mod = linear_act_mod(
         "swiglu",
         gated=True,
@@ -148,28 +161,40 @@ def _run_rank(fmt):
     )
     dist.barrier()  # every rank's rows are written before any pull reads them
     rows, args = dispatch.prepare(topk_g, s_scatter, s_reverse, cu)
-    mod.gemm(
-        w_q,
-        rows,
-        None,
-        None,
-        epi_args=epi_args,
-        tile_M=256,
-        tile_N=TILE_N,
-        cluster_M=2,
-        cluster_N=1,
-        cu_seqlens_n=cu,
-        dist_op=dispatch.op,
-        dist_op_args=args,
-        **sf_kw,
-    )
+    kw = dict(epi_args=epi_args, dist_op=dispatch.op, dist_op_args=args, **sf_kw)
+    if ragged_dim == "n":  # swap-AB: weights on M, the token rows on N
+        mod.gemm(
+            w_q,
+            rows,
+            None,
+            None,
+            tile_M=256,
+            tile_N=block,
+            cluster_M=2,
+            cluster_N=1,
+            cu_seqlens_n=cu,
+            **kw,
+        )
+    else:  # varlen_m: the token rows on M
+        mod.gemm(
+            rows,
+            w_q,
+            None,
+            None,
+            tile_M=block,
+            tile_N=256,
+            cluster_M=1,
+            cluster_N=1,
+            cu_seqlens_m=cu,
+            **kw,
+        )
     torch.cuda.synchronize(device)
 
     failures = []
     x_rows = x_dq[
         (s_scatter.long() // TOPK)[:total]
-    ]  # the GEMM's B rows: each slot's token, in row order
-    gate, up = split_gate_up(w_dq)
+    ]  # the GEMM's token rows: each slot's token, in row order
+    gate, up = split_gate_up(w_dq, ragged_dim)
     for e in range(E_LOCAL):
         xe = x_rows[int(cu[e]) : int(cu[e + 1])]
         ref = F.silu(xe @ gate[e].T) * (xe @ up[e].T)
@@ -185,8 +210,12 @@ def _run_rank(fmt):
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs two GPUs")
-@pytest.mark.parametrize("fmt", list(FORMATS))
-def test_gemm_dispatch(fmt):
+@pytest.mark.parametrize("fmt, ragged_dim", CASES)
+def test_gemm_dispatch(fmt, ragged_dim):
+    from quack.cute_dsl_utils import get_device_capacity
+
+    if ragged_dim == "n" and get_device_capacity(torch.device("cuda"))[0] < 10:
+        pytest.skip("cu_seqlens_n is SM100+ (gemm.py)")
     cmd = [
         sys.executable,
         "-m",
@@ -195,9 +224,12 @@ def test_gemm_dispatch(fmt):
         "--standalone",
         __file__,
         fmt,
+        ragged_dim,
     ]
     subprocess.run(cmd, check=True, timeout=600)
 
 
 if __name__ == "__main__":
-    _run_rank(sys.argv[1] if len(sys.argv) > 1 else "bf16")
+    _run_rank(
+        sys.argv[1] if len(sys.argv) > 1 else "bf16", sys.argv[2] if len(sys.argv) > 2 else "n"
+    )

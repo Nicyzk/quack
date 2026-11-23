@@ -236,9 +236,7 @@ def _compile_gemm_epi(
         False,
         l,
         raster_order=raster_order,
-        shard_tile_order=(
-            dist_op.make_scheduler_args(dist_op.fake_args(d_dtype)) if dist_op is not None else None
-        ),
+        **(dist_op.make_scheduler_args(dist_op.fake_args(d_dtype)) if dist_op is not None else {}),
     )
     varlen_args = make_fake_varlen_args(
         varlen_m,
@@ -315,7 +313,7 @@ class GemmEpiPlan(NamedTuple):
     epi_arg_keys: tuple  # ((op_name, key), ...) as compiled
     tile_M: int  # scheduler-cluster geometry, for launch-time AG validation
     cluster_M: int  # (see validate_ag_geometry in plan_scheduler_args)
-    dist_op: object  # the operator: its make_scheduler_args(dist_op_args) is the per-call tile order
+    dist_op: object  # the operator: make_scheduler_args(dist_op_args) = its per-call scheduler options
     # Launch-overhead precomputation (host hot path): (name, converter, key)
     # triples — converter is the op's bound ``host_call_arg``, or None when the
     # op inherits the identity default (the value passes straight through) —

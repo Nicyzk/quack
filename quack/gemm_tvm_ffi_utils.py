@@ -348,14 +348,18 @@ def make_fake_scheduler_args(
     has_batch_idx_permute,
     l_sym,
     raster_order=RasterOrderOption.Heuristic,  # constexpr: baked here, the launch value is ignored
-    shard_tile_order=None,  # the operator's make_scheduler_args on its fake bundle, or None
+    # the operator's make_scheduler_args on its fake bundle: its tile order, or its tile counter (a fake tensor)
+    shard_tile_order=None,
+    tile_count_semaphore=None,
 ):
     return TileSchedulerOptions(
         max_active_clusters=Int32(1),
         raster_order=RasterOrderOption(raster_order),
         max_swizzle_size=Int32(8),
         tile_count_semaphore=(
-            make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=4) if has_semaphore else None
+            make_ptr(Int32, 0, cute.AddressSpace.gmem, assumed_align=4)
+            if has_semaphore or tile_count_semaphore is not None
+            else None
         ),
         shard_tile_order=shard_tile_order,
         batch_idx_permute=(
@@ -552,20 +556,18 @@ def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None, dist
     callers with one pass A (the kernel-A tensor) so the shard geometry is validated against
     the plan's tile config on every launch — frontends can't forget it by construction.
     """
-    shard_tile_order = (
-        plan.dist_op.make_scheduler_args(dist_op_args) if plan.dist_op is not None else None
-    )
-    if shard_tile_order is not None:
+    op_sched = plan.dist_op.make_scheduler_args(dist_op_args) if plan.dist_op is not None else {}
+    if "shard_tile_order" in op_sched:
         assert A is not None, "plan_scheduler_args: a shard tile order requires A for geometry validation"
         validate_ag_geometry(A, dist_op_args, plan.tile_M, plan.cluster_M)
-    elif plan.scheduler_static is not None:
+    if not op_sched and plan.scheduler_static is not None:
         return plan.scheduler_static
     return make_scheduler_args(
         plan.max_active_clusters,
         plan.max_swizzle_size,
-        tile_count_semaphore if plan.scheduler_uses_semaphore else None,
+        op_sched.pop("tile_count_semaphore", tile_count_semaphore if plan.scheduler_uses_semaphore else None),
         batch_idx_permute,
-        shard_tile_order=shard_tile_order,
+        **op_sched,
     )
 
 
@@ -870,6 +872,8 @@ def compile_gemm_kernel(
     # every kernel declares a trailing dist_op_args (defaults are baked into the arity): its fakes, or None
     d_dtype = mD.element_type if mD is not None else None  # sink-only epilogues have no D
     dist_op_args = (dist_op.fake_args(d_dtype) if dist_op is not None else None,)
+    if dist_op is not None and "tile_count_semaphore" in dist_op.make_scheduler_args(dist_op_args[0]):
+        assert not is_dynamic_persistent, "the operator runs its tile counter: leave is_dynamic_persistent False"
     return cute.compile(
         gemm_obj,
         mA,

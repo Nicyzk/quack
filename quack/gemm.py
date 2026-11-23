@@ -194,9 +194,7 @@ def _compile_gemm(
         has_batch_idx_permute,
         l,
         raster_order=raster_order,
-        shard_tile_order=(
-            dist_op.make_scheduler_args(dist_op.fake_args(d_dtype)) if dist_op is not None else None
-        ),
+        **(dist_op.make_scheduler_args(dist_op.fake_args(d_dtype)) if dist_op is not None else {}),
     )
     aidx_len = m if varlen_m else (k if varlen_k else None)
     varlen_args = make_fake_varlen_args(
@@ -281,7 +279,7 @@ class _GemmPlan(NamedTuple):
     tile_N: int
     cluster_M: int
     cluster_N: int
-    dist_op: object  # the operator: its make_scheduler_args(dist_op_args) is the per-call tile order
+    dist_op: object  # the operator: make_scheduler_args(dist_op_args) = its per-call scheduler options
     # varlen_n blockscaled: tile_n for the per-call cu_tiles_n prefix (None = not needed)
     cu_tiles_tile_n: Optional[int] = None
 
@@ -806,6 +804,9 @@ def _build_gemm_plan(
     if dist_op is not None:
         # SM8x has no specialized load warp (cp.async kernel) for the operator's hooks
         assert device_capacity[0] >= 9, "dist_op requires SM90+"
+    if varlen_n:  # swap-AB grouping exists for the runtime-N MMA; wgmma has none, and on our EP
+        # shapes neither full tiles nor compiled N variants beat cu_seqlens_m (H100, 2026-11)
+        assert device_capacity[0] >= 10, "cu_seqlens_n is SM100+; use cu_seqlens_m on SM90"
     sf_dtype, sf_vec_size = None, None
     a_mma_dtype, b_mma_dtype = None, None
     if blockscaled:
