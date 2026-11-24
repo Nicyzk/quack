@@ -84,7 +84,7 @@ def _run_rank():
         return a_q_full_u8.view(a_dtypes[fmt]), sfa_full
 
     def gated(runner, fmt_a, fmt_b, shard_op, b_q, sfb, d):
-        with runner.gather(shard_op) as (a_op, ag_args):
+        with runner.prepare(shard_op) as (a_op, ag_args):
             quack_gemm(
                 a_op.qdata,
                 b_q,
@@ -160,6 +160,54 @@ def _run_rank():
                 if not torch.equal(d, d_ref):
                     failures.append(f"{label}: gated D != dense D (bitwise)")
 
+    # --- nvfp4 with block scales only (16-element vectors, e4m3 scales: a different scale lane from the
+    # 32-vector e8m0 formats above). A per-tensor scale is per-rank state the runner refuses; without one the
+    # quantization is row-local, so quantizing the NCCL-gathered A is the gathered operand, bitwise.
+    fmt = "nvfp4"
+    runner = BlockScaledAllGatherRunner(shard_m, k, fmt, device=device)
+    torch.manual_seed(1234)
+    b_hp = (torch.randn(n, k, dtype=torch.bfloat16, device=device) / 8).contiguous()
+    b_op = BlockScaledOperand.quantize(b_hp, fmt)
+    sfb = b_op.scale[
+        None
+    ]  # this file's single-batch 6-D scale form (the gathered SFA's); SFA and SFB share it
+    for it in range(3):
+        torch.manual_seed(1000 * it + 77 + rank)
+        a_hp = (torch.randn(shard_m, k, dtype=torch.bfloat16, device=device) / 8).contiguous()
+        a_hp_full = torch.empty(m_total, k, dtype=torch.bfloat16, device=device)
+        dist.all_gather_into_tensor(a_hp_full, a_hp)
+        full_op = BlockScaledOperand.quantize(a_hp_full, fmt)
+        d_ref = torch.empty(m_total, n, dtype=torch.bfloat16, device=device)
+        quack_gemm(
+            full_op.qdata,
+            b_op.qdata,
+            d_ref,
+            None,
+            None,
+            tm,
+            tn,
+            cm,
+            cn,
+            SFA=full_op.scale[None],
+            SFB=sfb,
+            bs_format_a=fmt,
+            bs_format_b=fmt,
+        )
+        d = torch.empty_like(d_ref)
+        a_op = gated(runner, fmt, fmt, BlockScaledOperand.quantize(a_hp, fmt), b_op.qdata, sfb, d)
+        torch.cuda.synchronize(device)
+        dist.barrier()  # peers' pushes into MY buffers must have landed
+        torch.cuda.synchronize(device)
+        label = f"rank{rank} {fmt} x {fmt} iter={it}"
+        if not torch.equal(a_op.qdata.view(torch.uint8), full_op.qdata.view(torch.uint8)):
+            failures.append(f"{label}: gathered qdata bytes != the gathered A quantized")
+        if not torch.equal(
+            a_op.scale.view(torch.uint8).view(-1), full_op.scale.view(torch.uint8).view(-1)
+        ):
+            failures.append(f"{label}: gathered SFA bytes != the gathered A quantized")
+        if not torch.equal(d, d_ref):
+            failures.append(f"{label}: gated D != dense D (bitwise)")
+
     # --- Late sends: hold the transport stream back so SFA+qdata arrival is
     # provably late and the in-kernel gate must wait for both payloads.
     fmt = "mxfp8_e4m3"
@@ -199,7 +247,7 @@ def _run_rank():
     # --- Plain-tensor shard: type-symmetric fall-through to the parent's
     # byte-only gather (SFA supplied statically here).
     d = torch.empty_like(d_ref)
-    with ag.gather(a_q.view(torch.uint8).contiguous()) as (a_full_u8, ag_args):
+    with ag.prepare(a_q.view(torch.uint8).contiguous()) as (a_full_u8, ag_args):
         quack_gemm(
             a_full_u8.view(a_dtypes[fmt]),
             b_q,

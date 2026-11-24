@@ -465,7 +465,16 @@ class AllReduceRunner:
         self.d, d_mc, _ = _symm((m, _d_cols(n, torch_dtype)), torch_dtype)
         self.op = AllReduce(rank, world)
         self.args = AllReduceArguments(partials, partials_mc, d_mc, flags, flags_mc, *rest)
+        self._handles = []
         torch.cuda.synchronize()
 
     def prepare(self):
         return self.args
+
+    def reduce_output(self, shape, torch_dtype):
+        """A reduce output (an epilogue reduce op's slots) replicated into every rank: (local, view) where
+        `view` is the multicast view the GEMM writes (pass it as the epi arg; AllReduce.store_sink lands
+        each slot on every rank) and `local` this rank's copy to read after the launch. Zeroed."""
+        local, mc, hdl = _symm(shape, torch_dtype, zero=True)
+        self._handles.append(hdl)  # pins the symmetric mapping as long as the runner lives
+        return local, mc

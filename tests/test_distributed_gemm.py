@@ -207,6 +207,69 @@ def _run_rank():
             if not (err <= bound).all() or torch.isnan(scale).any():
                 failures.append(f"rank{rank} AG+mxfp8-D iter={it}: err={err.max().item()}")
 
+    # --- The TP block's remaining forward and backward epilogues on the gathered operand: the deferred-rstd
+    # gate/up (per-row scale r, paired bias, SwiGLU; D = the affine preact), the dSwiGLU dgrad (acc = dout,
+    # C = the saved packed preact, D = packed (dx, dy)), and the RMSNorm-backward partial around a dgrad
+    # (a tile load y, the colvec rstd, the rowvec w, D = rstd * acc * w and the per-tile correction dots) ---
+    from quack.epilogue.library import dswiglu_mod, norm_swiglu_mod, rms_bwd_partial_epi
+
+    n = 1024  # != m_total: an unpinned (l, dim) vector is told apart from the other dim by its length
+    torch.manual_seed(4323)
+    b = (torch.randn(n, k, dtype=dtype, device=device) / 8).contiguous()
+    r = torch.rand(1, m_total, dtype=torch.float32, device=device) + 0.5  # dense calls pass vectors (l, dim)
+    bias = torch.randn(1, n, dtype=torch.float32, device=device)
+    w = torch.randn(1, n, dtype=torch.float32, device=device)
+    y_saved = torch.randn(m_total, n, dtype=dtype, device=device)
+    preact = torch.randn(m_total, 2 * n, dtype=dtype, device=device)  # packed (x, y) pairs
+    postact = torch.empty(m_total, n // 2, dtype=dtype, device=device)
+    d_pre = torch.empty(m_total, n, dtype=dtype, device=device)
+    post_bwd = torch.empty(m_total, n, dtype=dtype, device=device)  # dSwiGLU's recomputed postact, GEMM-N wide
+    d_bwd = torch.empty(m_total, 2 * n, dtype=dtype, device=device)
+    d_rms = torch.empty(m_total, n, dtype=dtype, device=device)
+    dots = torch.zeros(m_total, n // 256, dtype=torch.float32, device=device)
+    for it in range(2):
+        torch.manual_seed(79 * it + rank)
+        a_shard = (torch.randn(shard_m, k, dtype=dtype, device=device) / 8).contiguous()
+        a_full_ref = torch.empty(m_total, k, dtype=dtype, device=device)
+        dist.all_gather_into_tensor(a_full_ref, a_shard)
+        acc = a_full_ref.float() @ b.float().T
+        accq = acc.to(dtype).float()
+        # r-scale + paired bias + SwiGLU (CODA's gate/up kernel with the rstd deferred into this GEMM)
+        with runner.prepare(a_shard) as (a_full, ag_args):
+            norm_swiglu_mod.gemm(
+                a_full, b, d_pre, None, epi_args=dict(rstd=r, bias=bias, postact=postact), dist_op_args=ag_args, **kw
+            )
+        torch.cuda.synchronize(device)
+        v, vq = acc * r.T + bias, accq * r.T + bias
+        check(f"AG+rscale+swiglu D iter={it}", d_pre, v, vq)
+        check(f"AG+rscale+swiglu iter={it}", postact, F.silu(v[:, 0::2]) * v[:, 1::2], F.silu(vq[:, 0::2]) * vq[:, 1::2])
+        # dSwiGLU: the dgrad GEMM's output is dout per pair; C = the saved packed preact
+        with runner.prepare(a_shard) as (a_full, ag_args):
+            dswiglu_mod.gemm(a_full, b, d_bwd, preact, epi_args=dict(postact=post_bwd), dist_op_args=ag_args, **kw)
+        torch.cuda.synchronize(device)
+        x, yy = preact.float()[:, 0::2], preact.float()[:, 1::2]
+        sig = torch.sigmoid(x)
+
+        def dswiglu_ref(dout):
+            dx, dy = dout * yy * sig * (1 + x * (1 - sig)), dout * x * sig
+            return torch.stack([dx, dy], -1).reshape(m_total, 2 * n), x * sig * yy
+
+        d_ref, out_ref = dswiglu_ref(acc)
+        d_base, _ = dswiglu_ref(accq)
+        check(f"AG+dswiglu D iter={it}", d_bwd, d_ref, d_base)
+        check(f"AG+dswiglu postact iter={it}", post_bwd, out_ref, out_ref.to(dtype).float())
+        # RMSNorm backward partial: D = rstd * (acc * w), dots = per-tile sum over N of (acc * w) * (y * rstd)
+        with runner.prepare(a_shard) as (a_full, ag_args):
+            rms_bwd_partial_epi.gemm(
+                a_full, b, d_rms, None, epi_args=dict(y=y_saved, rstd=r, w=w, dots=dots), dist_op_args=ag_args, **kw
+            )
+        torch.cuda.synchronize(device)
+        t, tq = acc * w, accq * w
+        xhat = y_saved.float() * r.T
+        check(f"AG+rms_bwd D iter={it}", d_rms, t * r.T, tq * r.T)
+        tile_dots = lambda tt: (tt * xhat).view(m_total, n // 256, 256).sum(-1)
+        check(f"AG+rms_bwd dots iter={it}", dots, tile_dots(t), tile_dots(tq))
+
     # --- Outer-capture smoke: the epoch is device-resident, so a caller may
     # capture any number of whole calls and replay.
     dtype, shard_m, n, k = torch.bfloat16, 1024, 1024, 4096

@@ -523,8 +523,9 @@ class EpiMod:
         # D += delta with no C load) vs "store". A plain bool on the class is
         # trace-time constexpr and invisible to the FFI field walk.
         Args.add_to_output = add_to_output
+        # pair_dim names the class even unpaired: under swap-AB (m) an fp4 aux packs along M (TileStore)
         cls_name = (
-            f"GemmMod_{self._ident}_{('g' + pair_dim if paired_acc else '')}{'p' if packed_c else ''}_"
+            f"GemmMod_{self._ident}_{'g' if paired_acc else ''}{pair_dim}{'p' if packed_c else ''}_"
             f"{'_'.join(k for _, k in kind_sig) or 'none'}"
             f"{''.join(f'_{n}{f}' for n, f in arg_forms)}_sm{sm}"
             # rounding / add_to_output are call-time knobs on an otherwise

@@ -1044,8 +1044,8 @@ class BlockScaledAllGatherRunner(AllGatherRunner):
         return u8
 
     @contextmanager
-    def gather(self, shard):
-        """Overlapped all-gather around any GEMM(s): ``gather(X)`` yields
+    def prepare(self, shard):
+        """Overlapped all-gather around any GEMM(s): ``prepare(X)`` yields
         ``(X_gathered, ag_args)``.
 
         - ``torch.Tensor`` X: the parent's byte-only gather, verbatim.
@@ -1058,7 +1058,7 @@ class BlockScaledAllGatherRunner(AllGatherRunner):
         on this runner; regather in backward (see the parent's docstring).
         """
         if isinstance(shard, torch.Tensor):
-            with super().gather(shard) as result:
+            with super().prepare(shard) as result:
                 yield result
             return
         assert isinstance(shard, BlockScaledOperand), (
@@ -1081,7 +1081,7 @@ class BlockScaledAllGatherRunner(AllGatherRunner):
             f"got {tuple(shard.qdata.shape)}"
         )
         sfa_src = self._sfa_shard_src(shard)
-        with super().gather(shard.qdata.view(torch.uint8)) as (a_full_u8, ag_args):
+        with super().prepare(shard.qdata.view(torch.uint8)) as (a_full_u8, ag_args):
             parity = self._current_parity()
             sfa_buf = self.sfa_bufs[parity]
             gathered = BlockScaledOperand(

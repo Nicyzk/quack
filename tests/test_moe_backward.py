@@ -21,9 +21,21 @@ import sys
 import pytest
 import torch
 
-from test_gemm_dispatch import BLOCK_ROWS, E_LOCAL, H, I, T_LOCAL, TOPK, interleave_gate_up, routing  # noqa: F401
 
-TILE_N = BLOCK_ROWS["n"]  # the swap-AB operators' block: the GEMM's tile N
+def routing(topk_g, rank, e_local):
+    """Rank `rank`'s tables from the gathered top-k (W, T_local, K) of global expert ids: cu (E_local + 1),
+    s_scatter (row -> global slot), s_reverse (slot -> row). A row's token is its slot // K."""
+    f = topk_g.reshape(-1)
+    mine = (f // e_local == rank).nonzero().squeeze(1)
+    e = f[mine] - rank * e_local
+    s_scatter = mine[torch.argsort(e, stable=True)]
+    counts = torch.bincount(e, minlength=e_local)
+    cu = torch.cat([torch.zeros(1, dtype=torch.int64, device=f.device), counts.cumsum(0)])
+    s_reverse = torch.zeros(f.numel(), dtype=torch.int64, device=f.device)
+    s_reverse[s_scatter] = torch.arange(s_scatter.numel(), device=f.device)
+    i32 = lambda t: t.to(torch.int32)
+    return i32(cu), i32(s_scatter), i32(s_reverse)
+
 
 REL_TOL = 2.0**-6  # vs fp32 autograd, the forward benches' bound
 
@@ -41,14 +53,14 @@ def pairwise(w):
     return torch.stack([g, u], dim=2).reshape(E, I2, X)
 
 
-def reference_grads(x, scores, topk_g, dout, w1, w2):
+def reference_grads(x, scores, topk_g, dout, w1, w2, topk):
     """fp32 autograd over every rank's tokens and every expert: (dx, dscores, dw1, dw2)."""
     x = x.float().detach().requires_grad_()
     scores = scores.float().detach().requires_grad_()
     w1 = w1.float().detach().requires_grad_()
     w2 = w2.float().detach().requires_grad_()
     f = topk_g.reshape(-1).long()
-    tokens, s = torch.arange(f.numel(), device=x.device) // TOPK, scores.reshape(-1)
+    tokens, s = torch.arange(f.numel(), device=x.device) // topk, scores.reshape(-1)
     y = torch.zeros_like(x)
     for e in range(w1.shape[0]):
         slots = (f == e).nonzero().squeeze(1)
@@ -76,41 +88,44 @@ def _run_rank():
     dist.init_process_group("nccl")
     group = dist.group.WORLD
     bf16 = torch.bfloat16
-    E = world * E_LOCAL
+    H, I = 1024, 512
+    e_local, topk, t_local = 4, 2, 512
+    tile_n = 256  # the swap-AB operators' block: the GEMM's tile N
+    E = world * e_local
 
     def symm_rows(t):
         """This rank's rows of t (world * T_local, cols) in symmetric memory: (the buffer typed as t, handle)."""
         buf = symm_mem.empty(
-            T_LOCAL, t.shape[1] * t.element_size(), dtype=torch.uint8, device=device
+            t_local, t.shape[1] * t.element_size(), dtype=torch.uint8, device=device
         )
-        buf.copy_(t[rank * T_LOCAL : (rank + 1) * T_LOCAL].view(torch.uint8))
+        buf.copy_(t[rank * t_local : (rank + 1) * t_local].view(torch.uint8))
         return buf.view(t.dtype), symm_mem.rendezvous(buf, group=group)
 
     torch.manual_seed(0)  # the same routing, scores, weights and tokens on every rank
     topk_g = (
-        torch.stack([torch.randperm(E, device=device)[:TOPK] for _ in range(world * T_LOCAL)])
-        .view(world, T_LOCAL, TOPK)
+        torch.stack([torch.randperm(E, device=device)[:topk] for _ in range(world * t_local)])
+        .view(world, t_local, topk)
         .to(torch.int32)
     )
-    scores_g = torch.rand(world, T_LOCAL, TOPK, device=device).softmax(-1)
+    scores_g = torch.rand(world, t_local, topk, device=device).softmax(-1)
     w1 = torch.randn(E, 2 * I, H, device=device, dtype=bf16) * 0.05
     w2 = torch.randn(E, H, I, device=device, dtype=bf16) * 0.05
-    x_all = torch.randn(world * T_LOCAL, H, device=device, dtype=bf16)
-    dout_all = torch.randn(world * T_LOCAL, H, device=device, dtype=bf16)
-    mine = slice(rank * E_LOCAL, (rank + 1) * E_LOCAL)
+    x_all = torch.randn(world * t_local, H, device=device, dtype=bf16)
+    dout_all = torch.randn(world * t_local, H, device=device, dtype=bf16)
+    mine = slice(rank * e_local, (rank + 1) * e_local)
     w1_loc, w2_loc = w1[mine], w2[mine]
 
     # The routing and the forward's saved activations, packed per local expert
-    cu, s_scatter, s_reverse = routing(topk_g, rank)
+    cu, s_scatter, s_reverse = routing(topk_g, rank, e_local)
     total, max_rows = int(cu[-1]), s_scatter.numel()
     slot = s_scatter[:total].long()
-    x_rows = x_all[slot // TOPK]
+    x_rows = x_all[slot // topk]
     # the GEMM's operands span the routing's row bound (max_rows); rows past total are never scheduled
     score = torch.zeros(max_rows, device=device, dtype=torch.float32)
     score[:total] = scores_g.reshape(-1)[slot]
     w1_pw = pairwise(w1_loc)  # the preact in pairwise (gate_i, up_i) rows: the packed-pair layout
     h = torch.zeros(max_rows, 2 * I, device=device, dtype=bf16)
-    for e in range(E_LOCAL):
+    for e in range(e_local):
         r = slice(int(cu[e]), int(cu[e + 1]))
         h[r] = x_rows[r] @ w1_pw[e].T
 
@@ -120,14 +135,14 @@ def _run_rank():
     ).contiguous()  # (E, I, H), K-major: the transposed weight copy, once per step
     w1t = w1_pw.transpose(1, 2).contiguous()  # (E, H, 2I), K in the pairwise order dh comes in
     dout_loc, dout_hdl = symm_rows(dout_all)
-    dispatch = DispatchRunner(dout_loc, dout_hdl, TILE_N)
-    combine = CombineRunner(T_LOCAL, TOPK, H, bf16, group, max_rows)
+    dispatch = DispatchRunner(dout_loc, dout_hdl, tile_n)
+    combine = CombineRunner(t_local, topk, H, bf16, group, max_rows)
     dh = torch.zeros(max_rows, 2 * I, device=device, dtype=bf16)  # packed pairwise, as h
     a_s = torch.zeros(max_rows, I, device=device, dtype=bf16)
     # the score grad's per-CTA-M-tile partials (the sink rule: M tiles of the per-CTA tile, N columns)
     cta_tile_m = cta_tile_shape_m(256, 2, get_device_capacity(device)[0], False)
     dscore = torch.zeros(-(-I // cta_tile_m), max_rows, device=device, dtype=torch.float32)
-    dx = torch.empty(T_LOCAL, H, device=device, dtype=bf16)
+    dx = torch.empty(t_local, H, device=device, dtype=bf16)
     dist.barrier()  # every rank's dout is written before any pull reads it
     rows_d, args_d = dispatch.prepare(topk_g, s_scatter, s_reverse, cu)
     # 1 + 2 fused: the dgated epilogue on the fc2 dgrad reads the preact (C), writes dh (D), a * s and the
@@ -139,16 +154,16 @@ def _run_rank():
         h.T,
         epi_args={"score": score, "postact": a_s.T, "dscore": dscore},
         tile_M=256,
-        tile_N=TILE_N,
+        tile_N=tile_n,
         cluster_M=2,
         cluster_N=1,
         cu_seqlens_n=cu,
         dist_op=dispatch.op,
         dist_op_args=args_d,
     )
-    ds_g = torch.zeros(world * T_LOCAL * TOPK, device=device, dtype=torch.float32)
+    ds_g = torch.zeros(world * t_local * topk, device=device, dtype=torch.float32)
     ds_g[slot] = dscore.sum(0)[:total]  # the partials folded over the M tiles
-    ds = torch.empty(T_LOCAL * TOPK, device=device, dtype=torch.float32)
+    ds = torch.empty(t_local * topk, device=device, dtype=torch.float32)
     dist.reduce_scatter_tensor(ds, ds_g, group=group)
     # 3. fc1 dgrad drained into the origins' slots, then the sum over k
     gemm(
@@ -158,7 +173,7 @@ def _run_rank():
         None,
         None,
         256,
-        TILE_N,
+        tile_n,
         2,
         1,
         cu_seqlens_n=cu,
@@ -178,9 +193,11 @@ def _run_rank():
     )  # pairwise rows
     torch.cuda.synchronize(device)
 
-    dx_ref, ds_ref, dw1_ref, dw2_ref = reference_grads(x_all, scores_g, topk_g, dout_all, w1, w2)
-    me = slice(rank * T_LOCAL, (rank + 1) * T_LOCAL)
-    got = {"dx": dx, "dscores": ds.view(T_LOCAL, TOPK), "dw1": dw1, "dw2": dw2}
+    dx_ref, ds_ref, dw1_ref, dw2_ref = reference_grads(
+        x_all, scores_g, topk_g, dout_all, w1, w2, topk
+    )
+    me = slice(rank * t_local, (rank + 1) * t_local)
+    got = {"dx": dx, "dscores": ds.view(t_local, topk), "dw1": dw1, "dw2": dw2}
     ref = {
         "dx": dx_ref[me],
         "dscores": ds_ref[rank],

@@ -128,15 +128,14 @@ def _compile_gemm(
             d_dtype, m, n, cute.sym_int(), 1 if d_major == "n" else 0, 128 // d_dtype.width
         )
     if dist_op is not None:
-        # the operator's D has its own M extent (d_shape): untie it from A's M in the signature (varlen: 2-D)
-        mD = fake_batched(
-            d_dtype,
-            cute.sym_int(),
-            n,
-            l if batched and not (varlen_m or varlen_n) else None,
-            1 if d_major == "n" else 0,
-            128 // d_dtype.width,
-        )
+        # the operator's D has its own M extent (d_shape): untie it from A's M in the signature (varlen: 2-D);
+        # C is applied in the operator's frame (after the reduce, at the result's coordinates) and shares it
+        m_d = cute.sym_int()
+        l_d = l if batched and not (varlen_m or varlen_n) else None
+        # the N extents stay the fakes' own (an fp4 D is packed)
+        mD = fake_batched(d_dtype, m_d, mD.shape[-1], l_d, 1 if d_major == "n" else 0, 128 // d_dtype.width)
+        if c_dtype is not None:
+            mC = fake_batched(c_dtype, m_d, mC.shape[-1], l_d, 1 if c_major == "n" else 0, 128 // c_dtype.width)
 
     def fake_scalar(mode, dtype=Float32):
         if mode == 0:

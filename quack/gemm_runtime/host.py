@@ -191,16 +191,15 @@ def _compile_gemm_epi(
             # the operator's D has its own M extent (d_shape: RS's slab): untie it from A's M in the
             # compiled signature (varlen: 2-D). The epilogue operands index M in the operator's frame
             # (d_shape rows, in accumulator space: not A's M, not a packed D's): untied as well, the
-            # frontend checks their shapes against d_shape
+            # frontend checks their shapes against d_shape. C is applied in that frame too (after the
+            # reduce, at the result's coordinates) and shares D's M
             m = cute.sym_int()
-            mD = fake_batched(
-                d_dtype,
-                cute.sym_int(),
-                n,
-                l if batched and not (varlen_m or varlen_n) else None,
-                1 if d_major == "n" else 0,
-                div_for_dtype(d_dtype),
-            )
+            m_d = cute.sym_int()
+            l_d = l if batched and not (varlen_m or varlen_n) else None
+            # the N extents stay the fakes' own (a packed C / D is 2 x GEMM-N; fp4 D is packed)
+            mD = fake_batched(d_dtype, m_d, mD.shape[-1], l_d, 1 if d_major == "n" else 0, div_for_dtype(d_dtype))
+            if c_dtype is not None:
+                mC = fake_batched(c_dtype, m_d, mC.shape[-1], l_d, 1 if c_major == "n" else 0, div_for_dtype(c_dtype))
         if transform_mod is not None and transform_mod.needs_operands:
             # value transform with runtime operands: A crosses as a (plain A,
             # operand view) bundle in the one mA slot (same-arity trick as W4)
