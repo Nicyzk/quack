@@ -23,18 +23,15 @@ import torch
 
 
 def routing(topk_g, rank, e_local):
-    """Rank `rank`'s tables from the gathered top-k (W, T_local, K) of global expert ids: cu (E_local + 1),
-    s_scatter (row -> global slot), s_reverse (slot -> row). A row's token is its slot // K."""
+    """Rank `rank`'s tables from the gathered top-k (W, T_local, K) of global expert ids, the forward's (the
+    dispatch runner's order): cu (E_local + 1), s_scatter (row -> global slot). A row's token is its slot // K."""
     f = topk_g.reshape(-1)
     mine = (f // e_local == rank).nonzero().squeeze(1)
     e = f[mine] - rank * e_local
     s_scatter = mine[torch.argsort(e, stable=True)]
     counts = torch.bincount(e, minlength=e_local)
     cu = torch.cat([torch.zeros(1, dtype=torch.int64, device=f.device), counts.cumsum(0)])
-    s_reverse = torch.zeros(f.numel(), dtype=torch.int64, device=f.device)
-    s_reverse[s_scatter] = torch.arange(s_scatter.numel(), device=f.device)
-    i32 = lambda t: t.to(torch.int32)
-    return i32(cu), i32(s_scatter), i32(s_reverse)
+    return cu.to(torch.int32), s_scatter.to(torch.int32)
 
 
 REL_TOL = 2.0**-6  # vs fp32 autograd, the forward benches' bound
@@ -72,7 +69,6 @@ def reference_grads(x, scores, topk_g, dout, w1, w2, topk):
 
 def _run_rank():
     import torch.distributed as dist
-    import torch.distributed._symmetric_memory as symm_mem
 
     from quack.distributed.combine import CombineRunner
     from quack.distributed.dispatch import DispatchRunner
@@ -93,14 +89,6 @@ def _run_rank():
     tile_n = 256  # the swap-AB operators' block: the GEMM's tile N
     E = world * e_local
 
-    def symm_rows(t):
-        """This rank's rows of t (world * T_local, cols) in symmetric memory: (the buffer typed as t, handle)."""
-        buf = symm_mem.empty(
-            t_local, t.shape[1] * t.element_size(), dtype=torch.uint8, device=device
-        )
-        buf.copy_(t[rank * t_local : (rank + 1) * t_local].view(torch.uint8))
-        return buf.view(t.dtype), symm_mem.rendezvous(buf, group=group)
-
     torch.manual_seed(0)  # the same routing, scores, weights and tokens on every rank
     topk_g = (
         torch.stack([torch.randperm(E, device=device)[:topk] for _ in range(world * t_local)])
@@ -116,8 +104,8 @@ def _run_rank():
     w1_loc, w2_loc = w1[mine], w2[mine]
 
     # The routing and the forward's saved activations, packed per local expert
-    cu, s_scatter, s_reverse = routing(topk_g, rank, e_local)
-    total, max_rows = int(cu[-1]), s_scatter.numel()
+    cu, s_scatter = routing(topk_g, rank, e_local)
+    total = max_rows = s_scatter.numel()
     slot = s_scatter[:total].long()
     x_rows = x_all[slot // topk]
     # the GEMM's operands span the routing's row bound (max_rows); rows past total are never scheduled
@@ -134,8 +122,7 @@ def _run_rank():
         1, 2
     ).contiguous()  # (E, I, H), K-major: the transposed weight copy, once per step
     w1t = w1_pw.transpose(1, 2).contiguous()  # (E, H, 2I), K in the pairwise order dh comes in
-    dout_loc, dout_hdl = symm_rows(dout_all)
-    dispatch = DispatchRunner(dout_loc, dout_hdl, tile_n)
+    dispatch = DispatchRunner(t_local, topk, H, bf16, group, max_rows, tile_n, e_local)
     combine = CombineRunner(t_local, topk, H, bf16, group, max_rows)
     dh = torch.zeros(max_rows, 2 * I, device=device, dtype=bf16)  # packed pairwise, as h
     a_s = torch.zeros(max_rows, I, device=device, dtype=bf16)
@@ -143,8 +130,9 @@ def _run_rank():
     cta_tile_m = cta_tile_shape_m(256, 2, get_device_capacity(device)[0], False)
     dscore = torch.zeros(-(-I // cta_tile_m), max_rows, device=device, dtype=torch.float32)
     dx = torch.empty(t_local, H, device=device, dtype=bf16)
-    dist.barrier()  # every rank's dout is written before any pull reads it
-    rows_d, args_d = dispatch.prepare(topk_g, s_scatter, s_reverse, cu)
+    me = slice(rank * t_local, (rank + 1) * t_local)
+    args_d = dispatch.prepare(dout_all[me], topk_g[rank])  # publishes dout, routes on the device
+    rows_d = dispatch.rows
     # 1 + 2 fused: the dgated epilogue on the fc2 dgrad reads the preact (C), writes dh (D), a * s and the
     # per-token score grad (a row-vector reduce over I)
     dswiglu_moe_swap_mod.gemm(
@@ -196,7 +184,6 @@ def _run_rank():
     dx_ref, ds_ref, dw1_ref, dw2_ref = reference_grads(
         x_all, scores_g, topk_g, dout_all, w1, w2, topk
     )
-    me = slice(rank * t_local, (rank + 1) * t_local)
     got = {"dx": dx, "dscores": ds.view(t_local, topk), "dw1": dw1, "dw2": dw2}
     ref = {
         "dx": dx_ref[me],

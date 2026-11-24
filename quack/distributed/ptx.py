@@ -1,6 +1,7 @@
 # gmem primitives the distributed operators share: the 16-byte relaxed load that polls a mirror (Lamport), the
-# 16-byte plain stores that re-arm a slot or land a row slice in a peer's buffer (Lamport re-arm, combine), and
-# the dispatch pull's row transport (1D bulk copies through smem, the release add that publishes a landed row).
+# 16-byte plain stores that re-arm a slot or land a row slice in a peer's buffer (Lamport re-arm, combine), the
+# dispatch pull's row transport (1D bulk copies through smem, the release add that publishes a landed row) and the
+# system-scope release add that arrives on a peer's barrier word (the dispatch walk's NVLink barrier).
 from typing import Optional, Tuple
 
 from cutlass import Int32, Int64
@@ -81,6 +82,28 @@ def red_add_release_gpu_s32(
         None,
         [counter_pointer.toint(loc=loc, ip=ip).ir_value(), value.ir_value()],
         "red.release.gpu.global.add.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def red_add_release_sys_s32_at(
+    addr: Int64,
+    value: Int32,
+    *,
+    loc: Optional[ir.Location] = None,
+    ip: Optional[ir.InsertionPoint] = None,
+) -> None:
+    """A release add at a raw gmem address at system scope: the arrive on a peer's barrier word."""
+    llvm.inline_asm(
+        None,
+        [Int64(addr).ir_value(loc=loc, ip=ip), Int32(value).ir_value(loc=loc, ip=ip)],
+        "red.release.sys.global.add.s32 [$0], $1;",
         "l,r",
         has_side_effects=True,
         is_align_stack=False,

@@ -6,6 +6,9 @@ Methods:
   quack_ag    this work: reverse-ring CE push + flag-gated shard-rotated persistent GEMM
   nccl_seq    NCCL all_gather_into_tensor, then the same quack GEMM (exposed comm)
   torch_fused torch.ops.symm_mem.fused_all_gather_matmul (if available)
+  quack_ag_swiglu / quack_ag_rope      quack_ag with the gate/up GEMM's gated SwiGLU or the QKV GEMM's
+                                       RoPE fused in the epilogue
+  nccl_seq_swiglu / nccl_seq_rope      NCCL all_gather_into_tensor, then the same fused GEMM
 
 Protocol (shared-node rules): methods interleaved per round, per-launch CUDA
 events, median over rounds, cross-rank max reported. Run:
@@ -53,6 +56,7 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
 from quack.distributed import AllGather, AllGatherArguments, AllGatherRunner
+from quack.epilogue.library import linear_act_mod, rope_epi
 from quack.gemm import gemm as quack_gemm
 
 
@@ -185,6 +189,71 @@ def bench_shape(m_total, n_local, k, dtype, rank, world_size, device, rounds, ar
     torch.cuda.synchronize(device)
     tol = (d2.float() - ref).abs().max().item() + 1e-4
     assert err <= 2 * tol, f"rank{rank} quack_ag mismatch: {err} vs tol {tol}"
+
+    # the TP block's fused epilogues on the same route: gated SwiGLU on gate/up (pairs interleaved along
+    # N), RoPE on QKV (an interleaved cos/sin table); nccl_seq_* = the gather, then the same fused GEMM
+    torch.manual_seed(4322)
+    table = torch.randn(m_total, n_local, dtype=dtype, device=device)
+    postact = torch.empty(m_total, n_local // 2, dtype=dtype, device=device)
+    swiglu = linear_act_mod("swiglu", gated=True, has_c=False, has_rowvec=False, has_colvec=False)
+    epi_cfg = dict(gemm_cfg, max_swizzle_size=args.swizzle)
+
+    def run_quack_ag_swiglu():
+        with ag.prepare(a_shard) as (a_buf, ag_args):
+            swiglu.gemm(
+                a_buf,
+                b,
+                None,
+                None,
+                epi_args=dict(mAuxOut=postact),
+                dist_op=AllGather(),
+                dist_op_args=ag_args,
+                **epi_cfg,
+            )
+
+    def run_nccl_seq_swiglu():
+        dist.all_gather_into_tensor(a_full, a_shard)
+        swiglu.gemm(a_full, b, None, None, epi_args=dict(mAuxOut=postact), **epi_cfg)
+
+    def run_quack_ag_rope():
+        with ag.prepare(a_shard) as (a_buf, ag_args):
+            rope_epi.gemm(
+                a_buf,
+                b,
+                d,
+                None,
+                epi_args=dict(table=table),
+                dist_op=AllGather(),
+                dist_op_args=ag_args,
+                **epi_cfg,
+            )
+
+    def run_nccl_seq_rope():
+        dist.all_gather_into_tensor(a_full, a_shard)
+        rope_epi.gemm(a_full, b, d, None, epi_args=dict(table=table), **epi_cfg)
+
+    cos, sin = table.float()[:, 0::2], table.float()[:, 1::2]
+
+    def swiglu_ref(x):
+        return torch.nn.functional.silu(x[:, 0::2]) * x[:, 1::2]
+
+    def rope_ref(x):
+        x1, x2 = x[:, 0::2], x[:, 1::2]
+        return torch.stack([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1).reshape(m_total, n_local)
+
+    refq = ref.to(dtype).float()  # the baseline's one rounding
+    for name, fn, out, epi_ref in (
+        ("quack_ag_swiglu", run_quack_ag_swiglu, postact, swiglu_ref),
+        ("nccl_seq_swiglu", run_nccl_seq_swiglu, postact, swiglu_ref),
+        ("quack_ag_rope", run_quack_ag_rope, d, rope_ref),
+        ("nccl_seq_rope", run_nccl_seq_rope, d, rope_ref),
+    ):
+        fn()
+        torch.cuda.synchronize(device)
+        err = (out.float() - epi_ref(ref)).abs().max().item()
+        tol = (epi_ref(refq) - epi_ref(ref)).abs().max().item() + 1e-4
+        assert err <= 2 * tol, f"rank{rank} {name} mismatch: {err} vs tol {tol}"
+        methods[name] = fn
 
     # warmup (compiles, symm rendezvous, clock ramp)
     for fn in methods.values():

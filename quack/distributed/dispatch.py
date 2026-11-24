@@ -6,8 +6,9 @@
 # the tile's loads. The GEMM reads the operand as a plain contiguous tensor: no index, every GEMM feature composes.
 # The scheduler is the
 # GEMM's expert-grouped order on the operator's tile counter (make_scheduler_args: the dynamic scheduler over the
-# resident grid, CLC off). DispatchRunner allocates the rows and builds the walk (flags and counter included); the
-# GEMM's D is the caller's output.
+# resident grid, CLC off). DispatchRunner owns the symmetric token rows and the routing's buffers; its prepare is
+# the one launch that exchanges the top-k, routes and builds the walk (flags and counter reset with it); the GEMM's
+# D is the caller's output.
 #
 # pull_rows is MegaMoE's deterministic `token_in` transfer-warp loop, rows moved as bytes (any dtype; block-scaled
 # formats also scatter each row's scales): a row is pulled from its peer's x buffer into a per-warp smem stage with
@@ -27,9 +28,16 @@ from cutlass.cute.typing import AddressSpace
 from quack.blockscaled.operand import BlockScaledFormat
 from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, mlir_namedtuple
-from quack.distributed.dispatch_walk import WalkArguments, fake_walk_arguments, make_dispatch_walk
+from quack.distributed.dispatch_walk import (
+    GROUP_THREADS,
+    DispatchWalk,
+    WalkArguments,
+    fake_walk_arguments,
+    sf_atom_rows_of,
+)
 from quack.distributed.ptx import cp_async_bulk_s2g, red_add_release_gpu_s32, tma_load_1d
 from quack.gemm_base import DistOp, grouped_ragged_dim
+from quack.gemm_tvm_ffi_utils import varlen_n_block_atoms
 from quack.varlen_utils import varlen_n_block_rows
 
 
@@ -163,7 +171,7 @@ def pull_rows(
 class DispatchArguments(NamedTuple):
     """The transfer warps' bundle (the GEMM's dist_op_args)."""
 
-    walk: WalkArguments  # make_dispatch_walk's walk.args
+    walk: WalkArguments  # DispatchWalk's output
     rows: cute.Tensor  # the token operand as bytes: every reader expert's row of each pulled token
     flags: cute.Tensor  # (E_local, max blocks) int32, +1 per landed row: published here, gated on by wait_tile
     sem: cute.Tensor  # (1,) int32 the GEMM's tile counter (make_scheduler_args), zeroed per call
@@ -276,57 +284,125 @@ class DispatchPull(DistOp):
 # --- host ------------------------------------------------------------------------------------------------------------
 
 
-def sf_words_of(a_format, x):
-    """4-byte scale words per row of a block-scaled x (K / (4 sf_vec_size)); 0 for a plain dtype."""
-    if a_format is None:
-        return 0
-    fmt = a_format if isinstance(a_format, BlockScaledFormat) else BlockScaledFormat.from_name(a_format)
-    assert x.dtype == fmt.qdata_dtype, f"x rows must be {fmt.name} qdata ({fmt.qdata_dtype}), got {x.dtype}"
-    assert fmt.scale_dtype.itemsize == 1, f"{fmt.name}: the scale scatter moves 1-byte scales"
-    k = fmt.logical_k(x.shape[1])
-    assert k % (4 * fmt.sf_vec_size) == 0, f"{fmt.name}: K={k} must fill whole 4-scale SF words"
-    return k // (4 * fmt.sf_vec_size)
-
-
 class DispatchRunner:
-    """GEMM1 + dispatch pull. x = this rank's (T_local, K) token rows (one dtype or a block-scaled format's
-    qdata) in symmetric memory, x_hdl its rendezvous handle: every rank's rows are read through it, and the
-    runner keeps it so the mapping outlives the pulls; block_rows = the GEMM's tile along the ragged dim, the
-    gated unit (tile N under "n", the per-CTA tile_M under "m"); x_sf + x_sf_hdl + sf_pool: the block-scaled
-    scale lane (the (T_local, K / sf_vec_size) 1-byte scale rows, sf_pool = the GEMM's per-block SF atoms);
-    ragged_dim = the GEMM call's ragged dim, None = this arch's default (gemm_base.grouped_ragged_dim).
-    `op` = DispatchPull(row bytes, scale words, ragged_dim). prepare(topk_idx_g, s_scatter, s_reverse,
-    cu_seqlens) runs the device walk for a call's routing (topk_idx_g (W, T_local, K) int32, the rest int32 as
-    make_dispatch_walk) and returns (rows, args): the token operand the pull fills (rows packed per expert,
-    (max rows, K); the GEMM's B with cu_seqlens_n = cu_seqlens under "n", its A with cu_seqlens_m under "m")
-    and the dist_op_args. The caller orders every rank's rows before the first pull (a barrier)."""
+    """GEMM1 + dispatch pull of tokens_local tokens x k experts x hidden. `x` = this rank's (tokens_local, hidden)
+    token rows in symmetric memory, the buffer every rank's pulls read; `rows` = the token operand the pull fills,
+    (max_rows, hidden) packed per local expert: the GEMM's B with cu_seqlens_n=cu under "n" (swap-AB), its A with
+    cu_seqlens_m=cu under "m" (varlen_m); `cu` (num_local_experts + 1) and `s_scatter` (max_rows; each row's
+    global slot = (source rank, token, k) flattened, combine's row_key) = the routing; `op` = DispatchPull.
+    block_rows = the GEMM's tile along the ragged dim, the gated unit (tile N under "n", the per-CTA tile_M under
+    "m"); max_rows bounds the rows this rank receives (world x tokens_local x k is sure); ragged_dim = the GEMM
+    call's ragged dim, None = this arch's default (gemm_base.grouped_ragged_dim). dtype = the rows' torch dtype, or
+    a block-scaled format name: x holds the format's qdata, `x_sf` (tokens_local, hidden / sf_vec_size) its 1-byte
+    scale rows and `sf_pool` the GEMM's per-block SF atoms (its SFB). prepare(x, topk_idx[, x_sf]) publishes this
+    rank's rows and routes the call in one launch (the top-k exchange, an NVLink barrier that also orders the
+    rows for the peers' pulls, the routing, the walk, the flag and counter resets): every rank calls it; it
+    returns the GEMM's dist_op_args. The next prepare may start only once every rank's pulls of this call are done
+    (a forward's combine barrier)."""
 
-    def __init__(self, x, x_hdl, block_rows, x_sf=None, x_sf_hdl=None, sf_pool=None, ragged_dim=None):
-        self.rank, world = x_hdl.rank, x_hdl.world_size
-        peers = lambda t, hdl: [  # every rank's rows, typed as t (the handle hands out byte views)
-            hdl.get_buffer(q, (t.shape[0], t.shape[1] * t.element_size()), torch.uint8).view(t.dtype)
-            for q in range(world)
-        ]
+    def __init__(
+        self, tokens_local, k, hidden, dtype, group, max_rows, block_rows, num_local_experts, ragged_dim=None
+    ):
+        import torch.distributed._symmetric_memory as symm_mem
+
+        dev = torch.device(torch.cuda.current_device())
+        rank, world = group.rank(), group.size()
         if ragged_dim is None:
-            ragged_dim = grouped_ragged_dim(get_device_capacity(x.device)[0])
-        self.x, self.block_rows = x, block_rows
-        self.peers = peers(x, x_hdl)
-        self.sf_peers = None if x_sf is None else peers(x_sf, x_sf_hdl)
-        self.handles = (x_hdl, x_sf_hdl)  # pins the symmetric mappings as long as the runner lives
-        self.sf_bytes = None if sf_pool is None else sf_pool.view(torch.uint8).view(-1)  # the pull addresses bytes
-        sf_words = 0 if x_sf is None else x_sf.shape[1] * x_sf.element_size() // 4
-        self.op = DispatchPull(x.shape[1] * x.element_size(), sf_words, ragged_dim)
-        self.sem = torch.zeros(1, dtype=torch.int32, device=x.device)  # the GEMM's tile counter
+            ragged_dim = grouped_ragged_dim(get_device_capacity(dev)[0])
+        fmt = BlockScaledFormat.from_name(dtype) if isinstance(dtype, str) else None
+        cols = hidden
+        if fmt is not None:
+            assert fmt.scale_dtype.itemsize == 1 and hidden % (4 * fmt.sf_vec_size) == 0, (
+                f"{fmt.name}: the scale lane moves 1-byte scales in whole 4-scale words"
+            )
+            dtype, cols = fmt.qdata_dtype, fmt.storage_k(hidden)
+        assert tokens_local * k % 4 == 0, "the top-k is published 4 slots per store"
+        self._handles = []  # the symmetric mappings live as long as the runner
 
-    def prepare(self, topk_idx_g, s_scatter, s_reverse, cu_seqlens):
-        build, self.walk = make_dispatch_walk(
-            topk_idx_g, s_scatter, s_reverse, self.rank, cu_seqlens, self.peers, self.block_rows,
-            x_sf_peer_bufs=self.sf_peers, even_split=self.op.ragged_dim == "n",
+        def symm(shape, dtype):
+            buf = symm_mem.empty(*shape, dtype=dtype, device=dev)
+            hdl = symm_mem.rendezvous(buf, group=group)
+            self._handles.append(hdl)
+            bases = [hdl.get_buffer(q, shape, dtype).data_ptr() for q in range(world)]
+            return buf, torch.tensor(bases, dtype=torch.int64, device=dev)
+
+        i32 = lambda *shape: torch.empty(*shape, dtype=torch.int32, device=dev)
+        i64 = lambda *shape: torch.empty(*shape, dtype=torch.int64, device=dev)
+        n_tokens = world * tokens_local
+        self.x, peer_base = symm((tokens_local, cols), dtype)
+        topk_g, topk_g_base = symm((n_tokens * k,), torch.int32)
+        signal, signal_base = symm((1,), torch.int32)
+        signal.zero_()
+        self._handles[-1].barrier()  # every rank's word is zero before any arrive
+        ncols = -(-n_tokens // block_rows)  # an expert reads each token at most once: its blocks <= the tokens'
+        sf = fmt is not None
+        walk = WalkArguments(
+            src_address=i64(n_tokens),
+            gate_ptr=i32(n_tokens + 1),
+            gates=i32(max_rows),
+            num_rows=i32(1),
+            dst_row=i32(max_rows),
+            src_sf_address=i64(n_tokens) if sf else None,
+            dst_sf_row=i32(max_rows) if sf else None,
         )
-        rows = torch.empty(s_scatter.numel(), self.x.shape[1], dtype=self.x.dtype, device=self.x.device)
-        build()
-        self.walk.flags.zero_()
-        self.sem.zero_()
-        return rows, DispatchArguments(
-            self.walk.args, rows.view(torch.uint8), self.walk.flags, self.sem, self.sf_bytes
+        flags = i32(num_local_experts, ncols)
+        self.sem = torch.zeros(1, dtype=torch.int32, device=dev)  # the GEMM's tile counter
+        self.rows = torch.empty(max_rows, cols, dtype=dtype, device=dev)
+        self.cu, self.s_scatter = i32(num_local_experts + 1), i32(max_rows)
+        s_reverse = i32(n_tokens * k)
+        counts = i32(num_local_experts, -(-n_tokens // GROUP_THREADS))
+        counts2 = i32(2, num_local_experts * ncols)
+        grid_counter = torch.zeros(1, dtype=torch.int32, device=dev)
+        sf_words, sf_pool_bytes, sf_base, sf_row_bytes, cu_tiles = 0, None, None, 0, None
+        if sf:
+            vec = fmt.sf_vec_size
+            self.x_sf, sf_base = symm((tokens_local, hidden // vec), fmt.scale_dtype)
+            self.sf_pool = torch.zeros(
+                1,
+                num_local_experts * ncols * varlen_n_block_atoms(block_rows),
+                hidden // (4 * vec),
+                32,
+                4,
+                4,
+                dtype=fmt.scale_dtype,
+                device=dev,
+            )
+            sf_words, sf_row_bytes = hidden // (4 * vec), hidden // vec
+            sf_pool_bytes = self.sf_pool.view(torch.uint8).view(-1)  # the pull addresses bytes
+            cu_tiles = i32(num_local_experts + 1)
+        row_bytes = cols * self.x.element_size()
+        self.op = DispatchPull(row_bytes, sf_words, ragged_dim)
+        self.args = DispatchArguments(walk, self.rows.view(torch.uint8), flags, self.sem, sf_pool_bytes)
+        self.tokens_local, self.k = tokens_local, k
+
+        kernel = DispatchWalk(
+            k,
+            num_local_experts,
+            world,
+            block_rows,
+            torch.cuda.get_device_properties(dev).multi_processor_count,
+            sf_atom_rows_of(block_rows) if sf else 0,
+            ragged_dim == "n",
         )
+        v = lambda: make_fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1)
+        v64 = lambda: make_fake_tensor(Int64, (cute.sym_int(),), leading_dim=0, divisibility=1)
+        m = lambda: make_fake_tensor(Int32, (cute.sym_int(), cute.sym_int()), leading_dim=1, divisibility=1)
+        stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        fn = cute.compile(
+            kernel, v(), v(), v64(), v(), v64(), v(), m(), m(), v(), v(), v(), m(), v(), v64(),
+            fake_walk_arguments(sf), Int32(rank), Int32(tokens_local), Int32(row_bytes), stream,
+            v64() if sf else None, Int32(sf_row_bytes), v() if sf else None, options="--enable-tvm-ffi",
+        )
+        self._walk = lambda topk: fn(
+            topk, topk_g, topk_g_base, signal, signal_base, grid_counter, counts, counts2, self.cu, s_reverse,
+            self.s_scatter, flags, self.sem, peer_base, walk, rank, tokens_local, row_bytes, sf_base, sf_row_bytes,
+            cu_tiles,
+        )
+
+    def prepare(self, x, topk_idx, x_sf=None):
+        assert topk_idx.shape == (self.tokens_local, self.k) and topk_idx.dtype == torch.int32
+        self.x.copy_(x)  # the publish: the walk's barrier orders it for the peers' pulls
+        if x_sf is not None:
+            self.x_sf.copy_(x_sf)
+        self._walk(topk_idx.contiguous().view(-1))
+        return self.args

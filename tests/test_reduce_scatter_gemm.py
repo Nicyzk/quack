@@ -26,10 +26,11 @@ def _run_rank():
     from quack.cute_dsl_utils import get_device_capacity
     from quack.distributed.reduce_scatter import ReduceScatterRunner
     from quack.epilogue.frontend import gemm_epilogue
-    from quack.epilogue.library import identity_epi, linear_act_mod
+    from quack.epilogue.library import identity_epi, linear_act_mod, sq_reduce_mod
     from quack.epilogue.ops import ColVecLoad, RowVecLoad, RowVecReduce
     from quack.gemm import gemm
     from quack.gemm_config import GemmConfig
+    from quack.rms_final_reduce import rms_final_reduce
     from quack.tile_scheduler import RasterOrderOption
 
     rank = int(os.environ["RANK"])
@@ -215,6 +216,31 @@ def _run_rank():
         check(f"rs+rowmax D iter={it}", rs.d, ref, base)
         stripe_max = lambda x: x.view(m // tile_m, stripe, n).abs().amax(1)
         check(f"rs+rowmax colmax iter={it}", colmax, stripe_max(ref), stripe_max(base))
+
+    # --- residual + RMSNorm statistic (gemm_rms's shape): D = (reduce + C) * weight, the slab's per-tile
+    # squared-sum partials, rstd finalized by rms_final_reduce ---
+    rms_mod = sq_reduce_mod(has_c=True, has_rowvec=True, has_aux=False)
+    rstd_ref = lambda x: torch.rsqrt(x.square().mean(-1) + 1e-6)
+    rs = ReduceScatterRunner(m, n, dtype, tile_m, tile_n)
+    partials = torch.zeros(slab, n // tile_n, dtype=torch.float32, device=device)
+    for it in range(NUM_ITERS):
+        a, b = operands(3500 + 10 * it)
+        c = torch.randn(slab, n, dtype=dtype, device=device)
+        rms_mod.gemm(
+            a,
+            b,
+            rs.d,
+            c,
+            epi_args={"mRowVecBroadcast": bias, "mColVecReduce": partials},
+            dist_op=rs.op,
+            dist_op_args=rs.prepare(),
+            **launch,
+        )
+        rstd = rms_final_reduce(partials, scale=1.0 / n)
+        torch.cuda.synchronize(device)
+        ref, base = full_ref(a, b)[rows] + c.float(), (nccl_rs(a, b) + c).float()
+        check(f"rs+rms D iter={it}", rs.d, ref * bias, base * bias)
+        check(f"rs+rms rstd iter={it}", rstd, rstd_ref(ref), rstd_ref(base))
 
     if sm100:  # block-scaled operands and a quantized D: the SM100 formats (SM90 has no block-scaled hardware)
         from quack.blockscaled.operand import BlockScaledOperand

@@ -1,8 +1,9 @@
 # Copyright (C) 2026, Tri Dao.
 """Multi-rank correctness tests for DispatchRunner (quack/distributed/dispatch.py): MoE dispatch fused into the
-grouped FC1 GEMM. Every rank's tokens live in a symmetric buffer; the GEMM's transfer warps pull the rows this
-rank's experts read into every reader expert's row of the token operand, the tiles gate on the landed counts,
-and the fused activation's postact matches a torch reference over the routed tokens. Tokens on either ragged
+grouped FC1 GEMM. The runner's prepare publishes each rank's tokens and routes the call on the device (its
+tables are checked against a torch routing); the GEMM's transfer warps pull the rows this rank's experts read
+into every reader expert's row of the token operand, the tiles gate on the landed counts, and the fused
+activation's postact matches a torch reference over the routed tokens. Tokens on either ragged
 dim: "n" = swap-AB (B rows in even-split N blocks, the M-paired gated store; SM100+), "m" = varlen_m (A rows in
 fixed tile_M blocks, the N-paired store). Block-scaled formats ("n") pull each token's scale row into the
 GEMM's per-block SFB atoms alongside (the scale lane).
@@ -33,24 +34,20 @@ def interleave_gate_up(w, ragged_dim):
 
 
 def routing(topk_g, rank, e_local):
-    """Rank `rank`'s tables from the gathered top-k (W, T_local, K) of global expert ids, the routing_metadata
-    contract: cu (E_local + 1), s_scatter (row -> slot), s_reverse (slot -> row, this rank's slots only). A row's
-    token is its slot // K (slots are (source rank, token, k) flattened)."""
+    """Rank `rank`'s tables from the gathered top-k (W, T_local, K) of global expert ids, the reference for the
+    runner's: cu (E_local + 1), s_scatter (row -> slot; rows packed per local expert in slot order). A row's token
+    is its slot // K (slots are (source rank, token, k) flattened)."""
     f = topk_g.reshape(-1)
     mine = (f // e_local == rank).nonzero().squeeze(1)
     e = f[mine] - rank * e_local
     s_scatter = mine[torch.argsort(e, stable=True)]
     counts = torch.bincount(e, minlength=e_local)
     cu = torch.cat([torch.zeros(1, dtype=torch.int64, device=f.device), counts.cumsum(0)])
-    s_reverse = torch.zeros(f.numel(), dtype=torch.int64, device=f.device)
-    s_reverse[s_scatter] = torch.arange(s_scatter.numel(), device=f.device)
-    i32 = lambda t: t.to(torch.int32)
-    return i32(cu), i32(s_scatter), i32(s_reverse)
+    return cu.to(torch.int32), s_scatter.to(torch.int32)
 
 
 def _run_rank():
     import torch.distributed as dist
-    import torch.distributed._symmetric_memory as symm_mem
     import torch.nn.functional as F
 
     from quack.blockscaled.operand import BlockScaledOperand
@@ -58,7 +55,6 @@ def _run_rank():
     from quack.cute_dsl_utils import get_device_capacity
     from quack.distributed.dispatch import DispatchRunner
     from quack.epilogue.library import linear_act_mod
-    from quack.gemm_tvm_ffi_utils import varlen_n_block_atoms
 
     rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
     device = torch.device("cuda", rank % torch.cuda.device_count())
@@ -86,21 +82,21 @@ def _run_rank():
     )
     w_cat = torch.randn(e_local, 2 * I, H, device=device, dtype=torch.bfloat16) * 0.05  # [gate; up]
     w_plain = w_cat[:, :I].contiguous()
-    torch.manual_seed(100 + rank)
-    x = torch.randn(t_local, H, device=device, dtype=torch.bfloat16)
-    x_all = torch.empty(world * t_local, H, device=device, dtype=torch.bfloat16)
-    dist.all_gather_into_tensor(x_all, x)
-    cu, s_scatter, s_reverse = routing(topk_g, rank, e_local)
+    x_all = torch.randn(world * t_local, H, device=device, dtype=torch.bfloat16)
+    me = slice(rank * t_local, (rank + 1) * t_local)  # this rank's tokens of the gathered tensors
+    cu, s_scatter = routing(topk_g, rank, e_local)
     total = int(cu[-1])
+    max_rows = world * t_local * topk  # the sure bound on the rows a rank receives
     token_of_row = (s_scatter.long() // topk)[:total]  # each row's token in the gathered x
 
-    def symm_rows(t):
-        """This rank's rows of t in symmetric memory: (the buffer typed as t, its rendezvous handle)."""
-        buf = symm_mem.empty(
-            t_local, t.shape[1] * t.element_size(), dtype=torch.uint8, device=device
-        )
-        buf.copy_(t[rank * t_local : (rank + 1) * t_local].view(torch.uint8))
-        return buf.view(t.dtype), symm_mem.rendezvous(buf, group=group)
+    def prepare(label, dispatch, x, x_sf=None):
+        """The runner's prepare (every rank's publish + the device routing), its tables against the reference."""
+        dist.barrier()  # every rank's pulls of the previous call are done
+        args = dispatch.prepare(x, topk_g[rank], x_sf)
+        torch.cuda.synchronize(device)
+        if not (torch.equal(dispatch.cu, cu) and torch.equal(dispatch.s_scatter[:total], s_scatter)):
+            failures.append(f"rank{rank} {label}: the routing tables differ from the reference")
+        return args
 
     def check(label, postact, w_dq, x_dq, activation, gated):
         """The postact against the fp32 reference over the routed tokens, within twice the bf16 rounding error."""
@@ -118,25 +114,25 @@ def _run_rank():
             if err > tol:
                 failures.append(f"rank{rank} {label} expert {e}: err={err} tol={tol}")
 
-    def fc1(ragged_dim, block, w_q, rows, dispatch, args, mod, epi_args):
+    def fc1(ragged_dim, block, w_q, dispatch, args, mod, epi_args):
         """The grouped FC1 in the ragged dim's operand placement: swap-AB (weights on M) or varlen_m."""
         kw = dict(epi_args=epi_args, dist_op=dispatch.op, dist_op_args=args)
         if ragged_dim == "n":
             mod.gemm(
                 w_q,
-                rows,
+                dispatch.rows,
                 None,
                 None,
                 tile_M=256,
                 tile_N=block,
                 cluster_M=2,
                 cluster_N=1,
-                cu_seqlens_n=cu,
+                cu_seqlens_n=dispatch.cu,
                 **kw,
             )
         else:
             mod.gemm(
-                rows,
+                dispatch.rows,
                 w_q,
                 None,
                 None,
@@ -144,36 +140,29 @@ def _run_rank():
                 tile_N=256,
                 cluster_M=1,
                 cluster_N=1,
-                cu_seqlens_m=cu,
+                cu_seqlens_m=dispatch.cu,
                 **kw,
             )
         torch.cuda.synchronize(device)
 
     # --- bf16: every activation on every (ragged dim, block) this arch admits ---
-    x_loc, x_hdl = symm_rows(x_all)
     for ragged_dim, block in blocks:
-        dispatch = DispatchRunner(x_loc, x_hdl, block, ragged_dim=ragged_dim)
+        dispatch = DispatchRunner(
+            t_local, topk, H, torch.bfloat16, group, max_rows, block, e_local, ragged_dim=ragged_dim
+        )
         for activation in gated_acts + plain_acts:
             gated = activation in gated_acts
             w = interleave_gate_up(w_cat, ragged_dim) if gated else w_plain
-            postact = torch.zeros(total, I, device=device, dtype=torch.bfloat16)
+            postact = torch.zeros(max_rows, I, device=device, dtype=torch.bfloat16)
             mod = linear_act_mod(
                 activation, gated=gated, has_c=False, has_rowvec=False, has_colvec=False
             )
-            dist.barrier()  # every rank's rows are written before any pull reads them
-            rows, args = dispatch.prepare(topk_g, s_scatter, s_reverse, cu)
+            label = f"dispatch bf16 {ragged_dim}{block} {activation}"
+            args = prepare(label, dispatch, x_all[me])
             aux = postact.T if ragged_dim == "n" else postact  # the M-paired store writes m-major
-            fc1(ragged_dim, block, w, rows, dispatch, args, mod, {"mAuxOut": aux})
+            fc1(ragged_dim, block, w, dispatch, args, mod, {"mAuxOut": aux})
             w_ref = w_cat.float() if gated else w_plain.float()
-            check(
-                f"dispatch bf16 {ragged_dim}{block} {activation}",
-                postact,
-                w_ref,
-                x_all.float(),
-                activation,
-                gated,
-            )
-    dist.barrier()  # peers may still be pulling from x
+            check(label, postact, w_ref, x_all.float(), activation, gated)
 
     # --- block-scaled rows (swap-AB, SM100): the scale lane fills the GEMM's per-block SFB atoms ---
     if sm100:
@@ -194,23 +183,10 @@ def _run_rank():
             x_sf = unpack_scale_blocked_to_2d(xop.scale[None], world * t_local, H // vec)[
                 0
             ]  # 1-byte scale rows
-            ncols = -(-world * t_local // block)  # the walk's flag columns bound the block slots
-            sf_pool = torch.zeros(
-                1,
-                e_local * ncols * varlen_n_block_atoms(block),
-                H // (4 * vec),
-                32,
-                4,
-                4,
-                dtype=x_sf.dtype,
-                device=device,
-            )
-            xq_loc, xq_hdl = symm_rows(xop.qdata)
-            sf_loc, sf_hdl = symm_rows(x_sf)
             dispatch = DispatchRunner(
-                xq_loc, xq_hdl, block, sf_loc, sf_hdl, sf_pool, ragged_dim=ragged_dim
+                t_local, topk, H, name, group, max_rows, block, e_local, ragged_dim=ragged_dim
             )
-            postact = torch.zeros(total, I, device=device, dtype=torch.bfloat16)
+            postact = torch.zeros(max_rows, I, device=device, dtype=torch.bfloat16)
             mod = linear_act_mod(
                 "swiglu",
                 gated=True,
@@ -219,9 +195,9 @@ def _run_rank():
                 has_colvec=False,
                 has_alpha=fmt == "nvfp4",
             )
-            dist.barrier()
-            rows, args = dispatch.prepare(topk_g, s_scatter, s_reverse, cu)
-            sf_kw = dict(SFA=wop.scale, SFB=sf_pool, bs_format_a=name, bs_format_b=name)
+            label = f"dispatch {fmt} {ragged_dim}{block} swiglu"
+            args = prepare(label, dispatch, xop.qdata[me], x_sf[me])
+            sf_kw = dict(SFA=wop.scale, SFB=dispatch.sf_pool, bs_format_a=name, bs_format_b=name)
             kw = dict(
                 epi_args={**epi_args, "mAuxOut": postact.T},
                 dist_op=dispatch.op,
@@ -230,14 +206,14 @@ def _run_rank():
             )
             mod.gemm(
                 wop.qdata,
-                rows,
+                dispatch.rows,
                 None,
                 None,
                 tile_M=256,
                 tile_N=block,
                 cluster_M=2,
                 cluster_N=1,
-                cu_seqlens_n=cu,
+                cu_seqlens_n=dispatch.cu,
                 **kw,
             )
             torch.cuda.synchronize(device)
@@ -246,15 +222,8 @@ def _run_rank():
             w_dq = torch.cat(
                 [w_dq[:, :, 0].reshape(e_local, I, H), w_dq[:, :, 1].reshape(e_local, I, H)], dim=1
             )
-            check(
-                f"dispatch {fmt} {ragged_dim}{block} swiglu",
-                postact,
-                w_dq,
-                xop.dequantize(torch.float32),
-                "swiglu",
-                True,
-            )
-            dist.barrier()
+            check(label, postact, w_dq, xop.dequantize(torch.float32), "swiglu", True)
+    dist.barrier()  # peers may still be pulling
 
     fail_count = torch.tensor([len(failures)], device=device)
     dist.all_reduce(fail_count)

@@ -955,9 +955,10 @@ class EpiMod:
                     raise ValueError("packed m-major C/D outer strides must permit a f32 view")
                 packed_form = "m"
         else:
-            _require_shape("C", C, base_shape)
-            # an operator's D has the extent it declares (lamport: stacked mirrors)
-            _require_shape("D", D, base_shape if dist_op is None else dist_op.d_shape(base_shape))
+            # an operator's D has the extent it declares (RS: the slab); C is applied there and shares it
+            d_shape = base_shape if dist_op is None else dist_op.d_shape(base_shape)
+            _require_shape("C", C, d_shape)
+            _require_shape("D", D, d_shape)
         for out_name in self.outputs:
             if out_name not in epi_args:
                 raise ValueError(f"missing epilogue output buffer '{out_name}'")
@@ -1093,7 +1094,12 @@ class EpiMod:
                 )
             alloc = getattr(op, "sink_alloc_shape", None)
             if alloc is not None:
-                lead_k = (m,) if varlen_m or batch is None else (batch, m)
+                # a per-row sink follows D's rows (an operator's D: d_shape, e.g. RS's slab); a per-M-tile
+                # sink (dim 1) counts the GEMM's tiles
+                m_k = m
+                if dist_op is not None and getattr(op, "dim", 0) == 0:
+                    m_k = dist_op.d_shape((m, n_gemm))[0]
+                lead_k = (m_k,) if varlen_m or batch is None else (batch, m_k)
                 num_seqs_k = (
                     cu_seqlens_m.shape[0] - 1 if varlen_m and getattr(op, "dim", 0) == 1 else None
                 )

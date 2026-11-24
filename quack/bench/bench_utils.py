@@ -155,6 +155,61 @@ def _bench_cuda_graph_l2_rotate(
     return ms
 
 
+def bench_l2_rotate_dist(fn, arg_sets, warmup_target_ms: float = 200.0, n_timed_calls: int = 200):
+    """_bench_cuda_graph_l2_rotate for a collective ``fn`` (every rank launches it, torch.distributed
+    initialized): ms per call, the cross-rank max. Deltas from the single-GPU form: a barrier before the
+    probe and before the timed replay, the warm-up count max-synced across ranks (a collective must never
+    disagree on launch counts), and the warm-up is replays of the captured graph itself, so the timed
+    replay follows on the same stream with no host gap and the window opens at the clock the warm-up
+    settled to. ``len(arg_sets)`` even keeps double-buffered runners parity-invariant across a round.
+    ``fn`` is called as ``fn(*arg_sets[i])``; symmetric state (runners) lives in its closure."""
+    import torch.distributed as dist
+
+    n_sets = len(arg_sets)
+    rounds_timed = max(1, n_timed_calls // n_sets)
+    total_timed_calls = rounds_timed * n_sets
+    for _ in range(3):  # priming: first-launch driver / kernel-load overhead
+        fn(*arg_sets[0])
+    torch.cuda.synchronize()
+    dist.barrier()
+    probe_start, probe_end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    probe_start.record()
+    fn(*arg_sets[0])
+    probe_end.record()
+    torch.cuda.synchronize()
+    est_ms = max(probe_start.elapsed_time(probe_end), 1e-3)
+    timed_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(timed_graph):
+        for _ in range(rounds_timed):
+            for i in range(n_sets):
+                fn(*arg_sets[i])
+    torch.cuda.synchronize()
+    n_warm = torch.tensor([max(1, -(-int(warmup_target_ms) // max(1, int(est_ms * total_timed_calls))))], device="cuda")
+    dist.all_reduce(n_warm, op=dist.ReduceOp.MAX)
+    dist.barrier()
+    for _ in range(int(n_warm.item())):
+        timed_graph.replay()
+    start_evt, end_evt = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    start_evt.record()
+    timed_graph.replay()
+    end_evt.record()
+    torch.cuda.synchronize()
+    t = torch.tensor([start_evt.elapsed_time(end_evt) / total_timed_calls], device="cuda")
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return t.item()
+
+
+def l2_rotate_arg_sets_dist(*tensors):
+    """The rotate protocol's operand sets for a collective: ``_pick_l2_rotate_count`` clones of ``tensors``,
+    the count forced even and rank-MIN'd so every rank records the same launches."""
+    import torch.distributed as dist
+
+    n = max(4, _pick_l2_rotate_count(tensors, {}) & ~1)
+    c = torch.tensor([n], device="cuda", dtype=torch.int64)
+    dist.all_reduce(c, op=dist.ReduceOp.MIN)
+    return [tuple(t.clone() for t in tensors) for _ in range(int(c.item()))]
+
+
 def _clone_l2_rotate_inputs(args, kwargs, n_buffers: int):
     """Clone tensor args AND tensor kwargs ``n_buffers`` times.
 

@@ -1,22 +1,24 @@
-# The dispatch walk: the rows the pull moves, in the GEMM's block order, built on the device. A block is the gated
-# unit of the ragged dim: the swap-AB GEMM's even-split N block of one expert (quack varlen_n_block_rows; block_rows
-# = its tile N) or the grouped-M GEMM's fixed tile_M block (even_split False). Blocks come in the GEMM's plain
-# expert-grouped order (VarlenMTileScheduler over a one-tile fixed dim). A row is owned by its token's
-# local reader with the smallest row (the token's first use in walk order), found from the routing's s_scatter_idx
-# (row -> global slot) and s_reverse_local (slot -> row) over the token's K slots. Count: owned rows and reader
-# references per block (counts2[0 | 1, e * ncols + cid]); scatter: each block's entries at the earlier blocks'
-# counts, as WalkArguments. Both run on GROUP_THREADS-thread CTAs as DispatchWalk's two launches after the routing
-# metadata. Forked from duckpond kernels/moe/dispatch/walk.py (2026-10-22) so quack's dispatch operator stands alone.
-from types import SimpleNamespace
+# The dispatch walk, built on the device from the top-k in one launch (DispatchWalk): this rank's top-k into every
+# rank's gathered buffer, the per-call resets (the flags, the GEMM's tile counter), an NVLink barrier that also
+# orders the token rows published before it, the routing (cu, s_scatter, s_reverse: rows packed per local expert in
+# (source rank, token, k) order) and the walk, as phases over co-resident CTAs separated by grid syncs. The walk is
+# the rows the pull moves, in the GEMM's block order. A block is the gated unit of the ragged dim: the swap-AB
+# GEMM's even-split N block of one expert (quack varlen_n_block_rows; block_rows = its tile N) or the grouped-M
+# GEMM's fixed tile_M block (even_split False). Blocks come in the GEMM's plain expert-grouped order
+# (VarlenMTileScheduler over a one-tile fixed dim). A row is owned by its token's local reader with the smallest row
+# (the token's first use in walk order), found from s_scatter (row -> global slot) and s_reverse (slot -> row) over
+# the token's K slots. Count: owned rows and reader references per block (counts2[0 | 1, e * ncols + cid]);
+# scatter: each block's entries at the earlier blocks' counts, as WalkArguments. Forked from duckpond
+# kernels/moe/dispatch/{walk,prologue}.py (2026-10-22, 2026-11-24) so quack's dispatch operator stands alone.
 from typing import NamedTuple, Optional
 
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils as utils
-import torch
 from cutlass.cutlass_dsl import Int32, Int64
 from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import mlir_namedtuple
+from quack.distributed.ptx import red_add_release_sys_s32_at, st_weak_global_4xu32_at
 from quack.tile_scheduler import (
     PersistenceMode,
     RasterOrderOption,
@@ -24,11 +26,9 @@ from quack.tile_scheduler import (
     VarlenMTileSchedulerArguments,
 )
 from quack.utils import warp_prefix_sum
-
-from quack.gemm_tvm_ffi_utils import varlen_n_block_rows_host
 from quack.varlen_utils import VARLEN_N_GRANULE, varlen_n_block_rows
 
-GROUP_THREADS = 128  # threads per walk CTA
+GROUP_THREADS = 128  # threads per walk CTA = tokens per routing tile
 NUM_WARPS = GROUP_THREADS // 32
 
 
@@ -58,6 +58,9 @@ class MClusterWalk(VarlenMTileScheduler):
     @cute.jit
     def m_cluster_at(self, work_idx: Int32):
         return self._delinearize_work_idx(work_idx)
+
+
+# --- CTA and grid primitives -----------------------------------------------------------------------------------------
 
 
 @cute.jit
@@ -90,6 +93,247 @@ def block_exclusive_scan(
             before = before + scratch[w]
     cute.arch.sync_threads()
     return before + inclusive - val
+
+
+@cute.jit
+def grid_sync(counter: cute.Tensor, tid: Int32, num_ctas: Int32):
+    """Every CTA past this point only once every CTA has arrived (the grid is co-resident). The counter is
+    monotonic, one arrive per CTA per sync, so the target is its next multiple of num_ctas: no reset."""
+    cute.arch.sync_threads()
+    if tid == Int32(0):
+        cute.arch.fence_acq_rel_gpu()
+        old = cute.arch.atomic_add(counter.iterator, Int32(1), sem="acq_rel", scope="gpu")
+        target = (old // num_ctas + Int32(1)) * num_ctas
+        while cute.arch.load(counter.iterator, Int32, sem="acquire", scope="gpu") < target:
+            pass
+    cute.arch.sync_threads()
+
+
+@cute.jit
+def nvlink_barrier(
+    signal: cute.Tensor, signal_base: cute.Tensor, grid_counter: cute.Tensor, cta: Int32, lane: Int32,
+    num_ctas: Int32, W: cutlass.Constexpr[int], syncs_per_call: cutlass.Constexpr[int],
+):
+    """Warp 0 of every CTA, after the call's first grid sync: CTA 0 arrives on every rank's word (release, system
+    scope), every CTA waits on its own rank's word (acquire). The word is monotonic, W arrivals per call, so the
+    target is W x (this call's index + 1); the call's index is the grid counter over the syncs per call."""
+    call = cute.arch.load(grid_counter.iterator, Int32, sem="relaxed", scope="gpu") // (
+        Int32(syncs_per_call) * num_ctas
+    )
+    target = Int32(W) * (call + Int32(1))
+    if (cta == Int32(0)) & (lane < Int32(W)):
+        red_add_release_sys_s32_at(signal_base[lane], Int32(1))
+    cute.arch.sync_warp()
+    if lane == Int32(0):
+        while cute.arch.load(signal.iterator, Int32, sem="acquire", scope="sys") < target:
+            pass
+    cute.arch.sync_warp()
+
+
+# --- the exchange and the resets -------------------------------------------------------------------------------------
+
+
+@cute.jit
+def publish_topk(topk: cute.Tensor, topk_g_base: cute.Tensor, rank: Int32, cta: Int32, num_ctas: Int32, tid: Int32,
+                 W: cutlass.Constexpr[int]):
+    """This rank's (T * K,) top-k into every rank's gathered buffer at block `rank` (its own included), 4 per store."""
+    n = Int32(cute.size(topk))
+    i = (cta * Int32(GROUP_THREADS) + tid) * Int32(4)
+    while i < n:
+        for w in cutlass.range_constexpr(W):
+            st_weak_global_4xu32_at(
+                topk_g_base[w] + Int64(rank * n + i) * Int64(4), topk[i], topk[i + 1], topk[i + 2], topk[i + 3]
+            )
+        i = i + num_ctas * Int32(GROUP_THREADS * 4)
+
+
+@cute.jit
+def zero_flags(flags: cute.Tensor, sem: cute.Tensor, cta: Int32, num_ctas: Int32, tid: Int32):
+    """The per-call resets: the dispatch flags and the GEMM's tile counter."""
+    ncols = Int32(cute.size(flags, mode=[1]))
+    n = Int32(cute.size(flags))
+    i = cta * Int32(GROUP_THREADS) + tid
+    while i < n:
+        flags[(i // ncols, i % ncols)] = Int32(0)
+        i = i + num_ctas * Int32(GROUP_THREADS)
+    if (cta == Int32(0)) & (tid == Int32(0)):
+        sem[0] = Int32(0)
+
+
+# --- the routing: tiles of GROUP_THREADS tokens, one token (K slots) per thread ---------------------------------------
+
+
+@cute.jit
+def tile_slot_masks(
+    topk_g: cute.Tensor, tile: Int32, tid: Int32, lane: Int32, warp: Int32, rank: Int32, n_tokens: Int32,
+    masks: cute.Tensor, local: cute.Tensor, K: cutlass.Constexpr[int], E_local: cutlass.Constexpr[int],
+) -> Int32:
+    """Thread tid's token (tile * GROUP_THREADS + tid): local[k] = its slot k's local expert, returned = the bitmask
+    of the slots destined to this rank; masks[(e, warp)] (smem, E_local * NUM_WARPS words) = the tile's tokens of
+    expert e, one bit per lane, so a slot's rank among the tile's slots of its expert (f order) is a popcount."""
+    token = tile * Int32(GROUP_THREADS) + tid
+    valid = token < n_tokens
+    tc = token
+    if not valid:
+        tc = Int32(0)  # clamped, unconditional loads
+    i = tid
+    while i < Int32(E_local * NUM_WARPS):
+        masks[i] = Int32(0)
+        i = i + Int32(GROUP_THREADS)
+    cute.arch.sync_threads()
+    mask = Int32(0)
+    for k in cutlass.range_constexpr(K):
+        e = topk_g[tc * Int32(K) + Int32(k)] - rank * Int32(E_local)
+        local[k] = e
+        if valid & (e >= Int32(0)) & (e < Int32(E_local)):
+            mask = mask | Int32(1 << k)
+            cute.arch.atomic_or(masks.iterator + e * Int32(NUM_WARPS) + warp, Int32(1) << lane, sem="relaxed", scope="cta")
+    cute.arch.sync_threads()
+    return mask
+
+
+@cute.jit
+def slot_rank(masks: cute.Tensor, e: Int32, lane: Int32, warp: Int32) -> Int32:
+    """Rank of this lane's token among the tile's tokens of expert e (tile_slot_masks' masks)."""
+    r = cute.arch.popc(masks[e * Int32(NUM_WARPS) + warp] & ((Int32(1) << lane) - Int32(1)))
+    for w in cutlass.range_constexpr(NUM_WARPS):
+        if Int32(w) < warp:
+            r = r + cute.arch.popc(masks[e * Int32(NUM_WARPS) + Int32(w)])
+    return r
+
+
+@cute.jit
+def count_phase(
+    topk_g: cute.Tensor, counts: cute.Tensor, counts2: cute.Tensor, rank: Int32, n_tokens: Int32, cta: Int32,
+    num_ctas: Int32, tid: Int32, lane: Int32, warp: Int32, masks: cute.Tensor, K: cutlass.Constexpr[int],
+    E_local: cutlass.Constexpr[int],
+):
+    """counts[e, tile] = the tile's slots of local expert e destined to this rank; counts2 (the walk's per-block
+    owner / reference counts the emit phase accumulates) zeroed."""
+    local = cute.make_rmem_tensor(cute.make_layout(K), Int32)
+    n_tiles = Int32(cute.size(counts, mode=[1]))
+    n2 = Int32(cute.size(counts2, mode=[1]))
+    i = cta * Int32(GROUP_THREADS) + tid
+    while i < n2:
+        counts2[0, i] = Int32(0)
+        counts2[1, i] = Int32(0)
+        i = i + num_ctas * Int32(GROUP_THREADS)
+    tile = cta
+    while tile < n_tiles:
+        tile_slot_masks(topk_g, tile, tid, lane, warp, rank, n_tokens, masks, local, K, E_local)
+        e = tid
+        while e < Int32(E_local):
+            total = Int32(0)
+            for w in cutlass.range_constexpr(NUM_WARPS):
+                total = total + cute.arch.popc(masks[e * Int32(NUM_WARPS) + Int32(w)])
+            counts[e, tile] = total
+            e = e + Int32(GROUP_THREADS)
+        cute.arch.sync_threads()
+        tile = tile + num_ctas
+
+
+@cute.jit
+def expert_tile_sums(
+    counts: cute.Tensor, upto: Int32, lane: Int32, warp: Int32, out_s: cute.Tensor, E_local: cutlass.Constexpr[int]
+):
+    """out_s[e] = sum of counts[e, j] over tiles j < upto: warp w takes experts w, w + NUM_WARPS, ..., lanes over
+    tiles; per 32-tile pass every expert's load is issued before any is consumed (one round trip)."""
+    EPW = (E_local + NUM_WARPS - 1) // NUM_WARPS
+    acc = cute.make_rmem_tensor(cute.make_layout(EPW), Int32)
+    for i in cutlass.range_constexpr(EPW):
+        acc[i] = Int32(0)
+    for p in cutlass.range((upto + Int32(31)) // Int32(32), unroll=1):
+        j = p * Int32(32) + lane
+        v = cute.make_rmem_tensor(cute.make_layout(EPW), Int32)
+        for i in cutlass.range_constexpr(EPW):
+            e = Int32(i * NUM_WARPS) + warp
+            jc, ec = j, e
+            if (j >= upto) | (e >= Int32(E_local)):
+                jc = Int32(0)
+            if e >= Int32(E_local):
+                ec = Int32(0)
+            v[i] = counts[ec, jc]  # clamped, unconditional: the loads overlap
+        for i in cutlass.range_constexpr(EPW):
+            e = Int32(i * NUM_WARPS) + warp
+            if (j < upto) & (e < Int32(E_local)):
+                acc[i] = acc[i] + v[i]
+    for i in cutlass.range_constexpr(EPW):
+        e = Int32(i * NUM_WARPS) + warp
+        total = acc[i]
+        for s in cutlass.range_constexpr(5):
+            total = total + cute.arch.shuffle_sync_bfly(total, offset=1 << s)
+        if (lane == Int32(0)) & (e < Int32(E_local)):
+            out_s[e] = total
+
+
+@cute.jit
+def emit_phase(
+    topk_g: cute.Tensor, counts: cute.Tensor, cu: cute.Tensor, s_reverse: cute.Tensor, s_scatter: cute.Tensor,
+    counts2: cute.Tensor, cu_tiles: Optional[cute.Tensor], rank: Int32, n_tokens: Int32, cta: Int32,
+    num_ctas: Int32, tid: Int32, lane: Int32, warp: Int32, masks: cute.Tensor, cu_s: cute.Tensor,
+    before_s: cute.Tensor, block_rows: cutlass.Constexpr[int], K: cutlass.Constexpr[int],
+    E_local: cutlass.Constexpr[int], even_split: cutlass.Constexpr[bool],
+):
+    """The routing: cu (CTA 0; cu_tiles, the GEMM's per-expert block prefix, with it) and per tile s_reverse /
+    s_scatter; plus the walk's per-block counts from the token side: a present token's owner row is its lowest
+    local expert's row, so counts2[0, e * ncols + cid] += 1 and counts2[1, ...] += its local slots for the owner
+    row's block. cu_s / before_s = (E_local + 1,) smem: the expert offsets (cu_s[E_local] = total rows) and the
+    tile's per-expert prefixes."""
+    local = cute.make_rmem_tensor(cute.make_layout(K), Int32)
+    n_tiles = Int32(cute.size(counts, mode=[1]))
+    n2 = Int32(cute.size(counts2, mode=[1]))
+    ncols = n2 // Int32(E_local)
+    expert_tile_sums(counts, n_tiles, lane, warp, cu_s, E_local)  # per-expert totals
+    cute.arch.sync_threads()
+    if warp == Int32(0):  # exclusive prefix over experts: warp scan, lanes over experts
+        carry = Int32(0)
+        for p in cutlass.range_constexpr((E_local + 1 + 31) // 32):
+            e = Int32(p * 32) + lane
+            v = Int32(0)
+            if e < Int32(E_local):
+                v = cu_s[e]
+            inclusive = warp_prefix_sum(v, lane)
+            if e <= Int32(E_local):
+                cu_s[e] = carry + inclusive - v
+            carry = carry + cute.arch.shuffle_sync(inclusive, 31)
+    cute.arch.sync_threads()
+    if cta == Int32(0):
+        e = tid
+        while e <= Int32(E_local):
+            cu[e] = cu_s[e]
+            if cutlass.const_expr(cu_tiles is not None):
+                prefix = Int32(0)
+                for j in cutlass.range(e, unroll=1):
+                    prefix = prefix + cute.ceil_div(cu_s[j + 1] - cu_s[j], block_rows)
+                cu_tiles[e] = prefix
+            e = e + Int32(GROUP_THREADS)
+    tile = cta
+    while tile < n_tiles:
+        expert_tile_sums(counts, tile, lane, warp, before_s, E_local)  # prefixes over the tiles before this one
+        mask = tile_slot_masks(topk_g, tile, tid, lane, warp, rank, n_tokens, masks, local, K, E_local)
+        token = tile * Int32(GROUP_THREADS) + tid
+        e_min, row_min = Int32(0x7FFFFFFF), Int32(0)
+        for k in cutlass.range_constexpr(K):
+            if ((mask >> k) & Int32(1)) == Int32(1):
+                e_k = local[k]
+                f = token * Int32(K) + Int32(k)
+                row = cu_s[e_k] + before_s[e_k] + slot_rank(masks, e_k, lane, warp)
+                s_reverse[f] = row
+                s_scatter[row] = f
+                if e_k < e_min:
+                    e_min, row_min = e_k, row
+        if mask != Int32(0):  # the owner row's block gets this token's owned row and its reader references
+            b = Int32(block_rows)
+            if cutlass.const_expr(even_split):
+                b = varlen_n_block_rows(cu_s[e_min + Int32(1)] - cu_s[e_min], block_rows, VARLEN_N_GRANULE)
+            slot = e_min * ncols + (row_min - cu_s[e_min]) // b
+            cute.arch.atomic_add(counts2.iterator + slot, Int32(1), sem="relaxed", scope="gpu")
+            cute.arch.atomic_add(counts2.iterator + n2 + slot, cute.arch.popc(mask), sem="relaxed", scope="gpu")
+        cute.arch.sync_threads()
+        tile = tile + num_ctas
+
+
+# --- the walk --------------------------------------------------------------------------------------------------------
 
 
 @cute.jit
@@ -171,73 +415,6 @@ def owner_test(
 
 
 @cute.jit
-def walk_count_phase(
-    sched_params,
-    slot_of_row: cute.Tensor,
-    s_reverse: cute.Tensor,
-    topk: cute.Tensor,
-    cu: cute.Tensor,
-    flags: cute.Tensor,
-    counts2: cute.Tensor,
-    rank: Int32,
-    cta: Int32,
-    num_ctas: Int32,
-    tid: Int32,
-    lane: Int32,
-    warp: Int32,
-    scratch: cute.Tensor,
-    block_rows: cutlass.Constexpr[int],
-    topk_k: cutlass.Constexpr[int],
-    cu_tiles: Optional[cute.Tensor] = None,  # (E + 1,) int32 out: the GEMM's block prefix (the scale lane's slots)
-    even_split: cutlass.Constexpr[bool] = True,
-):
-    """counts2[0 | 1, e * ncols + cid] = the block's owned rows / reader references, one CTA per scheduled block;
-    slots past an expert's blocks are zeroed (the scatter phase sums whole experts). cu_tiles: CTA 0 writes the
-    per-expert prefix of ceil(rows / block_rows), the GEMM's cu_tiles_n (gemm_tvm_ffi_utils.compute_cu_tiles_m)."""
-    PASSES = (block_rows + GROUP_THREADS - 1) // GROUP_THREADS
-    reader_flags = cute.make_rmem_tensor(cute.make_layout(topk_k), Int32)
-    reader_rows = cute.make_rmem_tensor(cute.make_layout(topk_k), Int32)
-    num_experts = Int32(cute.size(cu) - 1)
-    n2 = Int32(cute.size(counts2, mode=[1]))
-    ncols = n2 // num_experts
-    i = cta * Int32(GROUP_THREADS) + tid
-    while i < n2:
-        e, c = i // ncols, i % ncols
-        if c >= cute.ceil_div(cu[e + 1] - cu[e], block_rows):
-            counts2[0, i] = Int32(0)
-            counts2[1, i] = Int32(0)
-        i = i + num_ctas * Int32(GROUP_THREADS)
-    if cutlass.const_expr(cu_tiles is not None):
-        if cta == Int32(0):
-            e = tid
-            while e <= num_experts:
-                prefix = Int32(0)
-                for j in cutlass.range(e, unroll=1):
-                    prefix = prefix + cute.ceil_div(cu[j + 1] - cu[j], block_rows)
-                cu_tiles[e] = prefix
-                e = e + Int32(GROUP_THREADS)
-    sched = MClusterWalk.create(sched_params)
-    q = cta
-    tile = sched.m_cluster_at(q)
-    while tile.is_valid_tile:
-        expert, cid = tile.tile_idx[3], tile.tile_idx[1]
-        owned_t, refs_t = Int32(0), Int32(0)
-        for p in cutlass.range_constexpr(PASSES):
-            _, _, _, owned, refs = owner_test(
-                expert, cid, Int32(p * GROUP_THREADS) + tid, slot_of_row, s_reverse, topk, cu, flags, rank,
-                num_experts, reader_flags, reader_rows, block_rows, topk_k, even_split=even_split,
-            )
-            owned_t, refs_t = owned_t + owned, refs_t + refs
-        owned_t = block_sum(owned_t, scratch, warp, lane, NUM_WARPS)
-        refs_t = block_sum(refs_t, scratch, warp, lane, NUM_WARPS)
-        if tid == Int32(0):
-            counts2[0, expert * ncols + cid] = owned_t
-            counts2[1, expert * ncols + cid] = refs_t
-        q = q + num_ctas
-        tile = sched.m_cluster_at(q)
-
-
-@cute.jit
 def walk_scatter_phase(
     sched_params,
     slot_of_row: cute.Tensor,
@@ -262,7 +439,7 @@ def walk_scatter_phase(
     peer_sf_base: Optional[cute.Tensor] = None,
     sf_bytes_per_token: Int32 = Int32(0),
     sf_atom_rows: cutlass.Constexpr[int] = 0,
-    cu_tiles: Optional[cute.Tensor] = None,  # the count phase's block prefix (sf_atom_rows > 0)
+    cu_tiles: Optional[cute.Tensor] = None,  # the emit phase's block prefix (sf_atom_rows > 0)
     even_split: cutlass.Constexpr[bool] = True,
 ):
     """Each block's owned rows at (walk-earlier blocks' owned rows + rank among its owners), in row order, from
@@ -309,7 +486,6 @@ def walk_scatter_phase(
             c = c + Int32(GROUP_THREADS)
         row_offset = block_sum(row_offset, scratch, warp, lane, NUM_WARPS)
         ref_offset = block_sum(ref_offset, scratch, warp, lane, NUM_WARPS)
-        b = block_rows_of(cu, expert, block_rows, even_split)
         tests = []  # every pass's owner_test first (static passes, load chains overlapping), then the scans
         for p in cutlass.range_constexpr(PASSES):
             tests.append(owner_test(
@@ -361,138 +537,70 @@ def walk_scheduler_args(slot_of_row, cu_seqlens, block_rows):
     )
 
 
-class DispatchWalk:
-    """The builder (after the routing metadata): count, then scatter, each one launch of num_ctas CTAs."""
-
-    def __init__(self, topk_k, block_rows, num_ctas, sf_atom_rows=0, even_split=True):
-        self.topk_k, self.block_rows, self.num_ctas = topk_k, block_rows, num_ctas
-        self.sf_atom_rows = sf_atom_rows  # block-scaled: SF rows per block slot (0: no scales)
-        self.even_split = even_split  # even-split N blocks (swap-AB) or fixed tile_M blocks (grouped M)
-
-    @cute.jit
-    def __call__(
-        self, slot_of_row, s_reverse, topk, cu_seqlens, flags, counts2, peer_base, walk: WalkArguments,
-        rank: Int32, tokens_per_rank: Int32, bytes_per_token: Int32, stream, peer_sf_base=None,
-        sf_bytes_per_token: Int32 = Int32(0), cu_tiles=None,
-    ):
-        sched = lambda: walk_scheduler_args(slot_of_row, cu_seqlens, self.block_rows)
-        launch = dict(grid=[self.num_ctas, 1, 1], block=[GROUP_THREADS, 1, 1], smem=256, stream=stream)
-        self.count_kernel(
-            sched(), slot_of_row, s_reverse, topk, cu_seqlens, flags, counts2, rank, cu_tiles
-        ).launch(**launch)
-        self.scatter_kernel(  # one scheduler params per launch: a launch rebinds the params' tensors to its arguments
-            sched(), slot_of_row, s_reverse, topk, cu_seqlens, flags, counts2, peer_base, walk, rank,
-            tokens_per_rank, bytes_per_token, peer_sf_base, sf_bytes_per_token, cu_tiles,
-        ).launch(**launch)
-
-    @cute.kernel
-    def count_kernel(
-        self, sched_params, slot_of_row, s_reverse, topk, cu_seqlens, flags, counts2, rank: Int32, cu_tiles
-    ):
-        tid, _, _ = cute.arch.thread_idx()
-        cta, _, _ = cute.arch.block_idx()
-        scratch = utils.SmemAllocator().allocate_tensor(Int32, cute.make_layout(NUM_WARPS), byte_alignment=16)
-        walk_count_phase(
-            sched_params, slot_of_row, s_reverse, topk, cu_seqlens, flags, counts2, rank, Int32(cta),
-            Int32(self.num_ctas), tid, tid % 32, tid // 32, scratch, self.block_rows, self.topk_k, cu_tiles,
-            self.even_split,
-        )
-
-    @cute.kernel
-    def scatter_kernel(
-        self, sched_params, slot_of_row, s_reverse, topk, cu_seqlens, flags, counts2, peer_base,
-        walk: WalkArguments, rank: Int32, tokens_per_rank: Int32, bytes_per_token: Int32, peer_sf_base,
-        sf_bytes_per_token: Int32, cu_tiles,
-    ):
-        tid, _, _ = cute.arch.thread_idx()
-        cta, _, _ = cute.arch.block_idx()
-        scratch = utils.SmemAllocator().allocate_tensor(Int32, cute.make_layout(NUM_WARPS), byte_alignment=16)
-        walk_scatter_phase(
-            sched_params, slot_of_row, s_reverse, topk, cu_seqlens, flags, counts2, peer_base, walk, rank,
-            tokens_per_rank, bytes_per_token, Int32(cta), Int32(self.num_ctas), tid, tid % 32, tid // 32, scratch,
-            self.block_rows, self.topk_k, peer_sf_base, sf_bytes_per_token, self.sf_atom_rows, cu_tiles,
-            self.even_split,
-        )
-
-
-# --- host ------------------------------------------------------------------------------------------------------------
-
-
-def flag_targets(cu_seqlens, flags, block_rows, even_split=True):
-    """What the flags read once every row has landed: rows of each (expert, block) in flags' shape, the blocks the
-    swap-AB GEMM's even-split N blocks (block_rows = its tile N) or varlen_m's fixed tile_M blocks."""
-    rows = (cu_seqlens[1:] - cu_seqlens[:-1]).to(torch.int64)[:, None]
-    b = varlen_n_block_rows_host(rows, block_rows, VARLEN_N_GRANULE) if even_split else torch.full_like(rows, block_rows)
-    first = torch.arange(flags.shape[1], device=flags.device)[None, :] * b
-    return torch.minimum((rows - first).clamp_(min=0), b).to(torch.int32)
-
-
 def sf_atom_rows_of(block_rows):
     """SF rows one block slot owns: the GEMM's SF window in whole 128-row atoms (GemmSm100.sfb_window_atoms)."""
     return -(-block_rows // 128) * 128
 
 
-def make_walk_buffers(W, T_local, max_rows, flags, block_rows, sf=False):
-    """The walk's tensors, sized to their bounds (owned rows <= W * T_local, references <= max_rows): args = the
-    WalkArguments the kernels take, plus the fields the host uses (flags (E_local, blocks) int32 with counters =
-    its flat view, block_rows; sf: sf_atom_rows and cu_tiles = the GEMM's per-expert block prefix the count phase
-    writes, the SF slot index)."""
-    dev = flags.device
-    i32 = lambda n: torch.empty(n, dtype=torch.int32, device=dev)
-    i64 = lambda n: torch.empty(n, dtype=torch.int64, device=dev)
-    args = WalkArguments(
-        src_address=i64(W * T_local), gate_ptr=i32(W * T_local + 1), gates=i32(max_rows), num_rows=i32(1),
-        dst_row=i32(max_rows),
-        src_sf_address=i64(W * T_local) if sf else None, dst_sf_row=i32(max_rows) if sf else None,
-    )
-    return SimpleNamespace(
-        **args._asdict(), args=args, flags=flags, counters=flags.view(-1), block_rows=block_rows,
-        sf_atom_rows=sf_atom_rows_of(block_rows) if sf else 0, cu_tiles=i32(flags.shape[0] + 1) if sf else None,
-    )
+class DispatchWalk:
+    """The one launch: num_ctas CTAs of GROUP_THREADS threads, all co-resident (the grid syncs); the phases are
+    grid-stride sweeps, so the count is a throughput choice (the SM count: the kernel runs alone on the stream)."""
 
+    num_grid_syncs = 3  # per call, in kernel(): the barrier reads the call's index off the grid counter
 
-def make_dispatch_walk(
-    topk_idx_g, s_scatter, s_reverse, rank, cu_seqlens, x_peer_bufs, block_rows, x_sf_peer_bufs=None,
-    even_split=True,
-):
-    """GPU-built walk in the GEMM's order: (build, walk). build() launches count + scatter in one host call, no
-    sync; walk = make_walk_buffers' namespace plus targets = flag_targets(...) (the flags once every row has landed).
-    s_scatter / s_reverse = the routing's s_scatter_idx / s_reverse_local (s_scatter's length bounds the GEMM's
-    rows); cu_seqlens = the GEMM's; block_rows = its tile along the ragged dim (even_split: the swap-AB GEMM's
-    even-split N blocks, else the grouped-M GEMM's fixed tile_M blocks); x_peer_bufs = every rank's x buffer;
-    x_sf_peer_bufs (block-scaled formats: every rank's (T, K / sf_vec_size) 1-byte scale rows) adds the scale lane.
-    Only the buffers' addresses are taken: the caller keeps the symmetric allocations alive while peers pull."""
-    W, T_local, K = topk_idx_g.shape
-    dev = s_scatter.device
-    topk = topk_idx_g.reshape(-1)
-    peer_base = torch.tensor([b.data_ptr() for b in x_peer_bufs], dtype=torch.int64, device=dev)
-    row_bytes = x_peer_bufs[rank].shape[1] * x_peer_bufs[rank].element_size()
-    assert topk.dtype == s_scatter.dtype == s_reverse.dtype == cu_seqlens.dtype == torch.int32
-    # an expert reads each token at most once, so its blocks <= the tokens'
-    flags = torch.zeros(cu_seqlens.numel() - 1, -(-W * T_local // block_rows), dtype=torch.int32, device=dev)
-    counts2 = torch.empty(2, flags.numel(), dtype=torch.int32, device=dev)
-    sf = x_sf_peer_bufs is not None
-    walk = make_walk_buffers(W, T_local, s_scatter.numel(), flags, block_rows, sf)
-    walk.targets = flag_targets(cu_seqlens, flags, block_rows, even_split)
+    def __init__(self, topk_k, num_experts, world, block_rows, num_ctas, sf_atom_rows=0, even_split=True):
+        self.topk_k, self.num_experts, self.world = topk_k, num_experts, world
+        self.block_rows, self.num_ctas = block_rows, num_ctas
+        self.sf_atom_rows = sf_atom_rows  # block-scaled: SF rows per block slot (0: no scales)
+        self.even_split = even_split  # even-split N blocks (swap-AB) or fixed tile_M blocks (grouped M)
+        self.smem_bytes = 4 * (NUM_WARPS + num_experts * NUM_WARPS + 2 * (num_experts + 1)) + 256
 
-    kernel = DispatchWalk(
-        K, block_rows, torch.cuda.get_device_properties(dev).multi_processor_count, walk.sf_atom_rows, even_split
-    )
-    v = lambda: make_fake_tensor(Int32, (cute.sym_int(),), leading_dim=0, divisibility=1)
-    v64 = lambda: make_fake_tensor(Int64, (cute.sym_int(),), leading_dim=0, divisibility=1)
-    m = lambda: make_fake_tensor(Int32, (cute.sym_int(), cute.sym_int()), leading_dim=1, divisibility=1)
-    stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-    sf_fake, sf_arg, sf_row_bytes = None, None, 0
-    if sf:
-        sf_fake = v64()
-        sf_arg = torch.tensor([b.data_ptr() for b in x_sf_peer_bufs], dtype=torch.int64, device=dev)
-        sf_row_bytes = x_sf_peer_bufs[rank].shape[1] * x_sf_peer_bufs[rank].element_size()
-    fn = cute.compile(
-        kernel, v(), v(), v(), v(), m(), m(), v64(), fake_walk_arguments(sf), Int32(rank), Int32(T_local),
-        Int32(row_bytes), stream, sf_fake, Int32(sf_row_bytes), v() if sf else None, options="--enable-tvm-ffi",
-    )
-    build = lambda: fn(
-        s_scatter, s_reverse, topk, cu_seqlens, flags, counts2, peer_base, walk.args, rank, T_local, row_bytes,
-        sf_arg, sf_row_bytes, walk.cu_tiles,
-    )
-    return build, walk
+    @cute.jit
+    def __call__(
+        self, topk, topk_g, topk_g_base, signal, signal_base, grid_counter, counts, counts2, cu, s_reverse,
+        s_scatter, flags, sem, peer_base, walk: WalkArguments, rank: Int32, tokens_per_rank: Int32,
+        bytes_per_token: Int32, stream, peer_sf_base=None, sf_bytes_per_token: Int32 = Int32(0), cu_tiles=None,
+    ):
+        sched = walk_scheduler_args(s_scatter, cu, self.block_rows)
+        self.kernel(
+            sched, topk, topk_g, topk_g_base, signal, signal_base, grid_counter, counts, counts2, cu, s_reverse,
+            s_scatter, flags, sem, peer_base, walk, rank, tokens_per_rank, bytes_per_token, peer_sf_base,
+            sf_bytes_per_token, cu_tiles,
+        ).launch(grid=[self.num_ctas, 1, 1], block=[GROUP_THREADS, 1, 1], smem=self.smem_bytes, stream=stream)
+
+    @cute.kernel
+    def kernel(
+        self, sched_params, topk, topk_g, topk_g_base, signal, signal_base, grid_counter, counts, counts2, cu,
+        s_reverse, s_scatter, flags, sem, peer_base, walk: WalkArguments, rank: Int32, tokens_per_rank: Int32,
+        bytes_per_token: Int32, peer_sf_base, sf_bytes_per_token: Int32, cu_tiles,
+    ):
+        tid, _, _ = cute.arch.thread_idx()
+        cta, _, _ = cute.arch.block_idx()
+        warp, lane = tid // 32, tid % 32
+        num_ctas, _, _ = cute.arch.grid_dim()  # the count the launch syncs on
+        K, E, W = self.topk_k, self.num_experts, self.world
+        smem = utils.SmemAllocator()
+        scratch = smem.allocate_tensor(Int32, cute.make_layout(NUM_WARPS), byte_alignment=16)
+        masks = smem.allocate_tensor(Int32, cute.make_layout(E * NUM_WARPS), byte_alignment=16)
+        cu_s = smem.allocate_tensor(Int32, cute.make_layout(E + 1), byte_alignment=16)
+        before_s = smem.allocate_tensor(Int32, cute.make_layout(E + 1), byte_alignment=16)
+        n_tokens = tokens_per_rank * Int32(W)
+        publish_topk(topk, topk_g_base, rank, cta, num_ctas, tid, W)
+        zero_flags(flags, sem, cta, num_ctas, tid)
+        grid_sync(grid_counter, tid, num_ctas)  # every CTA's stores issued
+        if warp == Int32(0):
+            cute.arch.fence_acq_rel_sys()
+            nvlink_barrier(signal, signal_base, grid_counter, cta, lane, num_ctas, W, self.num_grid_syncs)
+        cute.arch.sync_threads()
+        count_phase(topk_g, counts, counts2, rank, n_tokens, cta, num_ctas, tid, lane, warp, masks, K, E)
+        grid_sync(grid_counter, tid, num_ctas)
+        emit_phase(
+            topk_g, counts, cu, s_reverse, s_scatter, counts2, cu_tiles, rank, n_tokens, cta, num_ctas, tid, lane,
+            warp, masks, cu_s, before_s, self.block_rows, K, E, self.even_split,
+        )
+        grid_sync(grid_counter, tid, num_ctas)
+        walk_scatter_phase(
+            sched_params, s_scatter, s_reverse, topk_g, cu, flags, counts2, peer_base, walk, rank, tokens_per_rank,
+            bytes_per_token, cta, num_ctas, tid, lane, warp, scratch, self.block_rows, K, peer_sf_base,
+            sf_bytes_per_token, self.sf_atom_rows, cu_tiles, self.even_split,
+        )
