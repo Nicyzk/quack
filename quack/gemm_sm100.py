@@ -542,7 +542,8 @@ class GemmSm100(GemmTmaBase):
             # (16-granular), so the tile only bounds the window: any multiple of 16.
             n_granule = 16 if varlen_args.mCuSeqlensN is not None else 64
             assert (
-                self.cta_tile_shape_mnk[1] % n_granule == 0 and 64 <= self.cta_tile_shape_mnk[1] <= 256
+                self.cta_tile_shape_mnk[1] % n_granule == 0
+                and 64 <= self.cta_tile_shape_mnk[1] <= 256
             ), (
                 f"blockscaled tile_n must be a multiple of {n_granule} in [64, 256], "
                 f"got {self.cta_tile_shape_mnk[1]}"
@@ -850,8 +851,12 @@ class GemmSm100(GemmTmaBase):
             self.a_unpack, self.b_unpack = False, False
         self.a_smem_dtype = cutlass.Uint8 if self.a_unpack else self.a_dtype
         self.b_smem_dtype = cutlass.Uint8 if self.b_unpack else self.b_dtype
-        self.d_stage_dtype = mD.element_type if mD is not None else None  # what the epilogue warps stage
-        self.d_dtype = mD_comm.element_type if mD_comm is not None else self.d_stage_dtype  # the output
+        self.d_stage_dtype = (
+            mD.element_type if mD is not None else None
+        )  # what the epilogue warps stage
+        self.d_dtype = (
+            mD_comm.element_type if mD_comm is not None else self.d_stage_dtype
+        )  # the output
         self.c_dtype = mC.element_type if mC is not None else None
         self.sf_dtype: Optional[Type[cutlass.Numeric]] = (
             mSFA.element_type if mSFA is not None else None
@@ -885,14 +890,21 @@ class GemmSm100(GemmTmaBase):
             assert not any(
                 getattr(epilogue_args, op.name, None) is not None
                 and not op.is_tile_store()
-                and getattr(op, "fn_port", None) != "scalar"  # a scalar reads no row / block coordinate
-                and getattr(op, "quant_output", "D") == "D"  # an aux's quantize codec offsets by block itself
+                and getattr(op, "fn_port", None)
+                != "scalar"  # a scalar reads no row / block coordinate
+                and getattr(op, "quant_output", "D")
+                == "D"  # an aux's quantize codec offsets by block itself
                 # row vectors and row-vector sinks fold the block's column origin themselves
-                and not (getattr(op, "dim", None) == 1 and getattr(op, "fn_port", None) in ("row", "sink"))
+                and not (
+                    getattr(op, "dim", None) == 1
+                    and getattr(op, "fn_port", None) in ("row", "sink")
+                )
                 # column vectors index M (the weight's rows, per sequence), which is not ragged
                 and not (getattr(op, "dim", None) == 0 and getattr(op, "fn_port", None) == "col")
                 for op in getattr(type(self), "_epi_ops", ())
-            ), "varlen_n supports tile-store ops, scalars, their quantize codecs, row and column vectors"
+            ), (
+                "varlen_n supports tile-store ops, scalars, their quantize codecs, row and column vectors"
+            )
 
         # Setup attributes that dependent on gemm inputs
         self._setup_attributes(epilogue_args, varlen_args)
@@ -1547,7 +1559,9 @@ class GemmSm100(GemmTmaBase):
                             varlen_manager.offset_batch_SFB(mSFB_chunks, batch_idx),
                         )
                     gSFB_chunks = cute.local_tile(
-                        gSFB_atoms, (256, self.sfb_chunks_per_ktile, self.sfb_window_atoms), (0, None, 0)
+                        gSFB_atoms,
+                        (256, self.sfb_chunks_per_ktile, self.sfb_window_atoms),
+                        (0, None, 0),
                     )
 
                 # Partition global tensor for TiledMMA_A/B/D
@@ -2469,7 +2483,9 @@ class GemmSm100(GemmTmaBase):
         a_base, b_base = a_stage0.iterator.toint(), b_stage0.iterator.toint()
         a_stage_bytes = cute.size_in_bytes(self.a_dtype, a_stage0.layout)
         b_stage_bytes = cute.size_in_bytes(self.b_dtype, b_stage0.layout)
-        k_blk_bytes = self.mma_inst_shape_mnk[2] * self.a_dtype.width // 8  # one MMA's K inside the swizzle row
+        k_blk_bytes = (
+            self.mma_inst_shape_mnk[2] * self.a_dtype.width // 8
+        )  # one MMA's K inside the swizzle row
         num_k_blocks = self.cta_tile_shape_mnk[2] // self.mma_inst_shape_mnk[2]
         fp4 = const_expr(self.a_dtype is cutlass.Float4E2M1FN)
         umma_blockscaled = umma_mxf4nvf4_2sm if fp4 else umma_mxf8f6f4_2sm
@@ -2480,7 +2496,10 @@ class GemmSm100(GemmTmaBase):
                 idesc = instr_desc_mxf8f6f4(n_inst, self.mma_tiler[0])
         else:
             idesc = instr_desc_f16(
-                n_inst, self.mma_tiler[0], self.a_dtype == cutlass.BFloat16, self.b_dtype == cutlass.BFloat16
+                n_inst,
+                self.mma_tiler[0],
+                self.a_dtype == cutlass.BFloat16,
+                self.b_dtype == cutlass.BFloat16,
             )
         peek_ab_full_status = Boolean(True)
         if 0 < k_tile_cnt and is_leader_cta:
@@ -2499,7 +2518,9 @@ class GemmSm100(GemmTmaBase):
                 for k_blk in cutlass.range_constexpr(num_k_blocks):
                     accumulate = Int32(1)
                     if const_expr(k_blk == 0):
-                        accumulate = cutlass.min(k_tile, Int32(1))  # the tile's first MMA overwrites
+                        accumulate = cutlass.min(
+                            k_tile, Int32(1)
+                        )  # the tile's first MMA overwrites
                     with cute.arch.elect_one():
                         if const_expr(self.blockscaled):
                             umma_blockscaled(

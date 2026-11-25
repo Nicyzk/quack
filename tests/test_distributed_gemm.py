@@ -176,12 +176,16 @@ def _run_rank():
         acc = a_full_ref.float() @ b.float().T
         accq = acc.to(dtype).float()  # the baseline's one rounding
         with runner.prepare(a_shard) as (a_full, ag_args):
-            swiglu.gemm(a_full, b, None, None, epi_args=dict(mAuxOut=postact), dist_op_args=ag_args, **kw)
+            swiglu.gemm(
+                a_full, b, None, None, epi_args=dict(mAuxOut=postact), dist_op_args=ag_args, **kw
+            )
         torch.cuda.synchronize(device)
         ref = F.silu(acc[:, 0::2]) * acc[:, 1::2]
         check(f"AG+swiglu iter={it}", postact, ref, F.silu(accq[:, 0::2]) * accq[:, 1::2])
         with runner.prepare(a_shard) as (a_full, ag_args):
-            rope_epi.gemm(a_full, b, d, None, epi_args=dict(table=table), dist_op_args=ag_args, **kw)
+            rope_epi.gemm(
+                a_full, b, d, None, epi_args=dict(table=table), dist_op_args=ag_args, **kw
+            )
         torch.cuda.synchronize(device)
         cos, sin = table.float()[:, 0::2], table.float()[:, 1::2]
 
@@ -196,7 +200,18 @@ def _run_rank():
             with runner.prepare(a_shard) as (a_full, ag_args):
                 # the 2-CTA tile is 256 rows: a 64-row CTA half would split SF vectors across threads
                 quack_gemm(
-                    a_full, b, d_q, None, None, 256, 256, 2, 1, dist_op=AllGather(), dist_op_args=ag_args, SFD=sfd
+                    a_full,
+                    b,
+                    d_q,
+                    None,
+                    None,
+                    256,
+                    256,
+                    2,
+                    1,
+                    dist_op=AllGather(),
+                    dist_op_args=ag_args,
+                    SFD=sfd,
                 )
             torch.cuda.synchronize(device)
             scale = unpack_scale_blocked_to_2d(sfd, m_total, n // 32)[0].float()
@@ -216,14 +231,18 @@ def _run_rank():
     n = 1024  # != m_total: an unpinned (l, dim) vector is told apart from the other dim by its length
     torch.manual_seed(4323)
     b = (torch.randn(n, k, dtype=dtype, device=device) / 8).contiguous()
-    r = torch.rand(1, m_total, dtype=torch.float32, device=device) + 0.5  # dense calls pass vectors (l, dim)
+    r = (
+        torch.rand(1, m_total, dtype=torch.float32, device=device) + 0.5
+    )  # dense calls pass vectors (l, dim)
     bias = torch.randn(1, n, dtype=torch.float32, device=device)
     w = torch.randn(1, n, dtype=torch.float32, device=device)
     y_saved = torch.randn(m_total, n, dtype=dtype, device=device)
     preact = torch.randn(m_total, 2 * n, dtype=dtype, device=device)  # packed (x, y) pairs
     postact = torch.empty(m_total, n // 2, dtype=dtype, device=device)
     d_pre = torch.empty(m_total, n, dtype=dtype, device=device)
-    post_bwd = torch.empty(m_total, n, dtype=dtype, device=device)  # dSwiGLU's recomputed postact, GEMM-N wide
+    post_bwd = torch.empty(
+        m_total, n, dtype=dtype, device=device
+    )  # dSwiGLU's recomputed postact, GEMM-N wide
     d_bwd = torch.empty(m_total, 2 * n, dtype=dtype, device=device)
     d_rms = torch.empty(m_total, n, dtype=dtype, device=device)
     dots = torch.zeros(m_total, n // 256, dtype=torch.float32, device=device)
@@ -237,15 +256,34 @@ def _run_rank():
         # r-scale + paired bias + SwiGLU (CODA's gate/up kernel with the rstd deferred into this GEMM)
         with runner.prepare(a_shard) as (a_full, ag_args):
             norm_swiglu_mod.gemm(
-                a_full, b, d_pre, None, epi_args=dict(rstd=r, bias=bias, postact=postact), dist_op_args=ag_args, **kw
+                a_full,
+                b,
+                d_pre,
+                None,
+                epi_args=dict(rstd=r, bias=bias, postact=postact),
+                dist_op_args=ag_args,
+                **kw,
             )
         torch.cuda.synchronize(device)
         v, vq = acc * r.T + bias, accq * r.T + bias
         check(f"AG+rscale+swiglu D iter={it}", d_pre, v, vq)
-        check(f"AG+rscale+swiglu iter={it}", postact, F.silu(v[:, 0::2]) * v[:, 1::2], F.silu(vq[:, 0::2]) * vq[:, 1::2])
+        check(
+            f"AG+rscale+swiglu iter={it}",
+            postact,
+            F.silu(v[:, 0::2]) * v[:, 1::2],
+            F.silu(vq[:, 0::2]) * vq[:, 1::2],
+        )
         # dSwiGLU: the dgrad GEMM's output is dout per pair; C = the saved packed preact
         with runner.prepare(a_shard) as (a_full, ag_args):
-            dswiglu_mod.gemm(a_full, b, d_bwd, preact, epi_args=dict(postact=post_bwd), dist_op_args=ag_args, **kw)
+            dswiglu_mod.gemm(
+                a_full,
+                b,
+                d_bwd,
+                preact,
+                epi_args=dict(postact=post_bwd),
+                dist_op_args=ag_args,
+                **kw,
+            )
         torch.cuda.synchronize(device)
         x, yy = preact.float()[:, 0::2], preact.float()[:, 1::2]
         sig = torch.sigmoid(x)
@@ -261,7 +299,13 @@ def _run_rank():
         # RMSNorm backward partial: D = rstd * (acc * w), dots = per-tile sum over N of (acc * w) * (y * rstd)
         with runner.prepare(a_shard) as (a_full, ag_args):
             rms_bwd_partial_epi.gemm(
-                a_full, b, d_rms, None, epi_args=dict(y=y_saved, rstd=r, w=w, dots=dots), dist_op_args=ag_args, **kw
+                a_full,
+                b,
+                d_rms,
+                None,
+                epi_args=dict(y=y_saved, rstd=r, w=w, dots=dots),
+                dist_op_args=ag_args,
+                **kw,
             )
         torch.cuda.synchronize(device)
         t, tq = acc * w, accq * w

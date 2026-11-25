@@ -92,7 +92,9 @@ def bench_shape(m, n, k, bs_format, rank, world_size, device, args):
     capacity = get_device_capacity(device)[0]
     if blockscaled:
         pts_a = pts_b = None
-        if bs_format == "nvfp4":  # per-tensor scales, shared by every rank: one alpha after the reduce
+        if (
+            bs_format == "nvfp4"
+        ):  # per-tensor scales, shared by every rank: one alpha after the reduce
             amax = torch.stack([a.abs().amax(), b.abs().amax()])
             dist.all_reduce(amax, op=dist.ReduceOp.MAX)
             pts_a, pts_b = nvfp4_per_tensor_scale(amax[0]), nvfp4_per_tensor_scale(amax[1])
@@ -180,7 +182,13 @@ def bench_shape(m, n, k, bs_format, rank, world_size, device, args):
             cfg = f"{tile_m}x{tile_n} c({cluster_m},1) sw{sw}"
             for name, fn, read, method_ref, method_tol in (
                 ("quack_rs", run_quack_rs, lambda: rs.d, ref, tol),
-                ("quack_rs_rms", run_quack_rs_rms, lambda: rs.d.float() * rstd[:, None], ref_rms, tol_rms),
+                (
+                    "quack_rs_rms",
+                    run_quack_rs_rms,
+                    lambda: rs.d.float() * rstd[:, None],
+                    ref_rms,
+                    tol_rms,
+                ),
             ):
                 fn(*quack_in)
                 torch.cuda.synchronize(device)
@@ -214,7 +222,11 @@ def bench_shape(m, n, k, bs_format, rank, world_size, device, args):
     bound = max(results["gemm_only"][0], results["nccl_rs"][0])
     for name, (ms, cfg) in results.items():
         _print0(rank, f"  {name:<12} {ms:8.3f} ms  {flops / (ms * 1e-3) / 1e12:6.0f} TFLOPS  {cfg}")
-    vs = f"  quack_rs vs bound {100 * (best['quack_rs'][0] / bound - 1):+.0f}%" if "quack_rs" in best else ""
+    vs = (
+        f"  quack_rs vs bound {100 * (best['quack_rs'][0] / bound - 1):+.0f}%"
+        if "quack_rs" in best
+        else ""
+    )
     _print0(rank, f"  bound        {bound:8.3f} ms{vs}")
 
 

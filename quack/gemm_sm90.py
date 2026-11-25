@@ -630,8 +630,12 @@ class GemmSm90(GemmTmaBase):
         # setup static attributes before smem/grid/tma computation
         self.a_dtype = mA.element_type
         self.b_dtype = mB.element_type
-        self.d_stage_dtype = mD.element_type if mD is not None else None  # what the epilogue warps stage
-        self.d_dtype = mD_comm.element_type if mD_comm is not None else self.d_stage_dtype  # the output
+        self.d_stage_dtype = (
+            mD.element_type if mD is not None else None
+        )  # what the epilogue warps stage
+        self.d_dtype = (
+            mD_comm.element_type if mD_comm is not None else self.d_stage_dtype
+        )  # the output
         self.c_dtype = mC.element_type if mC is not None else None
         self.sf_dtype = mSFA.element_type if const_expr(mSFA is not None) else None
         # smem storage / TMA-internal dtypes default to the element dtypes; the
@@ -681,7 +685,9 @@ class GemmSm90(GemmTmaBase):
         # SFD needs the varlen mode to shape its logical scale layout).
         self.varlen_m = varlen_m
         self.varlen_k = varlen_k
-        self.varlen_n = False  # cu_seqlens_n is SM100+ (gemm.py); operators read the flag on both arches
+        self.varlen_n = (
+            False  # cu_seqlens_n is SM100+ (gemm.py); operators read the flag on both arches
+        )
 
         self._setup_attributes(epilogue_args)
 
@@ -1107,7 +1113,9 @@ class GemmSm90(GemmTmaBase):
                     is_scheduler_warp = is_scheduler_warp and cute.arch.block_idx_in_cluster() == 0
                 tile_scheduler = TileSchedulerCls()
                 work_tile = tile_scheduler.initial_work_tile_info()
-                gate = Int32(-1)  # the operator's wait_tile state (AllGather: its satisfied-gate cache)
+                gate = Int32(
+                    -1
+                )  # the operator's wait_tile state (AllGather: its satisfied-gate cache)
                 ab_producer_state = make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.ab_stage
                 )

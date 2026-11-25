@@ -94,7 +94,9 @@ def _run_rank():
         dist.barrier()  # every rank's pulls of the previous call are done
         args = dispatch.prepare(x, topk_g[rank], x_sf)
         torch.cuda.synchronize(device)
-        if not (torch.equal(dispatch.cu, cu) and torch.equal(dispatch.s_scatter[:total], s_scatter)):
+        if not (
+            torch.equal(dispatch.cu, cu) and torch.equal(dispatch.s_scatter[:total], s_scatter)
+        ):
             failures.append(f"rank{rank} {label}: the routing tables differ from the reference")
         return args
 
@@ -148,7 +150,7 @@ def _run_rank():
     # --- bf16: every activation on every (ragged dim, block) this arch admits ---
     for ragged_dim, block in blocks:
         dispatch = DispatchRunner(
-            t_local, topk, H, torch.bfloat16, group, max_rows, block, e_local, ragged_dim=ragged_dim
+            t_local, topk, H, torch.bfloat16, max_rows, block, e_local, ragged_dim=ragged_dim
         )
         for activation in gated_acts + plain_acts:
             gated = activation in gated_acts
@@ -184,7 +186,7 @@ def _run_rank():
                 0
             ]  # 1-byte scale rows
             dispatch = DispatchRunner(
-                t_local, topk, H, name, group, max_rows, block, e_local, ragged_dim=ragged_dim
+                t_local, topk, H, name, max_rows, block, e_local, ragged_dim=ragged_dim
             )
             postact = torch.zeros(max_rows, I, device=device, dtype=torch.bfloat16)
             mod = linear_act_mod(

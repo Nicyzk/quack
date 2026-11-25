@@ -723,7 +723,9 @@ class EpiMod:
             if dist_op_args is None:
                 raise ValueError("dist_op requires its dist_op_args bundle")
             if D is None and dist_op.runs_evt:
-                raise ValueError("dist_op: the partial the operator reduces is staged into D, pass D")
+                raise ValueError(
+                    "dist_op: the partial the operator reduces is staged into D, pass D"
+                )
             if getattr(dist_op, "broadcast", False) and self.outputs:
                 raise ValueError(
                     "two-shot AR replicates D and reduce outputs; an aux tensor would land on the "
@@ -843,7 +845,9 @@ class EpiMod:
             if D is not None and (D.ndim != 2 or D.stride(0) != 1):
                 raise ValueError("varlen_n: D is (m, total_n), m-major")
             if (C is not None and self.mode != "packed_cd_b16x2") or add_to_output or self.prepass:
-                raise ValueError("varlen_n: no C (except the packed pair mode's), add_to_output or prepass")
+                raise ValueError(
+                    "varlen_n: no C (except the packed pair mode's), add_to_output or prepass"
+                )
             if any(getattr(op, "dim", 1) != 1 for op in self.sinks.values()):
                 raise ValueError("varlen_n: row-vector (per token column) sinks only")
             if any(
@@ -890,7 +894,9 @@ class EpiMod:
         # kernel coords.
         paired_acc = self.mode == "acc_pair"
         packed_c = self.mode == "packed_cd_b16x2"
-        pair_dim = "m" if varlen_n else "n"  # swap-AB gated: the acc pairs over M rows, outputs m-major
+        pair_dim = (
+            "m" if varlen_n else "n"
+        )  # swap-AB gated: the acc pairs over M rows, outputs m-major
         if paired_acc and pair_dim == "n" and (n_gemm % 2 or tile_N % 2):
             raise ValueError("acc_pair mode requires even GEMM N and tile_N")
         post_init_attrs = tuple(post_init_attrs)

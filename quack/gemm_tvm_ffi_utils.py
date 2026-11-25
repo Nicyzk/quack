@@ -76,7 +76,9 @@ def varlen_n_block_rows_host(seqlens, tile_n, granule=16):
     """Host twin of varlen_utils.varlen_n_block_rows over a tensor of per-sequence row counts: the rows of each
     sequence's even-split blocks, ceil(n / ceil(n / tile_n)) rounded up to the granule (0 rows -> 0)."""
     num_blocks = (seqlens + tile_n - 1) // tile_n
-    return ((seqlens + num_blocks - 1) // num_blocks.clamp(min=1) + granule - 1) // granule * granule
+    return (
+        ((seqlens + num_blocks - 1) // num_blocks.clamp(min=1) + granule - 1) // granule * granule
+    )
 
 
 def varlen_n_sf_atoms(scales, cu_seqlens_n, tile_n):
@@ -94,7 +96,9 @@ def varlen_n_sf_atoms(scales, cu_seqlens_n, tile_n):
     seq = torch.searchsorted(cu_seqlens_n, r, right=True) - 1
     local = r - cu_seqlens_n[seq]
     dst = (cu_tiles[seq] + local // b[seq]) * (atoms * 128) + local % b[seq]
-    rows = torch.zeros(int(cu_tiles[-1]) * atoms * 128, sf_k, dtype=torch.uint8, device=scales.device)
+    rows = torch.zeros(
+        int(cu_tiles[-1]) * atoms * 128, sf_k, dtype=torch.uint8, device=scales.device
+    )
     rows[dst.long()] = scales.view(torch.uint8)
     return pack_scale_2d_to_blocked_contig(rows.view(scales.dtype))
 
@@ -399,7 +403,13 @@ def compute_cu_tiles_m(cu_seqlens_m, tile_m_cta):
 
 
 def make_fake_varlen_args(
-    varlen_m, varlen_k, gather_A, aidx_len, has_cu_tiles_m=False, varlen_n=False, has_cu_tiles_n=False
+    varlen_m,
+    varlen_k,
+    gather_A,
+    aidx_len,
+    has_cu_tiles_m=False,
+    varlen_n=False,
+    has_cu_tiles_n=False,
 ):
     if not varlen_m and not varlen_k and not varlen_n:
         return None
@@ -535,7 +545,9 @@ def validate_ag_geometry(A, ag_args, tile_M, cluster_M):
     calls it pre-compile to fail fast on the cold path."""
     m_rows = A.shape[-2]
     num_shards, num_chunks = int(ag_args.num_shards), int(ag_args.num_chunks)
-    assert m_rows % num_shards == 0, f"AG+GEMM: M ({m_rows}) must divide into num_shards ({num_shards})"
+    assert m_rows % num_shards == 0, (
+        f"AG+GEMM: M ({m_rows}) must divide into num_shards ({num_shards})"
+    )
     shard_rows = m_rows // num_shards
     assert shard_rows % (tile_M * cluster_M * num_chunks) == 0, (
         f"AG+GEMM: shard rows ({shard_rows}) must be a multiple of tile_M * cluster_M * "
@@ -544,7 +556,9 @@ def validate_ag_geometry(A, ag_args, tile_M, cluster_M):
     )
 
 
-def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None, dist_op_args=None, A=None):
+def plan_scheduler_args(
+    plan, tile_count_semaphore, batch_idx_permute=None, dist_op_args=None, A=None
+):
     """Per-call TileSchedulerOptions for a cached plan.
 
     Must mirror make_fake_scheduler_args in the variant's _compile_* function:
@@ -558,14 +572,18 @@ def plan_scheduler_args(plan, tile_count_semaphore, batch_idx_permute=None, dist
     """
     op_sched = plan.dist_op.make_scheduler_args(dist_op_args) if plan.dist_op is not None else {}
     if "shard_tile_order" in op_sched:
-        assert A is not None, "plan_scheduler_args: a shard tile order requires A for geometry validation"
+        assert A is not None, (
+            "plan_scheduler_args: a shard tile order requires A for geometry validation"
+        )
         validate_ag_geometry(A, dist_op_args, plan.tile_M, plan.cluster_M)
     if not op_sched and plan.scheduler_static is not None:
         return plan.scheduler_static
     return make_scheduler_args(
         plan.max_active_clusters,
         plan.max_swizzle_size,
-        op_sched.pop("tile_count_semaphore", tile_count_semaphore if plan.scheduler_uses_semaphore else None),
+        op_sched.pop(
+            "tile_count_semaphore", tile_count_semaphore if plan.scheduler_uses_semaphore else None
+        ),
         batch_idx_permute,
         **op_sched,
     )
@@ -796,8 +814,9 @@ def compile_gemm_kernel(
     dist_op=None,  # the distributed operator (quack.gemm_base.DistOp): ctor kwarg + its dist_op_args fakes
 ):
     """Build GemmCls instance, apply SM90 partial, and cute.compile with TVM-FFI."""
-    assert dist_op is None or device_capacity[0] in [9, 10, 11], (
-        "distributed operators are SM90/SM100 only"
+    # each kernel states which operators it hosts (SM120: gate-only; SM8x has no persistent load warp)
+    assert dist_op is None or device_capacity[0] in [9, 10, 11, 12], (
+        "distributed operators need a TMA arch (SM90+)"
     )
     split_k_kwargs = {}
     if split_k != 1:
@@ -872,8 +891,12 @@ def compile_gemm_kernel(
     # every kernel declares a trailing dist_op_args (defaults are baked into the arity): its fakes, or None
     d_dtype = mD.element_type if mD is not None else None  # sink-only epilogues have no D
     dist_op_args = (dist_op.fake_args(d_dtype) if dist_op is not None else None,)
-    if dist_op is not None and "tile_count_semaphore" in dist_op.make_scheduler_args(dist_op_args[0]):
-        assert not is_dynamic_persistent, "the operator runs its tile counter: leave is_dynamic_persistent False"
+    if dist_op is not None and "tile_count_semaphore" in dist_op.make_scheduler_args(
+        dist_op_args[0]
+    ):
+        assert not is_dynamic_persistent, (
+            "the operator runs its tile counter: leave is_dynamic_persistent False"
+        )
     return cute.compile(
         gemm_obj,
         mA,

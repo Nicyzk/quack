@@ -129,7 +129,7 @@ def _compile_gemm_epi(
     # arg, kernel-N (the activation M) is the only symbolic dim.
     transform_a_ref=None,
     transform_dims=None,
-    dist_op=None,  # SM100 DistOp object (picklable; its state is in the key)
+    dist_op=None,  # the DistOp object (picklable; its state is in the key)
     raster_order=RasterOrderOption.Heuristic,
     varlen_n=False,
 ):
@@ -197,9 +197,18 @@ def _compile_gemm_epi(
             m_d = cute.sym_int()
             l_d = l if batched and not (varlen_m or varlen_n) else None
             # the N extents stay the fakes' own (a packed C / D is 2 x GEMM-N; fp4 D is packed)
-            mD = fake_batched(d_dtype, m_d, mD.shape[-1], l_d, 1 if d_major == "n" else 0, div_for_dtype(d_dtype))
+            mD = fake_batched(
+                d_dtype, m_d, mD.shape[-1], l_d, 1 if d_major == "n" else 0, div_for_dtype(d_dtype)
+            )
             if c_dtype is not None:
-                mC = fake_batched(c_dtype, m_d, mC.shape[-1], l_d, 1 if c_major == "n" else 0, div_for_dtype(c_dtype))
+                mC = fake_batched(
+                    c_dtype,
+                    m_d,
+                    mC.shape[-1],
+                    l_d,
+                    1 if c_major == "n" else 0,
+                    div_for_dtype(c_dtype),
+                )
         if transform_mod is not None and transform_mod.needs_operands:
             # value transform with runtime operands: A crosses as a (plain A,
             # operand view) bundle in the one mA slot (same-arity trick as W4)
@@ -248,7 +257,11 @@ def _compile_gemm_epi(
     )
     mSFA = make_fake_sf_tensor(sf_dtype, l if sf_batched else None) if sf_dtype else None
     # varlen_n: SFB is the per-block atoms, batch 1
-    mSFB = make_fake_sf_tensor(sf_dtype, 1 if varlen_n else l if sf_batched else None) if sf_dtype else None
+    mSFB = (
+        make_fake_sf_tensor(sf_dtype, 1 if varlen_n else l if sf_batched else None)
+        if sf_dtype
+        else None
+    )
     post_init = None
     if post_init_attrs:
 
@@ -312,7 +325,9 @@ class GemmEpiPlan(NamedTuple):
     epi_arg_keys: tuple  # ((op_name, key), ...) as compiled
     tile_M: int  # scheduler-cluster geometry, for launch-time AG validation
     cluster_M: int  # (see validate_ag_geometry in plan_scheduler_args)
-    dist_op: object  # the operator: make_scheduler_args(dist_op_args) = its per-call scheduler options
+    dist_op: (
+        object  # the operator: make_scheduler_args(dist_op_args) = its per-call scheduler options
+    )
     # Launch-overhead precomputation (host hot path): (name, converter, key)
     # triples — converter is the op's bound ``host_call_arg``, or None when the
     # op inherits the identity default (the value passes straight through) —

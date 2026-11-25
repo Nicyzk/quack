@@ -160,7 +160,9 @@ def make_dgated_moe_mod(dgate, pair_dim="n"):
 
 
 dswiglu_moe_mod = make_dgated_moe_mod(dswiglu)
-dswiglu_moe_swap_mod = make_dgated_moe_mod(dswiglu, pair_dim="m")  # the swap-AB (tokens on N) fc2 dgrad
+dswiglu_moe_swap_mod = make_dgated_moe_mod(
+    dswiglu, pair_dim="m"
+)  # the swap-AB (tokens on N) fc2 dgrad
 
 
 # gpt-oss exact: swiglu_oai with the swiglu_limit=7.0 preact clamp (grads

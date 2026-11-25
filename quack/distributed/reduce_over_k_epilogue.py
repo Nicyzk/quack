@@ -1,4 +1,5 @@
-"""Fused epilogues for reduce_over_k (from duckpond kernels/moe/reduce_over_k/epilogue.py, 2026-11-21): the
+# Copyright (c) 2026, QuACK team.
+"""Fused epilogues for reduce_over_k: the
 combine's EVT runs after its sum, in this kernel rather than the GEMM. An epilogue is a @gemm_epilogue-style fn
 over the per-element fp32 sum, ``fn(acc, **operands) -> {"D": ..., <outputs/sinks>}``, operand kinds inferred
 from the tensors with m = T and n = H ((1, H) row vector, (1, T) per-token column vector, (T, H) / (1, T, H)
@@ -49,7 +50,9 @@ class TokenVecLoad(ColVecLoad):
         tile_M, tile_N = ctx.tile_M, ctx.tile_N
         gVec = cute.local_tile(self._get_gmem_vec(param, ctx), (tile_M,), (ctx.tile_coord_mnkl[0],))
         row = ctx.partition_for_epilogue_fn(cute.make_identity_tensor((tile_M, tile_N)))[0][0]
-        limit = min(ctx.varlen_manager.len_m(ctx.batch_idx) - ctx.tile_coord_mnkl[0] * tile_M, tile_M)
+        limit = min(
+            ctx.varlen_manager.len_m(ctx.batch_idx) - ctx.tile_coord_mnkl[0] * tile_M, tile_M
+        )
         v = Float32(0.0)
         if row < limit:
             v = Float32(gVec[row])
@@ -127,7 +130,17 @@ class ReduceEpiMod(EpiMod):
     """EpiMod minted on ReduceOverK (module docstring): EpiMod validates and fingerprints the fn; this class
     mints the reducer's class with its operand ops and owns the launch."""
 
-    def __init__(self, fn, outputs=(), ops=None, reduces=None, outs=None, extra_ops=(), prepass=None, prepass_outs=()):
+    def __init__(
+        self,
+        fn,
+        outputs=(),
+        ops=None,
+        reduces=None,
+        outs=None,
+        extra_ops=(),
+        prepass=None,
+        prepass_outs=(),
+    ):
         super().__init__(
             fn,
             outputs=outputs,
@@ -138,7 +151,9 @@ class ReduceEpiMod(EpiMod):
             prepass=prepass,
             prepass_outs=prepass_outs,
         )
-        TORCH_OP_EPI_MODS.pop(self.semantic_digest, None)  # the GEMM custom op's registry: not one of its mods
+        TORCH_OP_EPI_MODS.pop(
+            self.semantic_digest, None
+        )  # the GEMM custom op's registry: not one of its mods
 
     def mint(self, kind_sig, arch, arg_forms=()):
         """One kernel class per (operand kinds, arch, arg forms); arg_forms = ((name, form), ...) for the ops whose
@@ -147,7 +162,8 @@ class ReduceEpiMod(EpiMod):
         if key in self._minted:
             return self._minted[key]
         epi_ops = [
-            self.ops[name] if name in self.ops else _KIND_TO_OP[kind](name) for name, kind in kind_sig
+            self.ops[name] if name in self.ops else _KIND_TO_OP[kind](name)
+            for name, kind in kind_sig
         ]
         epi_ops += [RowTileStore(name) for name in self.outputs]
         epi_ops += list(self.sinks.values()) + list(self.extra_ops)
@@ -233,7 +249,13 @@ class ReduceEpiMod(EpiMod):
                 )
         epi_keys = tuple((op.name, op.host_arg_key(epi_args.get(op.name))) for op in cls._epi_ops)
         fn = compile_reduce_over_k(
-            torch2cute_dtype_map[x.dtype], K, w is not None, arch, cls=cls, epi_keys=epi_keys, **config
+            torch2cute_dtype_map[x.dtype],
+            K,
+            w is not None,
+            arch,
+            cls=cls,
+            epi_keys=epi_keys,
+            **config,
         )
         args = cls.EpilogueArguments(
             **{

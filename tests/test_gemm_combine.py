@@ -105,7 +105,7 @@ def _run_rank():
             failures.append(f"rank{rank} {label}: err={err} tol={tol}")
 
     for ragged_dim, tile_m, tile_n, cluster_m in tiles:
-        cb = CombineRunner(t_local, topk, H, dtype, group, total, ragged_dim=ragged_dim)
+        cb = CombineRunner(t_local, topk, H, dtype, total, ragged_dim=ragged_dim)
         for it in range(
             2
         ):  # back-to-back: the slots are overwritten, the counter re-zeroed by prepare
@@ -114,7 +114,7 @@ def _run_rank():
                 gemm(
                     w2,
                     act,
-                    cb.D,
+                    cb.d,
                     None,
                     None,
                     tile_m,
@@ -129,7 +129,7 @@ def _run_rank():
                 gemm(
                     act,
                     w2,
-                    cb.D,
+                    cb.d,
                     None,
                     None,
                     tile_m,

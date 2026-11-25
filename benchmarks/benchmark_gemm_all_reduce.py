@@ -106,7 +106,9 @@ def bench_shape(m, n, k, dtype, rank, world_size, device, args):
         if best is not None:
             results[name] = best
 
-    if world_size <= 4:  # the 64-row tile's stripes are 64 / world_size rows; the comm frame needs 16
+    if (
+        world_size <= 4
+    ):  # the 64-row tile's stripes are 64 / world_size rows; the comm frame needs 16
         best_of("quack_ar_2shot", AllReduceRunner(m, n, dtype, TILE, TILE))
     best_of("quack_ar_1shot", AllReduceOneShotRunner(m, n, dtype, TILE))
     out = torch.empty(m, n, dtype=dtype, device=device)
@@ -115,7 +117,10 @@ def bench_shape(m, n, k, dtype, rank, world_size, device, args):
         torch.matmul(x, y.T, out=out)
         dist.all_reduce(out)
 
-    results["nccl_seq"] = (min(bench_l2_rotate_dist(run_nccl_seq, sets) for _ in range(args.rounds)), "")
+    results["nccl_seq"] = (
+        min(bench_l2_rotate_dist(run_nccl_seq, sets) for _ in range(args.rounds)),
+        "",
+    )
     for name, (ms, cfg) in results.items():
         _print0(rank, f"  {name:<15} {ms * 1e3:8.1f} us  {cfg}")
 

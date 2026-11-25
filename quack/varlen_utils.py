@@ -34,7 +34,9 @@ VARLEN_N_GRANULE = 16  # the varlen_n even-split row granule (gemm_sm100.varlen_
 
 
 @cute.jit
-def varlen_n_block_rows(n: Int32, tile_n: cutlass.Constexpr[int], granule: cutlass.Constexpr[int]) -> Int32:
+def varlen_n_block_rows(
+    n: Int32, tile_n: cutlass.Constexpr[int], granule: cutlass.Constexpr[int]
+) -> Int32:
     """varlen_n even split: n rows cut into ceil(n / tile_n) blocks of ceil(n / blocks) rows rounded up to
     `granule`, so no block is a thin tail. Shared by the kernel, the tile scheduler's gates and the walks."""
     num_blocks = cute.ceil_div(n, tile_n)
@@ -274,7 +276,9 @@ class VarlenManager:
         atoms_per_block 128-row SF atoms (the MMA's SF window) at block slot cu_tiles_n[batch] + pid_n, so a
         tile's window always starts at an atom boundary whatever the block's row offset."""
         slot = self.params.cu_tiles_n[batch_idx] + pid_n
-        return cute.domain_offset((None, None, slot * atoms_per_block), mSFB_chunks[None, None, None, 0])
+        return cute.domain_offset(
+            (None, None, slot * atoms_per_block), mSFB_chunks[None, None, None, 0]
+        )
 
     def offset_batch_B(self, mB_nkl: cute.Tensor, batch_idx: Int32) -> cute.Tensor:
         params = self.params

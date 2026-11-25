@@ -1,7 +1,9 @@
-# gmem primitives the distributed operators share: the 16-byte relaxed load that polls a mirror (Lamport), the
-# 16-byte plain stores that re-arm a slot or land a row slice in a peer's buffer (Lamport re-arm, combine), the
-# dispatch pull's row transport (1D bulk copies through smem, the release add that publishes a landed row) and the
-# system-scope release add that arrives on a peer's barrier word (the dispatch walk's NVLink barrier).
+# Copyright (c) 2026, QuACK team.
+"""gmem primitives the distributed operators share: the 16-byte relaxed load that polls a mirror (Lamport), the
+16-byte plain stores that re-arm a slot or land a row slice in a peer's buffer (Lamport re-arm, combine), the
+dispatch pull's row transport (1D bulk copies through smem, the release add that publishes a landed row) and the
+system-scope release add that arrives on a peer's barrier word (the dispatch walk's NVLink barrier)."""
+
 from typing import Optional, Tuple
 
 from cutlass import Int32, Int64

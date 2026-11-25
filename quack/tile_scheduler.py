@@ -1212,7 +1212,9 @@ class VarlenMTileScheduler(TileScheduler):
                 problem_shape_ntile_mn[fixed], args.cluster_shape_mnk[fixed]
             )
             problem_shape_ncluster_mn = (
-                (None, ncluster_fixed) if const_expr(args.varlen_dim == 0) else (ncluster_fixed, None)
+                (None, ncluster_fixed)
+                if const_expr(args.varlen_dim == 0)
+                else (ncluster_fixed, None)
             )
             problem_shape_ncluster_mnl = problem_shape_ncluster_mn + (
                 args.problem_shape_ntile_mnl[2],

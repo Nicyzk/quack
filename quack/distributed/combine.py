@@ -1,13 +1,15 @@
-# MoE GEMM2 + combine as the GEMM's distributed operator: no gate, no publish, no comm warps. The grouped GEMM's
-# tokens are D's columns (swap-AB, varlen_n: D = y.T (hidden, total_n) m-major) or D's rows (grouped M, varlen_m:
-# D = y (total_m, hidden) n-major), packed per expert either way; the operator drains each staged D subtile straight
-# into the origin rank's slot for that (token, k) pair, 16 B per lane along hidden (store_tile's own copy: the GEMM
-# stages accumulator -> registers -> epi ops -> smem as always, the TMA store is replaced). D is never written,
-# nothing is waited on; completion is the kernel's end, then the caller barriers and reduces every token's K slots
-# (quack.distributed.reduce_over_k). Slot id of token t = row_key[t] = rank * slots_per_rank + local. Usage: runner =
-# CombineRunner(tokens_local, k, hidden, dtype, group, max_rows); per call gemm(w2, act, runner.D, ...,
-# cu_seqlens_n=cu, dist_op=runner.op, dist_op_args=runner.prepare(row_key)) on SM100, gemm(act, w2, runner.D, ...,
-# cu_seqlens_m=cu, ...) on SM90; then barrier; the landed rows are runner.slots (tokens_local, k, hidden).
+# Copyright (c) 2026, QuACK team.
+"""MoE GEMM2 + combine as the GEMM's distributed operator: no gate, no publish, no comm warps. The grouped GEMM's
+tokens are D's columns (swap-AB, varlen_n: D = y.T (hidden, total_n) m-major) or D's rows (grouped M, varlen_m:
+D = y (total_m, hidden) n-major), packed per expert either way; the operator drains each staged D subtile straight
+into the origin rank's slot for that (token, k) pair, 16 B per lane along hidden (store_tile's own copy: the GEMM
+stages accumulator -> registers -> epi ops -> smem as always, the TMA store is replaced). D is never written,
+nothing is waited on; completion is the kernel's end, then the caller barriers and reduces every token's K slots
+(quack.distributed.reduce_over_k). Slot id of token t = row_key[t] = rank * slots_per_rank + local. Usage: runner =
+CombineRunner(tokens_local, k, hidden, dtype, max_rows); per call gemm(w2, act, runner.d, ...,
+cu_seqlens_n=cu, dist_op=runner.op, dist_op_args=runner.prepare(row_key)) on SM100, gemm(act, w2, runner.d, ...,
+cu_seqlens_m=cu, ...) on SM90; then barrier; the landed rows are runner.slots (tokens_local, k, hidden)."""
+
 from functools import partial
 from typing import NamedTuple
 
@@ -18,6 +20,7 @@ from cutlass import Int32, Int64
 from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import get_device_capacity, mlir_namedtuple
 from quack.distributed.ptx import st_weak_global_4xu32_at
+from quack.distributed.utils import peer_bases, symm_alloc
 from quack.gemm_base import DistOp, grouped_ragged_dim
 
 
@@ -25,7 +28,7 @@ from quack.gemm_base import DistOp, grouped_ragged_dim
 class CombineArguments(NamedTuple):
     """The drain's bundle (the GEMM's dist_op_args)."""
 
-    slot_base: cute.Tensor  # (world,) int64: every rank's slot buffer base address
+    slot_base: cute.Tensor  # (world_size,) int64: every rank's slot buffer base address
     slots_per_rank: Int32  # tokens_local * k
     row_key: cute.Tensor  # (total,) int32: each token's global slot id, in the GEMM's row order
     sem: cute.Tensor  # (1,) int32 the GEMM's tile counter (make_scheduler_args), zeroed per call
@@ -66,10 +69,17 @@ def store_subtile(
     slots_per_rank = dist_op_args.slots_per_rank
     addr = cute.make_rmem_tensor(cute.make_layout(STEPS), Int64)
     for step in cutlass.range_constexpr(STEPS):
-        c = cutlass.min(col0 + step * tokens_per_step, n_valid - Int32(1))  # clamped: the load is unconditional
+        c = cutlass.min(
+            col0 + step * tokens_per_step, n_valid - Int32(1)
+        )  # clamped: the load is unconditional
         slot = dist_op_args.row_key[base_col + c]
-        addr[step] = dist_op_args.slot_base[slot // slots_per_rank] + Int64(slot % slots_per_rank) * Int64(row_bytes)
-    h_off = Int64((tile_coord_mnkl[0] * cta_tile_mn[0] + dst_idx[0] * epi_m + (tidx % lanes) * elems) * elem_bytes)
+        addr[step] = dist_op_args.slot_base[slot // slots_per_rank] + Int64(
+            slot % slots_per_rank
+        ) * Int64(row_bytes)
+    h_off = Int64(
+        (tile_coord_mnkl[0] * cta_tile_mn[0] + dst_idx[0] * epi_m + (tidx % lanes) * elems)
+        * elem_bytes
+    )
     cute.copy(tiled_copy, tSR_s[None, None, None, src_idx], tSR_r)
     words = cute.recast_tensor(tSR_r, Int32)  # ((4, 1), 1, steps): the lane's 16 B per step
     for step in cutlass.range_constexpr(STEPS):
@@ -111,10 +121,17 @@ def store_subtile_m(
     slots_per_rank = dist_op_args.slots_per_rank
     addr = cute.make_rmem_tensor(cute.make_layout(STEPS), Int64)
     for step in cutlass.range_constexpr(STEPS):
-        r = cutlass.min(row0 + step * tokens_per_step, m_valid - Int32(1))  # clamped: the load is unconditional
+        r = cutlass.min(
+            row0 + step * tokens_per_step, m_valid - Int32(1)
+        )  # clamped: the load is unconditional
         slot = dist_op_args.row_key[base_row + r]
-        addr[step] = dist_op_args.slot_base[slot // slots_per_rank] + Int64(slot % slots_per_rank) * Int64(row_bytes)
-    h_off = Int64((tile_coord_mnkl[1] * cta_tile_mn[1] + dst_idx[1] * epi_n + (tidx % lanes) * elems) * elem_bytes)
+        addr[step] = dist_op_args.slot_base[slot // slots_per_rank] + Int64(
+            slot % slots_per_rank
+        ) * Int64(row_bytes)
+    h_off = Int64(
+        (tile_coord_mnkl[1] * cta_tile_mn[1] + dst_idx[1] * epi_n + (tidx % lanes) * elems)
+        * elem_bytes
+    )
     cute.copy(tiled_copy, tSR_s[None, None, None, src_idx], tSR_r)
     words = cute.recast_tensor(tSR_r, Int32)  # ((4, 1), steps, 1): the lane's 16 B per step
     for step in cutlass.range_constexpr(STEPS):
@@ -158,7 +175,9 @@ class CombineStore(DistOp):
         assert lanes * 128 == hidden_sub * width, "a token's subtile slice is whole 16 B lanes"
         elems = 128 // width
         tokens_per_step = gemm.num_epi_warps * cute.arch.WARP_SIZE // lanes
-        assert cute.size(epi_tile[tokens_mode]) % tokens_per_step == 0, "the subtile's tokens are whole steps"
+        assert cute.size(epi_tile[tokens_mode]) % tokens_per_step == 0, (
+            "the subtile's tokens are whole steps"
+        )
         op = cute.nvgpu.CopyUniversalOp()
         atom = cute.make_copy_atom(op, gemm.d_dtype, num_bits_per_copy=128)
         if gemm.varlen_n:
@@ -191,30 +210,25 @@ class CombineStore(DistOp):
 
 
 class CombineRunner:
-    """GEMM2 + combine of tokens_local tokens x k experts x hidden: `D` = the GEMM's D operand, a (max_rows,
+    """GEMM2 + combine of tokens_local tokens x k experts x hidden: `d` = the GEMM's D operand, a (max_rows,
     hidden) buffer the drain never writes, as (hidden, max_rows) m-major under "n" (swap-AB) or as is under "m"
     (varlen_m); `slots` = the symmetric slots every peer's GEMM2 lands rows in (reduce over k after a cross-rank
     barrier: reduce_over_k), `op` = CombineStore(hidden, ragged_dim); ragged_dim = the GEMM call's ragged dim,
     None = this arch's default (gemm_base.grouped_ragged_dim); prepare(row_key) = the GEMM's
-    dist_op_args for a call's routing (each token's global slot id, in the GEMM's row order)."""
+    dist_op_args for a call's routing (each token's global slot id, in the GEMM's row order); group = the
+    ranks (None = the world group)."""
 
-    def __init__(self, tokens_local, k, hidden, torch_dtype, group, max_rows, ragged_dim=None):
-        import torch.distributed._symmetric_memory as symm_mem
-
+    def __init__(self, tokens_local, k, hidden, dtype, max_rows, ragged_dim=None, group=None):
         dev = torch.cuda.current_device()
         if ragged_dim is None:
             ragged_dim = grouped_ragged_dim(get_device_capacity(torch.device(dev))[0])
-        self.slots = symm_mem.empty(tokens_local, k, hidden, dtype=torch_dtype, device=dev)
-        hdl = symm_mem.rendezvous(self.slots, group=group)
-        shape = (tokens_local, k, hidden)
-        bases = [hdl.get_buffer(q, shape, torch_dtype).data_ptr() for q in range(group.size())]
-        self._args = partial(
-            CombineArguments, torch.tensor(bases, dtype=torch.int64, device=dev), tokens_local * k
-        )
+        # the handle pins the mapping as long as the runner lives
+        self.slots, self._handle = symm_alloc((tokens_local, k, hidden), dtype, group)
+        self._args = partial(CombineArguments, peer_bases(self._handle), tokens_local * k)
         self.op = CombineStore(hidden, ragged_dim)
         self.sem = torch.zeros(1, dtype=torch.int32, device=dev)  # the GEMM's tile counter
-        d = torch.empty(max_rows, hidden, dtype=torch_dtype, device=dev)
-        self.D = d.T if ragged_dim == "n" else d
+        d = torch.empty(max_rows, hidden, dtype=dtype, device=dev)
+        self.d = d.T if ragged_dim == "n" else d
 
     def prepare(self, row_key):
         self.sem.zero_()

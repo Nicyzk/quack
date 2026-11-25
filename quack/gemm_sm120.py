@@ -48,6 +48,7 @@ from cutlass.utils import blockscaled_layout
 from quack.varlen_utils import VarlenManager
 from quack.pipeline import make_pipeline_state
 from quack import copy_utils
+from quack.gemm_base import DistOp, DistOpCtx
 from quack.gemm_sm90 import GemmSm90, NamedBarrierGemm
 from quack.gemm_config import SplitKMode
 from quack import sm80_utils
@@ -285,8 +286,14 @@ class GemmSm120(GemmSm90):
         # dtypes (packed fp6 crosses the FFI boundary as raw bytes)
         a_mma_dtype: Optional[Type[cutlass.Numeric]] = None,
         b_mma_dtype: Optional[Type[cutlass.Numeric]] = None,
+        dist_op: Optional[DistOp] = None,  # the distributed operator (quack.gemm_base.DistOp)
     ):
         # Don't call super().__init__ — we set up our own config
+        # this kernel calls the operator's load-warp gate only: no comm warps, the store stays its own
+        assert dist_op is None or (
+            dist_op.num_warps == 0 and type(dist_op).store_tile is DistOp.store_tile
+        ), "SM120 hosts gate-only distributed operators (AllGather)"
+        self.dist_op_setup(dist_op, ())
         self.acc_dtype = acc_dtype
         self.pingpong = pingpong
         self.is_persistent = is_persistent
@@ -789,9 +796,14 @@ class GemmSm120(GemmSm90):
         aux_a_smem_layout: Optional[cute.Layout],
         tile_sched_params,
         TileSchedulerCls: cutlass.Constexpr[Callable],
-        dist_op_args,  # the SM90-family __call__ passes it; no distributed operator on SM120
+        dist_op_args,  # the operator's per-call bundle
+        mC_comm: Optional[cute.Tensor],  # comm warps' C and D: None here (gate-only operators)
+        mD_comm: Optional[cute.Tensor],
     ):
         from cutlass.cute.experimental import iket
+
+        # what the operator's gate sees of this kernel
+        ctx = DistOpCtx(dist_op_args, sched_params=tile_sched_params)
 
         varlen_m = const_expr(varlen_params.cu_seqlens_m is not None)
         varlen_k = const_expr(varlen_params.cu_seqlens_k is not None)
@@ -951,6 +963,9 @@ class GemmSm120(GemmSm90):
                     is_scheduler_warp = is_scheduler_warp and cute.arch.block_idx_in_cluster() == 0
                 tile_scheduler = TileSchedulerCls()
                 work_tile = tile_scheduler.initial_work_tile_info()
+                gate = Int32(
+                    -1
+                )  # the operator's wait_tile state (AllGather: its satisfied-gate cache)
                 ab_producer_state = make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.ab_stage
                 )
@@ -958,6 +973,8 @@ class GemmSm120(GemmSm90):
                     # (pid_m, pid_n, split_idx | None, batch_idx), decoded by the scheduler
                     tile_coord_mnkl = work_tile.tile_idx
                     batch_idx, split_idx = tile_coord_mnkl[3], tile_coord_mnkl[2]
+                    # the operator's gate before the tile's first TMA (see gemm_sm90.py)
+                    gate = self.dist_op.wait_tile(self, ctx, tile_coord_mnkl, gate)
                     iket.range_push("tma_load")
                     # Local_tile partition global tensors
                     copy_A, prefetch_A = None, None

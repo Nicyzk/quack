@@ -287,7 +287,9 @@ class AllGatherArguments(NamedTuple):
     # (num_shards * num_chunks,) Int32, symmetric, chunk-major within a shard (flag idx =
     # shard * num_chunks + chunk), each a copy of the call's device epoch once that chunk landed
     flags: cute.Tensor
-    epoch: cute.Tensor  # (1,) Int32, 4B-aligned, device-resident epoch slot read through the pointer
+    epoch: (
+        cute.Tensor
+    )  # (1,) Int32, 4B-aligned, device-resident epoch slot read through the pointer
     num_shards: Int32  # world_size: shards along M
     # Index of the shard whose tiles are scheduled FIRST; consumption walks
     # the ring from there. Each rank passes its own rank — the local shard
@@ -336,7 +338,9 @@ class AllGather(DistOp):
         new_gate = shard * args.num_chunks + chunk
         if new_gate != gate:
             # device-resident epoch (the host bumps it with a captured kernel): graph-capturable
-            epoch = cute.arch.load(ctx.args.epoch.iterator.llvm_ptr, Int32, sem="relaxed", scope="gpu")
+            epoch = cute.arch.load(
+                ctx.args.epoch.iterator.llvm_ptr, Int32, sem="relaxed", scope="gpu"
+            )
             ptr = ctx.args.flags.iterator + new_gate
             val = cute.arch.load(ptr.llvm_ptr, Int32, sem="relaxed", scope="sys")
             while (val - epoch) < 0:
@@ -362,7 +366,7 @@ class AllGatherRunner:
       (plain, act/epilogue, blockscaled, ...).
 
     From the kernel's perspective AG-capability is exactly (a) the
-    shard-major rotated scheduler decode (TileScheduler's ``ag`` bundle) and
+    shard-major rotated scheduler decode (TileScheduler's ``shard_tile_order`` bundle) and
     (b) that one flag gate before a tile's first TMA (the AllGather
     operator's wait_tile) — both live in shared code, so enabling a new GEMM
     variant is nothing. The single geometry fact the two halves share —
@@ -893,7 +897,7 @@ class BlockScaledAllGatherRunner(AllGatherRunner):
     flag set, fully overlapped with the GEMM.
 
     Same ``prepare()`` interface as the parent, made type-symmetric:
-    ``gather(X)`` yields ``(X_gathered, ag_args)``. A plain
+    ``prepare(X)`` yields ``(X_gathered, dist_op_args)``. A plain
     ``torch.Tensor`` X runs the parent verbatim; a
     :class:`~quack.blockscaled.operand.BlockScaledOperand` X engages the
     SFA lane and yields a gathered ``BlockScaledOperand``::

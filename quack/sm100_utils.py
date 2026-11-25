@@ -195,5 +195,3 @@ def make_smem_layout_tma_gather_a(
         ip=ip,
     )
     return a_smem_layout_staged
-
-

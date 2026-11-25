@@ -417,17 +417,26 @@ class BlockScaleFactorStore(EpiOp):
                 f"epi tile M ({epi_m}) must cover whole SF vectors of {vec} rows"
             )
         if self._aux_col():
-            assert gemm.arch == 100 and vec in (16, 32), "M-paired aux quantization: SM100, 16/32-row vectors"
+            assert gemm.arch == 100 and vec in (16, 32), (
+                "M-paired aux quantization: SM100, 16/32-row vectors"
+            )
             # Host-side ints for the device: the epi tile's layouts are host-region values, so
             # neither cute.size nor .shape on them may run inside the kernel.
             epi_n = cute.size(gemm.epi_tile[1])
             assert isinstance(epi_n, int) and epi_n % 8 == 0, epi_n
             setattr(gemm, self._epi_n_attr(), epi_n)
-            if vec == 32:  # a 32-row vector spans a warp pair (16 postact rows per warp); 16 is warp-local
+            if (
+                vec == 32
+            ):  # a 32-row vector spans a warp pair (16 postact rows per warp); 16 is warp-local
                 setattr(
                     gemm,
                     self._xw_shape_attr(),
-                    (gemm.cta_tile_shape_mnk[0] // 2 // vec, epi_n, gemm.epi_smem_warp_shape_mnk()[0], 2),
+                    (
+                        gemm.cta_tile_shape_mnk[0] // 2 // vec,
+                        epi_n,
+                        gemm.epi_smem_warp_shape_mnk()[0],
+                        2,
+                    ),
                 )
         setattr(gemm, self._vec_attr(), vec)
         setattr(gemm, self._sf_dtype_attr(), sf_dtype)
@@ -741,7 +750,13 @@ class BlockScaleFactorStore(EpiOp):
         gSFD = cute.domain_offset((ctx.tile_coord_mnkl[0] * tile_M_aux, n0), mSFD_mn)
         warp = cute.arch.make_warp_uniform(ctx.tidx // cute.arch.WARP_SIZE)
         return _SfdAuxColState(
-            gSFD, smem_tensor, limit_n, norm_const, ctx.epilogue_barrier, warp, ctx.tidx % cute.arch.WARP_SIZE
+            gSFD,
+            smem_tensor,
+            limit_n,
+            norm_const,
+            ctx.epilogue_barrier,
+            warp,
+            ctx.tidx % cute.arch.WARP_SIZE,
         )
 
     @cute.jit
@@ -1156,7 +1171,18 @@ def sfd_quantize_subtile_col(
 
 @cute.jit
 def sfd_quantize_subtile_aux_m(
-    gemm, gSFD_cur, sExch_cur, limit_n, frag, barrier, warp, lane, epi_n, vec, norm_const=None, value_dtype=None
+    gemm,
+    gSFD_cur,
+    sExch_cur,
+    limit_n,
+    frag,
+    barrier,
+    warp,
+    lane,
+    epi_n,
+    vec,
+    norm_const=None,
+    value_dtype=None,
 ):
     """Column-direction quantize of the M-paired gated aux subtile (TileStore pair_dim "m", SM100): thread t of
     epilogue warp w holds postact rows 16w + 8 m2 + t/4 (m2 = 0, 1) at columns 8g + 2 (t % 4) + j, registers in
@@ -1175,13 +1201,17 @@ def sfd_quantize_subtile_aux_m(
     sf_dtype = gSFD_cur.element_type
     is_e8m0 = const_expr(sf_dtype is cutlass.Float8E8M0FNU)
     groups = epi_n // 8
-    assert cute.size(frag) == 4 * groups, f"M-paired aux fragment: {cute.size(frag)} values, {groups} column groups"
+    assert cute.size(frag) == 4 * groups, (
+        f"M-paired aux fragment: {cute.size(frag)} values, {groups} column groups"
+    )
     tScratchB = cute.make_rmem_tensor(cute.make_layout(1), cutlass.Uint8)
     tScratch_sf = cute.recast_tensor(tScratchB, sf_dtype)
     tScratch_e8 = cute.recast_tensor(tScratchB, cutlass.Float8E8M0FNU)
     t4, c4 = lane // 4, lane % 4
     q, member = warp // 2, warp % 2
-    amaxes = cute.make_rmem_tensor(cute.make_layout(2 * groups), Float32)  # the warp's 16-row maxima
+    amaxes = cute.make_rmem_tensor(
+        cute.make_layout(2 * groups), Float32
+    )  # the warp's 16-row maxima
     for g in cutlass.range_constexpr(groups):
         for j in cutlass.range_constexpr(2):
             i0 = j + 2 * g  # m2 = 0; m2 = 1 at i0 + 2 * groups

@@ -133,9 +133,13 @@ def _compile_gemm(
         m_d = cute.sym_int()
         l_d = l if batched and not (varlen_m or varlen_n) else None
         # the N extents stay the fakes' own (an fp4 D is packed)
-        mD = fake_batched(d_dtype, m_d, mD.shape[-1], l_d, 1 if d_major == "n" else 0, 128 // d_dtype.width)
+        mD = fake_batched(
+            d_dtype, m_d, mD.shape[-1], l_d, 1 if d_major == "n" else 0, 128 // d_dtype.width
+        )
         if c_dtype is not None:
-            mC = fake_batched(c_dtype, m_d, mC.shape[-1], l_d, 1 if c_major == "n" else 0, 128 // c_dtype.width)
+            mC = fake_batched(
+                c_dtype, m_d, mC.shape[-1], l_d, 1 if c_major == "n" else 0, 128 // c_dtype.width
+            )
 
     def fake_scalar(mode, dtype=Float32):
         if mode == 0:
@@ -278,7 +282,9 @@ class _GemmPlan(NamedTuple):
     tile_N: int
     cluster_M: int
     cluster_N: int
-    dist_op: object  # the operator: make_scheduler_args(dist_op_args) = its per-call scheduler options
+    dist_op: (
+        object  # the operator: make_scheduler_args(dist_op_args) = its per-call scheduler options
+    )
     # varlen_n blockscaled: tile_n for the per-call cu_tiles_n prefix (None = not needed)
     cu_tiles_tile_n: Optional[int] = None
 

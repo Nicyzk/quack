@@ -122,8 +122,8 @@ def _run_rank():
         1, 2
     ).contiguous()  # (E, I, H), K-major: the transposed weight copy, once per step
     w1t = w1_pw.transpose(1, 2).contiguous()  # (E, H, 2I), K in the pairwise order dh comes in
-    dispatch = DispatchRunner(t_local, topk, H, bf16, group, max_rows, tile_n, e_local)
-    combine = CombineRunner(t_local, topk, H, bf16, group, max_rows)
+    dispatch = DispatchRunner(t_local, topk, H, bf16, max_rows, tile_n, e_local)
+    combine = CombineRunner(t_local, topk, H, bf16, max_rows)
     dh = torch.zeros(max_rows, 2 * I, device=device, dtype=bf16)  # packed pairwise, as h
     a_s = torch.zeros(max_rows, I, device=device, dtype=bf16)
     # the score grad's per-CTA-M-tile partials (the sink rule: M tiles of the per-CTA tile, N columns)
@@ -157,7 +157,7 @@ def _run_rank():
     gemm(
         w1t,
         dh,
-        combine.D,
+        combine.d,
         None,
         None,
         256,

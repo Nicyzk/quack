@@ -1,25 +1,30 @@
-# GEMM + all-reduce, one-shot (cutlass Lamport), as the GEMM's distributed operator: no flags, the data is the flag.
-# The partials buffer is 3 slots x world mirrors of (m, n), stacked along M, stored through its multicast
-# view; slot k = launch counter % 3.
-# Every rank's epilogue warps store their -0.0-scrubbed raw partial of each tile into slot k's mirror `rank`
-# (one TMA multicast store lands on every rank, the GEMM's partial-only epilogue through this operator's
-# store_tile / scrub_partial), then re-arm last call's slot (k - 1) over that tile in every local mirror:
-# peers write that slot again only in call i + 2, after this rank's call i + 1 data, so nothing orders the
-# re-arm. The comm warps poll their local slot-k mirrors per 16 B atom until no word is the sentinel, sum in
-# f32, run the GEMM's epilogue on the whole tile and commit it into D, this rank's plain (m, n) output.
-# Usage: ar = AllReduceOneShotRunner(m, n, dtype, tile_m); per launch: mod.gemm(a, b, ar.d, c, ...,
-# dist_op=ar.op, dist_op_args=ar.prepare()). Direct: GemmSm100(..., dist_op=ar.op), launch with mD=ar.d.
+# Copyright (c) 2026, QuACK team.
+"""GEMM + all-reduce, one-shot (cutlass Lamport), as the GEMM's distributed operator: no flags, the data is the flag.
+The partials buffer is SLOTS slots x world_size mirrors of (m, n), stacked along M, stored through its multicast
+view; slot k = launch counter % SLOTS.
+Every rank's epilogue warps store their -0.0-scrubbed raw partial of each tile into slot k's mirror `rank`
+(one TMA multicast store lands on every rank, the GEMM's partial-only epilogue through this operator's
+store_tile / scrub_partial), then re-arm last call's slot (k - 1) over that tile in every local mirror:
+peers write that slot again only in call i + 2, after this rank's call i + 1 data, so nothing orders the
+re-arm. The comm warps poll their local slot-k mirrors per 16 B atom until no word is the sentinel, sum in
+f32, run the GEMM's epilogue on the whole tile and commit it into D, this rank's plain (m, n) output.
+Usage: ar = AllReduceOneShotRunner(m, n, dtype, tile_m); per launch: mod.gemm(a, b, ar.d, c, ...,
+dist_op=ar.op, dist_op_args=ar.prepare()). Direct: GemmSm100(..., dist_op=ar.op), launch with mD=ar.d."""
+
 from functools import partial
 from typing import NamedTuple
 
 import cutlass
 import cutlass.cute as cute
+import torch
+import torch.distributed as dist
 from cutlass import Int32, const_expr
 from cutlass.cutlass_dsl import any_, while_generate, yield_out
 from quack.compile_utils import make_fake_tensor
 from quack.cute_dsl_utils import mlir_namedtuple
 from quack.distributed.ptx import ld_relaxed_gpu_global_4xu32, st_weak_global_4xu32
-from quack.distributed.reduce_scatter import _frame, _symm, commit_subtile_local, load_subtile
+from quack.distributed.reduce_scatter import commit_subtile_local, frame, load_subtile
+from quack.distributed.utils import d_cols, multicast_view, symm_alloc, torch_dtype_of
 from quack.gemm_base import DistOp
 
 SLOTS = 3
@@ -29,8 +34,10 @@ SLOTS = 3
 class LamportArguments(NamedTuple):
     """The comm warps' bundle (the GEMM's dist_op_args)."""
 
-    slots: cute.Tensor  # this rank's mirrors (SLOTS * world * m, n), slot-major then mirror
-    slots_mc: cute.Tensor  # their multicast view: the GEMM's partial store lands in every rank's mirror
+    slots: cute.Tensor  # this rank's mirrors (SLOTS * world_size * m, n), slot-major then mirror
+    slots_mc: (
+        cute.Tensor
+    )  # their multicast view: the GEMM's partial store lands in every rank's mirror
     slot: cute.Tensor  # (1,) int32 launch counter; the host adds 1 before every launch
 
 
@@ -76,7 +83,9 @@ def lamport_reduce_subtile(
     tRS_rD: cute.Tensor,
     epi_coord: cute.Coord,
     no_release: cutlass.Constexpr[bool] = False,
-    batch: cutlass.Constexpr[int] = 8,  # 16-byte atoms in flight per sentinel wait (1 = serial spin)
+    batch: cutlass.Constexpr[
+        int
+    ] = 8,  # 16-byte atoms in flight per sentinel wait (1 = serial spin)
 ) -> None:
     """gemm.epilogue's load_acc_subtile: batched poll over the (atom, source mirror) lattice, atom-major:
     issue ``batch`` 16 B loads back to back, spin reloading them until no last word is the sentinel (the
@@ -135,7 +144,7 @@ def _tiled_copy(dtype, thr_shape, val_shape):
 
 
 class AllReduceLamport(DistOp):
-    """GEMM + one-shot all-reduce over `world` ranks: D = the full (m, n) result; the whole tile is this
+    """GEMM + one-shot all-reduce over `world_size` ranks: D = the full (m, n) result; the whole tile is this
     CTA's."""
 
     num_warps = 4
@@ -143,8 +152,8 @@ class AllReduceLamport(DistOp):
     runs_evt = True
     partial_dtype = cutlass.BFloat16  # the wire
 
-    def __init__(self, rank: int, world: int):
-        self.rank, self.world = rank, world
+    def __init__(self, rank: int, world_size: int):
+        self.rank, self.world_size = rank, world_size
 
     def fake_args(self, d_dtype):
         return _fake_arguments()
@@ -155,21 +164,23 @@ class AllReduceLamport(DistOp):
     def epi_warp_shape_mnk(self, gemm):
         cta_m, cta_n = gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[1]
         threads = gemm.num_comm_warps * cute.arch.WARP_SIZE
-        (_, thr_n), _, _ = _frame(self.partial_dtype, cta_m, cta_n, threads)
+        (_, thr_n), _, _ = frame(self.partial_dtype, cta_m, cta_n, threads)
         warps_n = max(1, thr_n // cute.arch.WARP_SIZE)
         return (gemm.num_comm_warps // warps_n, warps_n, 1)
 
     def epi_tile(self, gemm):
         cta_m, cta_n = gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[1]
         threads = gemm.num_comm_warps * cute.arch.WARP_SIZE
-        (thr_m, _), _, chunk = _frame(self.partial_dtype, cta_m, cta_n, threads)
+        (thr_m, _), _, chunk = frame(self.partial_dtype, cta_m, cta_n, threads)
         return (chunk * thr_m, cta_n)
 
     def store_tile(self, gemm, ctx, sD, epi_tile, tidx, tile_coord_mnkl, batch_idx, varlen_manager):
         """The GEMM's TMA store into slot k, mirror `rank`: the tile's row in the stacked mirrors."""
         dist_op_args = ctx.args
         tiles_m = ctx.mD.shape[0] // gemm.cta_tile_shape_mnk[0]
-        row = (_slot(dist_op_args.slot) * self.world + self.rank) * tiles_m + tile_coord_mnkl[0]
+        row = (_slot(dist_op_args.slot) * self.world_size + self.rank) * tiles_m + tile_coord_mnkl[
+            0
+        ]
         return (row, tile_coord_mnkl[1], tile_coord_mnkl[2], tile_coord_mnkl[3]), None
 
     @cute.jit
@@ -185,13 +196,13 @@ class AllReduceLamport(DistOp):
         cta_m, cta_n = gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[1]
         dtype = dist_op_args.slots.element_type
         threads = gemm.num_epi_warps * cute.arch.WARP_SIZE
-        thr_shape, val_shape, _ = _frame(dtype, cta_m, cta_n, threads)
+        thr_shape, val_shape, _ = frame(dtype, cta_m, cta_n, threads)
         thr_copy = _tiled_copy(dtype, thr_shape, val_shape).get_slice(tidx)
         gSlots = cute.local_tile(dist_op_args.slots, (cta_m, cta_n), (None, None))
         tiles_m = ctx.mD.shape[0] // cta_m
         k = (_slot(dist_op_args.slot) + (SLOTS - 1)) % SLOTS
         pid_m, pid_n = tile_coord_mnkl[0], tile_coord_mnkl[1]
-        rows = [(k * self.world + r) * tiles_m + pid_m for r in range(self.world)]
+        rows = [(k * self.world_size + r) * tiles_m + pid_m for r in range(self.world_size)]
         lamport_rearm_tile(
             tuple(thr_copy.partition_S(gSlots[None, None, row, pid_n]) for row in rows)
         )
@@ -199,14 +210,14 @@ class AllReduceLamport(DistOp):
     @cute.jit
     def comm_warps(self, gemm, ctx, warp_idx: Int32, tidx: Int32):
         assert gemm.split_k == 1, "lamport all-reduce: no split-K"
-        world = self.world
+        world_size = self.world_size
         # bound methods and ctx fields cross into the loop as locals; the objects cannot
         epilogue, comm_barrier = gemm.epilogue, gemm.comm_barrier
         dist_op_args, TileSchedulerCls, varlen_manager = ctx.args, ctx.TileSchedulerCls, ctx.varlen
         epilogue_params, epi_smem_tensors, mC = ctx.epi_params, ctx.epi_smem_tensors, ctx.mC
         cta_m, cta_n = gemm.cta_tile_shape_mnk[0], gemm.cta_tile_shape_mnk[1]
         slots, out = dist_op_args.slots, ctx.mD
-        thr_shape, val_shape, chunk = _frame(
+        thr_shape, val_shape, chunk = frame(
             slots.element_type, cta_m, cta_n, gemm.num_comm_warps * cute.arch.WARP_SIZE
         )
         tiled_copy = _tiled_copy(slots.element_type, thr_shape, val_shape)
@@ -223,7 +234,9 @@ class AllReduceLamport(DistOp):
             tRS_rC = cute.make_rmem_tensor((_atom, chunk, loop_n), mC.element_type)
             gC = cute.local_tile(mC, (cta_m, cta_n), (None, None))
         is_tma_warp = warp_idx == gemm.comm_warp_ids[0]
-        epi_store_pipeline = gemm.make_epi_store_pipeline(gemm.num_comm_warps)  # aux outputs' TMA stores
+        epi_store_pipeline = gemm.make_epi_store_pipeline(
+            gemm.num_comm_warps
+        )  # aux outputs' TMA stores
         tiles_m = out.shape[0] // cta_m
         k = _slot(dist_op_args.slot)
 
@@ -233,8 +246,10 @@ class AllReduceLamport(DistOp):
         while work_tile.is_valid_tile:
             pid_m, pid_n = work_tile.tile_idx[0], work_tile.tile_idx[1]
             mirrors = tuple(
-                thr_copy.partition_S(gSlots[None, None, (k * world + r) * tiles_m + pid_m, pid_n])
-                for r in range(world)
+                thr_copy.partition_S(
+                    gSlots[None, None, (k * world_size + r) * tiles_m + pid_m, pid_n]
+                )
+                for r in range(world_size)
             )
             load_C = None
             if const_expr(mC is not None):
@@ -281,27 +296,25 @@ class AllReduceLamport(DistOp):
 
 
 class AllReduceOneShotRunner:
-    """GEMM + one-shot (Lamport) AR of an (m, n) output: `d` = this rank's full (m, n) result in torch_dtype,
-    `op` = AllReduceLamport(rank, world); `prepare()` advances the launch counter (slot k = launches % 3) and
-    returns the GEMM's dist_op_args: call it once per launch."""
+    """GEMM + one-shot (Lamport) AR of an (m, n) output over `group` (None = the world group): `d` = this
+    rank's full (m, n) result in dtype, `op` = AllReduceLamport(rank, world_size); `prepare()` advances the
+    launch counter (slot k = launches % SLOTS) and returns the GEMM's dist_op_args: call it once per launch."""
 
-    def __init__(self, m, n, torch_dtype, tile_m):
-        import torch
-        import torch.distributed as dist
-
-        from quack.cute_dsl_utils import torch2cute_dtype_map
-
-        rank, world = dist.get_rank(), dist.get_world_size()
-        assert m % tile_m == 0, "whole tiles along M"
-        wire = next(t for t, c in torch2cute_dtype_map.items() if c is AllReduceLamport.partial_dtype)
-        slots, slots_mc, _ = _symm((SLOTS * world * m, n), wire)
+    def __init__(self, m, n, dtype, tile_M, group=None):
+        group = dist.group.WORLD if group is None else group
+        rank, world_size = dist.get_rank(group), dist.get_world_size(group)
+        assert m % tile_M == 0, "whole tiles along M"
+        shape, wire = (SLOTS * world_size * m, n), torch_dtype_of(AllReduceLamport.partial_dtype)
+        slots, self._handle = symm_alloc(shape, wire, group)  # the handle pins the mapping
+        slots_mc = multicast_view(self._handle, shape, wire)
         slots.fill_(-0.0)
-        cols = n // 2 if torch_dtype == torch.float4_e2m1fn_x2 else n  # fp4 D packs two values a byte
-        self.d = torch.empty(m, cols, dtype=torch_dtype, device="cuda")
-        self.op = AllReduceLamport(rank, world)
-        self.args = LamportArguments(slots, slots_mc, torch.zeros(1, dtype=torch.int32, device="cuda"))
+        self.d = torch.empty(m, d_cols(n, dtype), dtype=dtype, device="cuda")
+        self.op = AllReduceLamport(rank, world_size)
+        self.args = LamportArguments(
+            slots, slots_mc, torch.zeros(1, dtype=torch.int32, device="cuda")
+        )
         torch.cuda.synchronize()
-        dist.barrier()  # every rank's mirrors are armed before any peer stores into them
+        dist.barrier(group=group)  # every rank's mirrors are armed before any peer stores into them
 
     def prepare(self):
         self.args.slot.add_(1)

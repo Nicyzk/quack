@@ -1,12 +1,11 @@
-"""The combine's gather-and-sum over K in CuTe-DSL (from duckpond kernels/moe/reduce_over_k/reduce_over_k.py,
-2026-11-21; the fused @reduce_epilogue mods are in reduce_over_k_epilogue.py): out[t, :] = sum_k w[t, k] *
-x[t, k, :] (w optional), the
-replacement for sonic's token_gather_and_sum_varlen_K_triton as the forward calls it (identity perm, K rows per
-token). Memory-bound: each thread loads vecs 16 B vectors of each of the token's K rows, accumulates in fp32 in fixed
+# Copyright (c) 2026, QuACK team.
+"""The combine's gather-and-sum over K in CuTe-DSL (the fused @reduce_epilogue mods are in
+reduce_over_k_epilogue.py): out[t, :] = sum_k w[t, k] * x[t, k, :] (w optional), K rows per token.
+Memory-bound: each thread loads vecs 16 B vectors of each of the token's K rows, accumulates in fp32 in fixed
 k order (bitwise run-to-run) and stores the vectors in the output dtype; a CTA covers (num_threads / threads_per_row)
 tokens by threads_per_row * vec * vecs columns, the grid tiles H then T.
 
-Fused epilogues come through quack's EpiOp machinery (epilogue.py): the fp32 sum is the accumulator fragment, the
+Fused epilogues come through quack's EpiOp machinery (reduce_over_k_epilogue.py): the fp32 sum is the accumulator fragment, the
 CTA tile is the one epilogue subtile, and the kernel runs quack's hooks in gemm_base.epilogue's order (epi_begin,
 epi_begin_loop, epi_visit_subtile, epi_end_loop, the stores, epi_end). The attributes the ops read off the GEMM
 (cta_tile_shape_mnk, num_epi_warps, acc_dtype, epi_m_major, epilogue_barrier, arch) are provided here."""
@@ -26,7 +25,7 @@ import quack.copy_utils as copy_utils
 
 class ReduceOverK(ComposableEpiMixin):
     """The plain kernel (no epilogue ops); a @reduce_epilogue mod mints a subclass carrying its _epi_ops and the
-    fn visit (epilogue.py)."""
+    fn visit (reduce_over_k_epilogue.py)."""
 
     _epi_ops = ()
     EpilogueArguments = None
